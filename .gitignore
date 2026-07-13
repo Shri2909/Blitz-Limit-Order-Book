@@ -1,0 +1,17 @@
+# Build outputs
+build/
+build-xdp/
+*.o
+*.obj
+
+# Generated benchmark/dataset artifacts
+# WHY: dataset files are deterministic and regenerable via blitz_gen_dataset
+#      given the same seed + config. Store seed/flags in datasets/manifest.txt
+#      instead of committing the binary files themselves.
+*.csv
+results/
+datasets/
+
+# CMake cache
+compile_commands.json
+.cache/
