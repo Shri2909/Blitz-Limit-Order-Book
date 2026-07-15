@@ -8,9 +8,15 @@ build-xdp/
 # WHY: dataset files are deterministic and regenerable via blitz_gen_dataset
 #      given the same seed + config. Store seed/flags in datasets/manifest.txt
 #      instead of committing the binary files themselves.
+# WHY datasets/* + a negated exception (not a blanket datasets/ rule): a
+#      bare "datasets/" ignores the whole directory, manifest.txt included
+#      -- silently defeating the "store flags in manifest.txt instead"
+#      policy this comment describes. This form ignores everything in the
+#      directory except the one file meant to be tracked.
 *.csv
 results/
-datasets/
+datasets/*
+!datasets/manifest.txt
 
 # CMake cache
 compile_commands.json

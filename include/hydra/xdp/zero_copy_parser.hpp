@@ -65,6 +65,23 @@ namespace hydra::xdp
                   "byte before changing this, callers/generators may be "
                   "pinned to the old layout");
 
+    // A single 802.1Q/802.1AD VLAN tag (4 bytes: priority+VLAN-ID, then the
+    // encapsulated EtherType). WHY this exists here: the eBPF classifier
+    // (net/xdp_prog.bpf.c, via parsing_helpers.h's parse_ethhdr_vlan())
+    // already skips VLAN tags when deciding whether to redirect a frame --
+    // without a matching skip here, a VLAN-tagged order-entry packet would
+    // be correctly redirected by the kernel side and then incorrectly
+    // rejected as a parse_error here, since eth->h_proto would read as
+    // ETH_P_8021Q/AD instead of ETH_P_IP.
+#pragma pack(push, 1)
+    struct VlanTag
+    {
+        uint16_t tci; // priority + VLAN ID; not needed for order parsing
+        uint16_t encapsulated_proto; // inner EtherType, network byte order
+    };
+#pragma pack(pop)
+    static_assert(sizeof(VlanTag) == 4, "VlanTag must be exactly 4 bytes");
+
     namespace detail
     {
 
@@ -110,7 +127,27 @@ namespace hydra::xdp
         }
         const auto *eth = reinterpret_cast<const ethhdr *>(frame + offset);
         offset += sizeof(ethhdr);
-        if (eth->h_proto != htons(ETH_P_IP))
+
+        uint16_t ethertype = eth->h_proto;
+        if (ethertype == htons(ETH_P_8021Q) || ethertype == htons(ETH_P_8021AD))
+        {
+            // Single VLAN tag only -- matches this parser's bounded,
+            // non-looping design. A double-tagged (QinQ) frame is
+            // rejected here rather than chasing an unbounded tag count;
+            // the eBPF classifier accepts up to 2 tags when deciding
+            // whether to redirect (see parse_ethhdr_vlan()'s
+            // VLAN_MAX_DEPTH), so a QinQ order-entry frame would still be
+            // redirected here and then correctly counted as a
+            // parse_error rather than silently misread.
+            if (frame_len < offset + sizeof(VlanTag))
+            {
+                return false;
+            }
+            const auto *vlan = reinterpret_cast<const VlanTag *>(frame + offset);
+            offset += sizeof(VlanTag);
+            ethertype = vlan->encapsulated_proto;
+        }
+        if (ethertype != htons(ETH_P_IP))
         {
             return false;
         }

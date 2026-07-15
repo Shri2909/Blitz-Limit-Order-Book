@@ -100,6 +100,42 @@ namespace hydra::test
             return buf.size();
         }
 
+        // Inserts `num_tags` 4-byte 802.1Q tags between the Ethernet
+        // header and the IPv4 header of an otherwise well-formed frame
+        // (built via build_synthetic_frame() above), so the resulting
+        // frame's outer eth->h_proto reads ETH_P_8021Q and the true
+        // ETH_P_IP ethertype is num_tags tags deeper -- exactly the shape
+        // parse_order_zero_copy()'s VLAN handling (zero_copy_parser.hpp)
+        // needs to unwrap correctly.
+        [[nodiscard]] std::size_t build_vlan_tagged_frame(std::vector<uint8_t> &buf,
+                                                            const SyntheticOrder &order,
+                                                            int num_tags)
+        {
+            std::vector<uint8_t> untagged;
+            const std::size_t untagged_len = build_synthetic_frame(untagged, order);
+
+            buf.assign(untagged_len + static_cast<std::size_t>(num_tags) * sizeof(hydra::xdp::VlanTag), 0);
+
+            std::memcpy(buf.data(), untagged.data(), sizeof(ethhdr));
+            auto *eth = reinterpret_cast<ethhdr *>(buf.data());
+            eth->h_proto = htons(ETH_P_8021Q);
+
+            std::size_t offset = sizeof(ethhdr);
+            for (int i = 0; i < num_tags; ++i)
+            {
+                auto *vlan = reinterpret_cast<hydra::xdp::VlanTag *>(buf.data() + offset);
+                vlan->tci = htons(42); // arbitrary VLAN ID, not inspected by the parser
+                vlan->encapsulated_proto =
+                    (i + 1 < num_tags) ? htons(ETH_P_8021Q) : htons(ETH_P_IP);
+                offset += sizeof(hydra::xdp::VlanTag);
+            }
+
+            std::memcpy(buf.data() + offset, untagged.data() + sizeof(ethhdr),
+                        untagged_len - sizeof(ethhdr));
+
+            return buf.size();
+        }
+
         void test_order_wire_format_size()
         {
             HYDRA_CHECK_EQ(sizeof(hydra::xdp::OrderWireFormat), std::size_t{30});
@@ -183,6 +219,47 @@ namespace hydra::test
             HYDRA_CHECK(!ok);
         }
 
+        // Regression test: net/xdp_prog.bpf.c's classifier (via
+        // parsing_helpers.h's parse_ethhdr_vlan()) already skips a single
+        // VLAN tag when deciding whether to redirect a frame, so a
+        // VLAN-tagged order-entry packet reaches this parser -- it must
+        // not be rejected just because eth->h_proto reads ETH_P_8021Q
+        // instead of ETH_P_IP.
+        void test_parse_accepts_single_vlan_tag()
+        {
+            SyntheticOrder synth{};
+            std::vector<uint8_t> buf;
+            const std::size_t len = build_vlan_tagged_frame(buf, synth, 1);
+
+            hydra::Order out{};
+            const bool ok = hydra::xdp::parse_order_zero_copy(
+                buf.data(), static_cast<uint32_t>(len), out);
+
+            HYDRA_CHECK(ok);
+            HYDRA_CHECK_EQ(out.order_id, synth.order_id);
+            HYDRA_CHECK_EQ(out.price, synth.price);
+            HYDRA_CHECK_EQ(out.qty, synth.qty);
+            HYDRA_CHECK_EQ(out.client_id, synth.client_id);
+            HYDRA_CHECK(out.side == hydra::Side::SELL);
+            HYDRA_CHECK(out.tif == hydra::TimeInForce::IOC);
+        }
+
+        // Double-tagged (QinQ) frames are deliberately rejected -- this
+        // parser only unwraps one VLAN tag, matching zero_copy_parser.hpp's
+        // documented bounded-parsing design (see its WHY comment). Proves
+        // that design choice actually rejects rather than misreads.
+        void test_parse_rejects_double_vlan_tag()
+        {
+            SyntheticOrder synth{};
+            std::vector<uint8_t> buf;
+            const std::size_t len = build_vlan_tagged_frame(buf, synth, 2);
+
+            hydra::Order out{};
+            const bool ok = hydra::xdp::parse_order_zero_copy(
+                buf.data(), static_cast<uint32_t>(len), out);
+            HYDRA_CHECK(!ok);
+        }
+
     } // namespace
 } // namespace hydra::test
 
@@ -196,6 +273,8 @@ int main()
     RUN_TEST(test_parse_rejects_non_udp_protocol);
     RUN_TEST(test_parse_rejects_truncated_frame);
     RUN_TEST(test_parse_rejects_empty_frame);
+    RUN_TEST(test_parse_accepts_single_vlan_tag);
+    RUN_TEST(test_parse_rejects_double_vlan_tag);
 
     return report_and_exit_code();
 }

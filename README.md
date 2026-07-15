@@ -519,13 +519,15 @@ docs/DESIGN.md           Full ablation methodology and rationale behind
 
 ## AF_XDP: what has and hasn't been measured
 
-Verified this session, on a real packet path: an eBPF program
-(`net/xdp_prog.bpf.c`) redirecting UDP order-entry traffic into an AF_XDP
-socket, a zero-copy parser turning wire frames into `Order`s, and the
-result flowing into the same matching pipeline as any other order —
-15,000/15,000 packets sent, received, and parsed correctly, 0 drops, 0
-parse errors, at a moderate rate (500/sec) over a veth pair with the peer
-end in its own network namespace (`scripts/setup_veth.sh`).
+### Verified working
+
+An eBPF program (`net/xdp_prog.bpf.c`) redirecting UDP order-entry traffic
+into an AF_XDP socket, a zero-copy parser turning wire frames into
+`Order`s, and the result flowing into the same matching pipeline as any
+other order — confirmed correct over a veth pair with the peer end in its
+own network namespace (`scripts/setup_veth.sh`), twice: 15,000/15,000
+packets at 500/sec, then 20,000/20,000 at 1000/sec, both 0 drops and 0
+parse errors.
 
 **Not yet true**, and don't imply otherwise:
 - veth only supports `XDP_COPY` and generic (`skb`) program attachment —
@@ -533,11 +535,143 @@ end in its own network namespace (`scripts/setup_veth.sh`).
   `XDP_ZEROCOPY` performance. That requires a real NIC/driver pair
   (e.g. Mellanox mlx5, Intel i40e/ice).
 - The AF_XDP path has not been used to produce the project's headline
-  P99.9 number above — that number is dataset-replay only. Live-traffic
-  latency was observed (low-tens-of-microseconds p50 at 500 orders/sec,
-  under ~400µs p99.99), but that was a lightly-loaded correctness check,
-  not a controlled, repeated-trial benchmark, and it measures a different
-  (blended, not end-to-end-only) metric than the headline number.
+  P99.9 number above — that number is dataset-replay only, and stays
+  that way (see the live-latency investigation below for exactly what
+  the AF_XDP path's own numbers mean and don't mean).
+
+### Bugs found and fixed by a critical audit of the AF_XDP path
+
+Prompted by an unexplained live-latency reading (see below), the AF_XDP
+code was audited line by line — twice, independently (a direct read plus
+a separate agent pass) — for correctness bugs, not just the performance
+question that started it. Four real bugs came out of it, all fixed and
+covered by the existing test suite (`blitz_lob_test_phase10_xdp`, now 8
+tests, all passing; full suite of 79+ tests across every phase passing
+with zero regressions):
+
+- **No UDP port filter in the eBPF classifier** (`net/xdp_prog.bpf.c`).
+  It redirected *any* IPv4/UDP packet on the bound queue — DNS, mDNS, any
+  other service sharing that queue — into the AF_XDP socket, and
+  `parse_order_zero_copy()` has no checksum/magic/version validation of
+  its own, so a stray ≥30-byte UDP payload could become a syntactically
+  valid `Order` with arbitrary field values. Fixed: the eBPF program now
+  checks the UDP destination port against `AFXDP_ORDER_ENTRY_UDP_PORT`
+  (40000) and rejects (`XDP_PASS`) anything else, with a new
+  `HYDRA_STAT_WRONG_PORT` counter to make the rejection visible.
+- **IP fragments weren't rejected** — same underlying gap (no payload
+  validation) via a different packet shape; a fragment has
+  `ip->protocol == IPPROTO_UDP` but no real UDP header at that offset.
+  Fixed alongside the port filter, with a `HYDRA_STAT_FRAGMENTED` counter.
+- **`XdpSocket::release_frame()`'s double-release guard was sized against
+  the wrong capacity and failed silently** (`net/xdp_socket_user.cpp`).
+  It guarded against overflowing the compile-time array size (4096), not
+  this instance's actual seeded frame count — and a caught double-release
+  was just dropped, no counter, no signal. Fixed: guards against the
+  correct per-instance count and increments a new
+  `double_release_count()`, now printed in `afxdp_rx_thread_fn`'s
+  periodic/final report lines alongside `received`/`parsed_ok`/
+  `parse_errors`/`dropped`.
+- **VLAN-tagged frames were misclassified.** The eBPF classifier already
+  handled 802.1Q/802.1AD tags correctly when deciding what to redirect,
+  but `parse_order_zero_copy()` (`zero_copy_parser.hpp`) assumed a bare
+  Ethernet header and rejected anything VLAN-tagged as a parse error even
+  though the kernel had routed it there correctly. Fixed: the parser now
+  unwraps a single VLAN tag before reading the inner EtherType (a
+  double-tagged/QinQ frame is still deliberately rejected — this parser
+  is bounded to one tag by design). Covered by two new tests:
+  `test_parse_accepts_single_vlan_tag`, `test_parse_rejects_double_vlan_tag`.
+
+None of these four turned out to be the cause of the live-latency question
+that prompted the audit — that mystery had a completely different,
+non-AF_XDP-specific answer, below. They're real, independently valuable
+fixes found along the way.
+
+### The live-latency investigation: what actually explained the numbers
+
+A live AF_XDP run initially reported P99.9 latency in the 1.6–2.3μs
+range, then — after other environmental factors were controlled for — a
+run that looked far worse, with `queue_transit_ns` (RX-thread-to-matching-
+thread handoff) sitting at **p50=684,260ns, p99.9=3,035,560ns**, while
+`match_time_ns` (the matching engine's own per-order cost) stayed healthy
+at **p50=291ns, p99.9=4,693ns**. That decomposed split — obtained by
+temporarily wiring the same `RawSampleSink` mechanism `--benchmark`
+already uses into the live pipeline (`src/main.cpp`, marked `DIAG-TEMP`,
+still present in the code as of this writing) — was the key piece of
+evidence: whatever was wrong was in the *queue handoff*, not the matching
+engine, and not (per the earlier ablation study) the lock-free `SpscQueue`
+itself.
+
+The actual cause, confirmed with hard evidence rather than a guess:
+**a separate benchmark process was left running in the background, pinned
+to the same isolated cores (4 and 5) the live AF_XDP test also uses.**
+`isolcpus` stops the scheduler from putting *unrelated* processes on those
+cores by default — it does nothing to stop two processes that both
+explicitly request the same isolated cores from fighting the OS scheduler
+for them. Three independent pieces of evidence converged on this:
+
+1. `sudo bpftool map dump name xdp_prog_stats` during the run showed
+   `REDIRECTED` summed across all CPUs at **exactly 20,000** — matching
+   the packets actually sent, with `WRONG_PORT`/`FRAGMENTED` both zero —
+   ruling out extraneous network traffic as a contributor.
+2. The decomposed split above pointed at the queue handoff specifically.
+3. A same-condition `--benchmark` control run showed the same signature
+   *while contaminated* (variance across trials: **3,000,176ns** — almost
+   exactly matching the contaminated run's `queue_transit_ns` p99.9) and
+   a **completely different, healthy result once run in isolation**:
+   median P99 **1467.0ns**, variance **20,743ns** (compare to the
+   contaminated run's P99 22,815ns, variance 3,000,176ns).
+
+With nothing else on cores 4/5, the live AF_XDP path's own numbers came
+back genuinely healthy: **`queue_transit_ns` p50=204ns, `match_time_ns`
+p50=230ns, `end_to_end_ns` p50=470ns** (n=19,906 samples) — squarely in
+line with expectations, confirming the AF_XDP path, the SPSC queue, and
+the matching engine are all working correctly. **Never run `--benchmark`
+and a live AF_XDP test at the same time, or on the same isolated cores as
+anything else** — this is now the top item to check if a live number ever
+looks wrong again.
+
+**One residual, smaller finding**: even with no contending process, the
+tail (`queue_transit_ns` p99=22,459ns, p99.9=26,203ns) stayed elevated
+while `match_time_ns`'s own tail stayed tight (p99=1,253ns, p99.9=2,227ns).
+Traced to real hardware interrupts landing on the isolated cores —
+`isolcpus`/`nohz_full` isolate *scheduling*, not *interrupt routing*,
+which is a separate kernel mechanism entirely. `/proc/interrupts` showed
+the touchpad's IRQ (14 and 133, same physical device via two paths) firing
+144,743 times during one test window, landing directly on core 4 — almost
+certainly because the trackpad was being actively used (e.g. to scroll
+terminal output) while the test ran. IRQ 14 was successfully moved off
+cores 4/5; IRQ 133 rejected the same change (`Operation not permitted`) —
+it's routed through an `intel-gpio` controller, which frequently doesn't
+support CPU-affinity changes at the hardware/driver level at all, not a
+permissions problem. **The simplest actual fix: don't touch the trackpad
+while a test is running.** This residual is a general-purpose-laptop-
+kernel characteristic, not a code defect — eliminating it fully would need
+kernel-level real-time tuning (e.g. `PREEMPT_RT`), out of scope for this
+project's code.
+
+### Commands to reproduce this investigation
+
+```bash
+# Confirm the eBPF layer is redirecting exactly what you sent, nothing more
+sudo bpftool map dump name xdp_prog_stats
+# key 0 = REDIRECTED, 1 = PASSED, 2 = NOT_UDP, 3 = WRONG_PORT, 4 = FRAGMENTED
+# sum REDIRECTED across all "cpu" entries and compare to packets actually sent
+
+# Before trusting any live AF_XDP number, confirm nothing else is on cores 4/5
+ps -eo pid,psr,pcpu,comm | grep blitz_lob
+
+# Move a movable IRQ off the isolated cores (IO-APIC-routed IRQs only --
+# GPIO-routed ones, like a touchpad's second IRQ line, will often reject this)
+echo 0-3,6-11 | sudo tee /proc/irq/<N>/smp_affinity_list
+cat /proc/irq/<N>/effective_affinity_list   # confirms whether it actually took
+```
+
+The live pipeline's `DIAG decomposed` output (separate `queue_transit_ns`/
+`match_time_ns`/`end_to_end_ns` percentiles, printed once at shutdown
+alongside the existing blended histogram report) comes from temporary
+instrumentation added in `src/main.cpp` for this investigation, marked
+`DIAG-TEMP` — it's additive and doesn't change any other behavior, but is
+a candidate for cleanup/removal now that the investigation is resolved.
 
 ---
 

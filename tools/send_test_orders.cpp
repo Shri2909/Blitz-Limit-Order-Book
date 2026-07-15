@@ -46,7 +46,7 @@ namespace
     {
         std::fprintf(stderr,
                      "Usage: %s --target IP:PORT [--count N] [--rate-hz F]\n"
-                     "          [--seed N] [--client-id N]\n"
+                     "          [--seed N] [--client-id N] [--client-count N]\n"
                      "\n"
                      "  --target IP:PORT  required: destination for the UDP order-entry\n"
                      "                    traffic, e.g. 10.200.0.1:40000 (veth-hydra0's\n"
@@ -55,7 +55,18 @@ namespace
                      "  --rate-hz F       pace sends at this rate; 0 = send as fast as\n"
                      "                    possible (default: 0)\n"
                      "  --seed N          RNG seed for price/qty/side (default: 42)\n"
-                     "  --client-id N     client_id stamped on every order (default: 1)\n"
+                     "  --client-count N  rotate order.client_id through N synthetic\n"
+                     "                    clients (1..N by order_id), same scheme as\n"
+                     "                    dataset_generator.hpp's kSyntheticClientCount\n"
+                     "                    (default: 8) -- WHY: OrderBook::is_self_trade()\n"
+                     "                    skips a fill whenever resting.client_id ==\n"
+                     "                    incoming.client_id; every order sharing one\n"
+                     "                    client_id means NOTHING ever fills and the book\n"
+                     "                    grows unbounded, which is exactly what a single\n"
+                     "                    fixed --client-id used to do by default here\n"
+                     "  --client-id N     override: stamp this exact client_id on every\n"
+                     "                    order instead of rotating (use to deliberately\n"
+                     "                    test self-trade prevention itself)\n"
                      "\n"
                      "Example:\n"
                      "  %s --target 10.200.0.1:40000 --count 2000 --rate-hz 500\n",
@@ -145,6 +156,8 @@ int main(int argc, char **argv)
     double rate_hz = 0.0;
     uint64_t seed = 42;
     uint64_t client_id = 1;
+    bool client_id_explicit = false;
+    uint64_t client_count = 8;
 
     for (int i = 1; i < argc; ++i)
     {
@@ -172,6 +185,17 @@ int main(int argc, char **argv)
         if (match_flag(argc, argv, i, "--client-id", val))
         {
             client_id = parse_u64(val, "--client-id");
+            client_id_explicit = true;
+            continue;
+        }
+        if (match_flag(argc, argv, i, "--client-count", val))
+        {
+            client_count = parse_u64(val, "--client-count");
+            if (client_count == 0)
+            {
+                std::fprintf(stderr, "error: --client-count must be >= 1\n");
+                std::exit(1);
+            }
             continue;
         }
         if (std::strcmp(argv[i], "--help") == 0 || std::strcmp(argv[i], "-h") == 0)
@@ -216,9 +240,24 @@ int main(int argc, char **argv)
         return 1;
     }
 
-    std::printf("send_test_orders: target=%s:%u count=%zu rate_hz=%.1f seed=%llu client_id=%llu\n",
-                target.ip.c_str(), target.port, count, rate_hz,
-                static_cast<unsigned long long>(seed), static_cast<unsigned long long>(client_id));
+    if (client_id_explicit)
+    {
+        std::printf("send_test_orders: target=%s:%u count=%zu rate_hz=%.1f seed=%llu "
+                     "client_id=%llu (fixed -- every order will self-trade-block against "
+                     "every other; nothing will fill, by design)\n",
+                     target.ip.c_str(), target.port, count, rate_hz,
+                     static_cast<unsigned long long>(seed),
+                     static_cast<unsigned long long>(client_id));
+    }
+    else
+    {
+        std::printf("send_test_orders: target=%s:%u count=%zu rate_hz=%.1f seed=%llu "
+                     "client_count=%llu (rotating -- orders from different synthetic "
+                     "clients can cross and fill)\n",
+                     target.ip.c_str(), target.port, count, rate_hz,
+                     static_cast<unsigned long long>(seed),
+                     static_cast<unsigned long long>(client_count));
+    }
 
     // Same synthetic field distributions as rx_thread_fn's in-process
     // generator (src/pipeline.cpp) -- side alternates by order_id parity,
@@ -235,11 +274,23 @@ int main(int argc, char **argv)
     std::size_t sent = 0;
     for (uint64_t order_id = 1; order_id <= count; ++order_id)
     {
+        // WHY rotate by default (unless --client-id pins a single value):
+        // OrderBook::is_self_trade() skips a fill whenever resting.client_id
+        // == incoming.client_id (order_book.hpp) -- one fixed client_id for
+        // every order means every order is a self-trade against every other,
+        // nothing ever fills, and the book grows unbounded as each new order
+        // scans an ever-larger pile of permanently-unmatchable resting
+        // orders. Same rotation scheme as dataset_generator.hpp's
+        // kSyntheticClientCount so live AF_XDP traffic exercises the same
+        // realistic fill/rest mix a dataset replay does.
+        const uint64_t effective_client_id =
+            client_id_explicit ? client_id : (1 + (order_id % client_count));
+
         hydra::xdp::OrderWireFormat wire{};
         wire.order_id = htobe64(order_id);
         wire.price = static_cast<int64_t>(htobe64(static_cast<uint64_t>(price_dist(rng))));
         wire.qty = htonl(qty_dist(rng));
-        wire.client_id = htobe64(client_id);
+        wire.client_id = htobe64(effective_client_id);
         wire.side = (order_id % 2 == 0) ? static_cast<uint8_t>(hydra::Side::BUY)
                                         : static_cast<uint8_t>(hydra::Side::SELL);
         wire.tif = static_cast<uint8_t>(hydra::TimeInForce::GTC);

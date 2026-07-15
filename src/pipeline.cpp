@@ -304,14 +304,19 @@ namespace hydra
             {
                 std::fprintf(stdout,
                              "afxdp_rx_thread_fn: received=%llu parsed_ok=%llu "
-                             "parse_errors=%llu dropped=%llu\n",
+                             "parse_errors=%llu dropped=%llu double_releases=%llu\n",
                              static_cast<unsigned long long>(received),
                              static_cast<unsigned long long>(parsed_ok),
                              static_cast<unsigned long long>(parse_errors),
-                             static_cast<unsigned long long>(dropped));
+                             static_cast<unsigned long long>(dropped),
+                             static_cast<unsigned long long>(socket->double_release_count()));
                 last_progress_cycles = now_cycles;
             }
         }
+
+        // Captured before socket.reset() below -- the counter lives on the
+        // XdpSocket instance, which is about to be destroyed.
+        const uint64_t double_releases = socket->double_release_count();
 
         // Socket destructor (UMEM/ring teardown) runs here, before the
         // program is detached -- matches Phase 10's documented shutdown
@@ -323,11 +328,12 @@ namespace hydra
 
         std::fprintf(stdout,
                      "afxdp_rx_thread_fn: shutdown complete. final counts: received=%llu "
-                     "parsed_ok=%llu parse_errors=%llu dropped=%llu\n",
+                     "parsed_ok=%llu parse_errors=%llu dropped=%llu double_releases=%llu\n",
                      static_cast<unsigned long long>(received),
                      static_cast<unsigned long long>(parsed_ok),
                      static_cast<unsigned long long>(parse_errors),
-                     static_cast<unsigned long long>(dropped));
+                     static_cast<unsigned long long>(dropped),
+                     static_cast<unsigned long long>(double_releases));
     }
 
 #endif // ENABLE_AFXDP

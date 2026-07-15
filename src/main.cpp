@@ -20,6 +20,7 @@
 #include "hydra/spsc_queue.hpp"
 #include "hydra/types.hpp"
 
+#include <algorithm>
 #include <chrono>
 #include <csignal>
 #include <cstdio>
@@ -31,6 +32,7 @@
 #include <stop_token>
 #include <string>
 #include <thread>
+#include <vector>
 
 namespace
 {
@@ -360,6 +362,23 @@ namespace
                      hydra::RX_CORE_ID, hydra::MATCHING_CORE_ID,
                      opts.xdp_iface ? opts.xdp_iface->c_str() : "synthetic");
 
+        // DIAG-TEMP: decomposed (non-blended) raw-sample capture, for
+        // diagnosing which leg (queue-transit / match-time / end-to-end)
+        // is actually elevated in a live run -- revert after this
+        // investigation. Reuses the exact RawSampleSink mechanism
+        // --benchmark already uses (src/benchmark.cpp), just installed for
+        // this run's whole duration instead of a bounded per-trial window,
+        // and read out once after both threads have joined below -- at
+        // that point nothing can still be writing, so (unlike a periodic
+        // mid-run reset would need) there is no reset-vs-concurrent-writer
+        // race to guard against.
+        constexpr std::size_t kDiagRawCapacity = 2'000'000;
+        auto diag_raw_storage = std::make_unique<hydra::LatencySample[]>(kDiagRawCapacity);
+        hydra::RawSampleSink diag_raw_sink;
+        diag_raw_sink.samples = diag_raw_storage.get();
+        diag_raw_sink.capacity = kDiagRawCapacity;
+        ctx.raw_samples.store(&diag_raw_sink, std::memory_order_release);
+
         // std::thread, not std::jthread: rx_thread_fn/matching_thread_fn
         // must both observe the SAME external stop_source, so one
         // request_stop() call (from the SIGINT handler above) stops both --
@@ -437,6 +456,55 @@ namespace
                      "p99.9=%.1fns p99.99=%.1fns\n",
                      histogram->query_percentile(50.0), histogram->query_percentile(99.0),
                      histogram->query_percentile(99.9), histogram->query_percentile(99.99));
+
+        // DIAG-TEMP: decomposed readout -- both threads above have
+        // definitively stopped writing by this point (join() guarantees
+        // it), so this is a plain, race-free read of everything captured
+        // over the whole run.
+        {
+            ctx.raw_samples.store(nullptr, std::memory_order_release);
+
+            const std::size_t n = diag_raw_sink.count();
+            std::vector<uint64_t> qt, mt, ee;
+            qt.reserve(n);
+            mt.reserve(n);
+            ee.reserve(n);
+            for (std::size_t i = 0; i < n; ++i)
+            {
+                const hydra::LatencySample &s = diag_raw_storage[i];
+                if (s.is_cancel)
+                {
+                    continue;
+                }
+                qt.push_back(s.queue_transit_ns);
+                mt.push_back(s.match_time_ns);
+                ee.push_back(s.end_to_end_ns);
+            }
+
+            const auto pct = [](std::vector<uint64_t> v, double p) -> double
+            {
+                if (v.empty())
+                {
+                    return 0.0;
+                }
+                std::sort(v.begin(), v.end());
+                std::size_t idx = static_cast<std::size_t>((p / 100.0) * static_cast<double>(v.size()));
+                if (idx >= v.size())
+                {
+                    idx = v.size() - 1;
+                }
+                return static_cast<double>(v[idx]);
+            };
+
+            std::fprintf(stdout,
+                         "DIAG decomposed (n=%zu non-cancel samples, whole run, unblended):\n"
+                         "  queue_transit_ns: p50=%.1f p99=%.1f p99.9=%.1f\n"
+                         "  match_time_ns:    p50=%.1f p99=%.1f p99.9=%.1f\n"
+                         "  end_to_end_ns:    p50=%.1f p99=%.1f p99.9=%.1f\n",
+                         qt.size(), pct(qt, 50.0), pct(qt, 99.0), pct(qt, 99.9),
+                         pct(mt, 50.0), pct(mt, 99.0), pct(mt, 99.9),
+                         pct(ee, 50.0), pct(ee, 99.0), pct(ee, 99.9));
+        }
 
         g_stop_source = nullptr;
         std::signal(SIGINT, SIG_DFL);

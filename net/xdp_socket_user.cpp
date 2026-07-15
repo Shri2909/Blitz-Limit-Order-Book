@@ -55,6 +55,7 @@ namespace hydra::xdp
             throw std::runtime_error(
                 "XdpSocket: umem_size exceeds AFXDP_NUM_FRAMES * AFXDP_FRAME_SIZE");
         }
+        num_frames_ = num_frames;
 
         // Allow unlimited locked memory so the UMEM region (DMA target for
         // the NIC) can be pinned. Best-effort + throw on failure: this is
@@ -177,13 +178,22 @@ namespace hydra::xdp
 
     void XdpSocket::release_frame(uint64_t addr) noexcept
     {
-        if (free_frame_count_ < free_frames_.size())
+        // Guarded against num_frames_ (this instance's actual seeded frame
+        // count), not free_frames_.size() (the compile-time array
+        // capacity) -- see the WHY comment on num_frames_ in xdp_socket.hpp.
+        // free_frame_count_ can never legitimately exceed num_frames_; if
+        // it would, the caller double-released a frame (or released an
+        // address this instance never owned) -- drop it rather than
+        // corrupt the allocator, and count it so the condition is visible
+        // instead of silent.
+        if (free_frame_count_ < num_frames_)
         {
             free_frames_[free_frame_count_++] = addr;
         }
-        // free_frame_count_ can never legitimately exceed the UMEM's frame
-        // count; if it would, the caller double-released a frame -- drop
-        // it rather than corrupt the allocator.
+        else [[unlikely]]
+        {
+            ++double_release_count_;
+        }
     }
 
     int XdpSocket::fd() const noexcept

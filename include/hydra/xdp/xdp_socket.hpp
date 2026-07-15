@@ -124,9 +124,24 @@ namespace hydra::xdp
         // recv_batch() call can restuff it into the FILL ring for the
         // kernel to DMA into again. Must be called exactly once per frame
         // handed out by recv_batch(), after the caller is done reading it.
+        // A call that would exceed this instance's actual frame count (a
+        // double-release, or a release of an address this instance never
+        // owned) is dropped rather than corrupting the free-list, and
+        // counted -- see double_release_count().
         void release_frame(uint64_t addr) noexcept;
 
         [[nodiscard]] int fd() const noexcept;
+
+        // Count of release_frame() calls dropped because the free-list was
+        // already at this instance's full frame count -- i.e. a caller bug
+        // (double-release), not a normal operating condition. Should stay
+        // 0 always; non-zero means an invariant was violated somewhere
+        // upstream (mirrors ObjectPool::exhaustion_count()'s role for the
+        // pool allocator -- see object_pool.hpp).
+        [[nodiscard]] uint64_t double_release_count() const noexcept
+        {
+            return double_release_count_;
+        }
 
     private:
         void refill_fill_ring() noexcept;
@@ -141,8 +156,20 @@ namespace hydra::xdp
         xsk_ring_prod tx_ring_{};
         xsk_socket *socket_ = nullptr;
 
+        // Set once in the constructor to umem_size_ / AFXDP_FRAME_SIZE --
+        // this instance's actual seeded frame count, which release_frame()
+        // must guard against instead of free_frames_.size() (the
+        // compile-time array capacity): a umem_size smaller than
+        // AFXDP_NUM_FRAMES * AFXDP_FRAME_SIZE (the header above documents
+        // this as a legal, if suboptimal, construction) would otherwise let
+        // a real double-release go undetected until free_frame_count_
+        // exceeded the array's full compile-time capacity rather than this
+        // instance's true frame count.
+        std::size_t num_frames_ = 0;
+
         std::array<uint64_t, hydra::config::AFXDP_NUM_FRAMES> free_frames_{};
         std::size_t free_frame_count_ = 0;
+        uint64_t double_release_count_ = 0;
     };
 
     // --- XDP program loading helpers (setup-time only, never on the hot path) ---
