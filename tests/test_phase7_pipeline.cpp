@@ -96,11 +96,9 @@ namespace hydra::test
 
             auto order_pool = std::make_unique<ObjectPool<Order, ORDER_POOL_SIZE>>();
             auto level_pool = std::make_unique<ObjectPool<Level, LEVEL_POOL_SIZE>>();
-            auto fill_pool = std::make_unique<ObjectPool<FillEvent, FILL_EVENT_POOL_SIZE>>();
             auto book = std::make_unique<OrderBook>(*order_pool, *level_pool);
-            auto matcher = std::make_unique<Matcher>(*book, *fill_pool, MatchingMode::PRICE_TIME);
+            auto matcher = std::make_unique<Matcher>(*book, MatchingMode::PRICE_TIME);
             auto queue = std::make_unique<SpscQueue<Order, SPSC_CAPACITY>>();
-            auto histogram = std::make_unique<HdrHistogram>();
 
             PipelineContext ctx{
                 .queue = *queue,
@@ -108,8 +106,6 @@ namespace hydra::test
                 .matcher = *matcher,
                 .order_pool = *order_pool,
                 .level_pool = *level_pool,
-                .fill_pool = *fill_pool,
-                .histogram = *histogram,
                 .ns_per_cycle = calibrate_ns_per_cycle(),
             };
 
@@ -177,11 +173,12 @@ namespace hydra::test
                     continue;
                 }
                 HYDRA_CHECK(s.match_time_ns < kSaneMatchTimeUpperBoundNs);
-                // Structural invariants from T1<=T2<=T3<=T4 (monotonic
-                // timestamps taken in that order): end-to-end always
-                // dominates both its own components.
+                // Structural invariants from the underlying monotonic
+                // timestamps: end-to-end always dominates both its own
+                // components (queue residence + pop time together can never
+                // exceed the full ingress-to-completion span).
                 HYDRA_CHECK(s.end_to_end_ns >= s.match_time_ns);
-                HYDRA_CHECK(s.end_to_end_ns >= s.queue_transit_ns);
+                HYDRA_CHECK(s.end_to_end_ns >= s.queue_residence_ns + s.queue_pop_ns);
                 if (s.end_to_end_ns > max_end_to_end_ns)
                 {
                     max_end_to_end_ns = s.end_to_end_ns;
@@ -197,6 +194,108 @@ namespace hydra::test
             HYDRA_CHECK(non_cancel_checked > 0);
         }
 
+        // rx_thread_fn's synthetic RNG never generates a cancel (its qty is
+        // always drawn from uniform_int_distribution<uint32_t>(1,100), see
+        // pipeline.cpp) -- so the test above never exercises
+        // matching_thread_fn's is_cancel branch. This test pushes a
+        // resting order and a matching cancel by hand, driving only
+        // matching_thread_fn (no rx_thread_fn), to confirm cancels now
+        // carry real, sane timestamps instead of the previous
+        // unconditional LatencySample{0, 0, 0, true}.
+        void test_matching_thread_records_real_cancel_latency()
+        {
+            if (std::thread::hardware_concurrency() <= static_cast<unsigned>(MATCHING_CORE_ID))
+            {
+                std::fprintf(stderr,
+                             "    SKIPPED: this machine has only %u core(s), fewer than "
+                             "MATCHING_CORE_ID+1 (%d) -- see the equivalent skip reason "
+                             "above.\n",
+                             std::thread::hardware_concurrency(), MATCHING_CORE_ID + 1);
+                return;
+            }
+
+            auto order_pool = std::make_unique<ObjectPool<Order, ORDER_POOL_SIZE>>();
+            auto level_pool = std::make_unique<ObjectPool<Level, LEVEL_POOL_SIZE>>();
+            auto book = std::make_unique<OrderBook>(*order_pool, *level_pool);
+            auto matcher = std::make_unique<Matcher>(*book, MatchingMode::PRICE_TIME);
+            auto queue = std::make_unique<SpscQueue<Order, SPSC_CAPACITY>>();
+
+            const double ns_per_cycle = calibrate_ns_per_cycle();
+            PipelineContext ctx{
+                .queue = *queue,
+                .book = *book,
+                .matcher = *matcher,
+                .order_pool = *order_pool,
+                .level_pool = *level_pool,
+                .ns_per_cycle = ns_per_cycle,
+            };
+
+            constexpr std::size_t kSinkCapacity = 8;
+            std::vector<LatencySample> storage(kSinkCapacity);
+            RawSampleSink sink;
+            sink.samples = storage.data();
+            sink.capacity = kSinkCapacity;
+            ctx.raw_samples.store(&sink, std::memory_order_release);
+
+            {
+                std::jthread matching(matching_thread_fn, std::ref(ctx));
+
+                Order resting{};
+                resting.order_id = 1;
+                resting.price = 100;
+                resting.qty = 10;
+                resting.side = Side::BUY;
+                resting.tif = TimeInForce::GTC;
+                resting.client_id = 1;
+                resting.timestamp_ns = static_cast<uint64_t>(
+                    static_cast<double>(rdtsc_now()) * ns_per_cycle);
+                HYDRA_CHECK(ctx.queue.push(resting));
+
+                Order cancel{};
+                cancel.order_id = 1;
+                cancel.qty = 0; // qty==0 is the wire encoding for "cancel"
+                cancel.timestamp_ns = static_cast<uint64_t>(
+                    static_cast<double>(rdtsc_now()) * ns_per_cycle);
+                HYDRA_CHECK(ctx.queue.push(cancel));
+
+                while (sink.count() < 2)
+                {
+                    std::this_thread::yield();
+                }
+                matching.request_stop();
+            }
+            ctx.raw_samples.store(nullptr, std::memory_order_release);
+
+            HYDRA_CHECK_EQ(sink.count(), std::size_t{2});
+            const LatencySample &order_sample = storage[0];
+            const LatencySample &cancel_sample = storage[1];
+
+            HYDRA_CHECK(!order_sample.is_cancel);
+            HYDRA_CHECK(cancel_sample.is_cancel);
+
+            std::fprintf(stderr,
+                         "    cancel sample: queue_residence_ns=%llu queue_pop_ns=%llu "
+                         "match_time_ns=%llu end_to_end_ns=%llu\n",
+                         static_cast<unsigned long long>(cancel_sample.queue_residence_ns),
+                         static_cast<unsigned long long>(cancel_sample.queue_pop_ns),
+                         static_cast<unsigned long long>(cancel_sample.match_time_ns),
+                         static_cast<unsigned long long>(cancel_sample.end_to_end_ns));
+
+            // The confirming assertions: previously an unconditional
+            // {0, 0, 0, true} -- now real, sane, non-zero timing.
+            HYDRA_CHECK(cancel_sample.end_to_end_ns > 0);
+            HYDRA_CHECK(cancel_sample.end_to_end_ns >= cancel_sample.match_time_ns);
+            HYDRA_CHECK(cancel_sample.end_to_end_ns >=
+                        cancel_sample.queue_residence_ns + cancel_sample.queue_pop_ns);
+            constexpr uint64_t kSaneCancelTimeUpperBoundNs = 5'000'000; // 5ms, generous
+            HYDRA_CHECK(cancel_sample.match_time_ns < kSaneCancelTimeUpperBoundNs);
+            HYDRA_CHECK(cancel_sample.match_time_ns > 0);
+
+            // And the cancel genuinely took effect against the book, not
+            // just against the timing instrumentation.
+            HYDRA_CHECK(!book->best_bid().has_value());
+        }
+
     } // namespace
 } // namespace hydra::test
 
@@ -207,6 +306,7 @@ int main()
     RUN_TEST(test_pin_and_verify_affinity_matching_succeeds);
     RUN_TEST(test_verify_affinity_throws_on_mismatch);
     RUN_TEST(test_pipeline_threads_run_record_and_shutdown_cleanly);
+    RUN_TEST(test_matching_thread_records_real_cancel_latency);
 
     return report_and_exit_code();
 }

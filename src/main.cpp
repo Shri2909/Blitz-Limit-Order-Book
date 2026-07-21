@@ -12,7 +12,6 @@
 #include "hydra/benchmark.hpp"
 #include "hydra/clock.hpp"
 #include "hydra/config.hpp"
-#include "hydra/histogram.hpp"
 #include "hydra/matcher.hpp"
 #include "hydra/object_pool.hpp"
 #include "hydra/order_book.hpp"
@@ -20,7 +19,6 @@
 #include "hydra/spsc_queue.hpp"
 #include "hydra/types.hpp"
 
-#include <algorithm>
 #include <chrono>
 #include <csignal>
 #include <cstdio>
@@ -32,7 +30,6 @@
 #include <stop_token>
 #include <string>
 #include <thread>
-#include <vector>
 
 namespace
 {
@@ -42,23 +39,34 @@ namespace
         std::fprintf(stderr,
                      "Usage: %s [--benchmark | --test] [options]\n"
                      "\n"
-                     "  --benchmark            run the latency benchmark harness (Phase 8)\n"
-                     "                         and exit; requires --output\n"
+                     "  --benchmark            run THE latency benchmark (Phase 8) and exit;\n"
+                     "                         requires --output and --dataset. This is the\n"
+                     "                         only code path in this project that produces a\n"
+                     "                         latency number -- there is no live-generation\n"
+                     "                         fallback and no other command to run instead.\n"
                      "  --test                 print how to run the standalone test binaries\n"
                      "                         and exit (tests are a separate target, never\n"
                      "                         linked into this binary -- see Phase 9)\n"
                      "  (neither flag)         run the live RX -> SPSC -> matching pipeline\n"
-                     "                         until interrupted (Ctrl+C)\n"
+                     "                         until interrupted (Ctrl+C). This is a manual\n"
+                     "                         smoke test -- it prints no latency numbers and\n"
+                     "                         is never a substitute for --benchmark.\n"
                      "\n"
-                     "  --mode [price_time|pro_rata]  matching mode (default: price_time)\n"
-                     "  --core N               benchmark-only: core the benchmark harness's\n"
-                     "                         own thread pins to (default: %d, RX_CORE_ID --\n"
-                     "                         idle during --benchmark since rx_thread_fn isn't\n"
-                     "                         spawned in that mode)\n"
-                     "  --trials N             benchmark-only: trial count (default: %zu)\n"
+                     "  --mode [price_time|pro_rata]  matching mode (default: price_time, the\n"
+                     "                         canonical claim; pro_rata is a secondary\n"
+                     "                         comparison run, not an interchangeable result)\n"
+                     "  --trials N             benchmark-only: trial count (default: %zu;\n"
+                     "                         below %zu is marked SMOKETEST in the output\n"
+                     "                         and should not be quoted as a result)\n"
                      "  --output PATH          benchmark-only, required: CSV output path\n"
-                     "  --dataset PATH         benchmark-only, optional: replay this dataset\n"
-                     "                         file instead of live-generating one\n"
+                     "  --dataset PATH         benchmark-only, required: replay this dataset\n"
+                     "                         file (generate one with blitz_gen_dataset)\n"
+                     "  --verbose              benchmark-only: print the detailed diagnostics\n"
+                     "                         block (per-workload breakdown, pool telemetry)\n"
+                     "                         in addition to the concise default report\n"
+                     "  --allow-dirty          benchmark-only: don't fail closed on a dirty\n"
+                     "                         working tree -- the report still marks the run\n"
+                     "                         as measured against a dirty tree\n"
                      "\n"
                      "  --xdp-iface IFACE      live-pipeline-only: receive real packets over\n"
                      "                         AF_XDP on this interface instead of the\n"
@@ -68,7 +76,7 @@ namespace
                      "  --xdp-prog PATH        compiled XDP program to load (default: %s)\n"
                      "  --xdp-attach-mode [native|skb|hw]  XDP attach mode (default: %s --\n"
                      "                         veth test interfaces only support skb/generic)\n",
-                     prog, hydra::RX_CORE_ID, hydra::DEFAULT_TRIAL_COUNT,
+                     prog, hydra::DEFAULT_TRIAL_COUNT, hydra::DEFAULT_TRIAL_COUNT,
                      hydra::config::AFXDP_DEFAULT_QUEUE_ID, "net/xdp_prog.o", "skb");
     }
 
@@ -124,25 +132,6 @@ namespace
     }
 #endif
 
-    [[nodiscard]] int parse_int(const std::string &s, const char *flag)
-    {
-        try
-        {
-            std::size_t consumed = 0;
-            const int v = std::stoi(s, &consumed);
-            if (consumed != s.size())
-            {
-                throw std::invalid_argument("trailing characters");
-            }
-            return v;
-        }
-        catch (const std::exception &)
-        {
-            std::fprintf(stderr, "error: %s expects an integer, got '%s'\n", flag, s.c_str());
-            std::exit(1);
-        }
-    }
-
     [[nodiscard]] std::size_t parse_size(const std::string &s, const char *flag)
     {
         try
@@ -168,10 +157,11 @@ namespace
         bool want_benchmark = false;
         bool want_test = false;
         hydra::MatchingMode mode = hydra::MatchingMode::PRICE_TIME;
-        int core = hydra::RX_CORE_ID;
         std::size_t trials = hydra::DEFAULT_TRIAL_COUNT;
         std::string output_path;
         std::optional<std::string> dataset_path;
+        bool verbose = false;
+        bool allow_dirty = false;
 
         // Live-pipeline-only: unset xdp_iface means "use the synthetic
         // rx_thread_fn generator" regardless of build configuration. These
@@ -207,11 +197,6 @@ namespace
                 opts.mode = parse_mode(val);
                 continue;
             }
-            if (match_flag(argc, argv, i, "--core", val))
-            {
-                opts.core = parse_int(val, "--core");
-                continue;
-            }
             if (match_flag(argc, argv, i, "--trials", val))
             {
                 opts.trials = parse_size(val, "--trials");
@@ -226,9 +211,19 @@ namespace
             {
                 // Forwarded into BenchmarkConfig::dataset_path unchanged --
                 // file loading/validation happens inside run_benchmark()
-                // (Phase 8), not here. Only meaningful alongside
-                // --benchmark; harmlessly unused otherwise.
+                // (Phase 8), not here. Required alongside --benchmark; there
+                // is no live-generation fallback.
                 opts.dataset_path = val;
+                continue;
+            }
+            if (std::strcmp(argv[i], "--verbose") == 0)
+            {
+                opts.verbose = true;
+                continue;
+            }
+            if (std::strcmp(argv[i], "--allow-dirty") == 0)
+            {
+                opts.allow_dirty = true;
                 continue;
             }
             if (match_flag(argc, argv, i, "--xdp-iface", val))
@@ -265,9 +260,24 @@ namespace
             std::exit(1);
         }
 
+        if (opts.want_benchmark && opts.want_test)
+        {
+            std::fprintf(stderr, "error: --benchmark and --test are mutually exclusive\n");
+            std::exit(1);
+        }
         if (opts.want_benchmark && opts.output_path.empty())
         {
             std::fprintf(stderr, "error: --benchmark requires --output PATH\n");
+            std::exit(1);
+        }
+        if (opts.want_benchmark && !opts.dataset_path.has_value())
+        {
+            std::fprintf(stderr,
+                         "error: --benchmark requires --dataset PATH -- there is no "
+                         "live-generation fallback. Generate one first:\n"
+                         "  cmake --build build --target blitz_gen_dataset\n"
+                         "  ./build/blitz_gen_dataset --seed 42 --count 110000 "
+                         "--output datasets/bench_110k.bin\n");
             std::exit(1);
         }
 
@@ -326,12 +336,9 @@ namespace
             std::make_unique<hydra::ObjectPool<hydra::Order, hydra::ORDER_POOL_SIZE>>();
         auto level_pool =
             std::make_unique<hydra::ObjectPool<hydra::Level, hydra::LEVEL_POOL_SIZE>>();
-        auto fill_pool =
-            std::make_unique<hydra::ObjectPool<hydra::FillEvent, hydra::FILL_EVENT_POOL_SIZE>>();
         auto book = std::make_unique<hydra::OrderBook>(*order_pool, *level_pool);
-        auto matcher = std::make_unique<hydra::Matcher>(*book, *fill_pool, mode);
+        auto matcher = std::make_unique<hydra::Matcher>(*book, mode);
         auto queue = std::make_unique<hydra::SpscQueue<hydra::Order, hydra::SPSC_CAPACITY>>();
-        auto histogram = std::make_unique<hydra::HdrHistogram>();
 
         hydra::PipelineContext ctx{
             .queue = *queue,
@@ -339,8 +346,6 @@ namespace
             .matcher = *matcher,
             .order_pool = *order_pool,
             .level_pool = *level_pool,
-            .fill_pool = *fill_pool,
-            .histogram = *histogram,
             .ns_per_cycle = hydra::calibrate_ns_per_cycle(),
         };
 
@@ -357,27 +362,13 @@ namespace
 
         std::fprintf(stdout,
                      "hydra_lob: running live pipeline (mode=%s, RX_CORE_ID=%d, "
-                     "MATCHING_CORE_ID=%d, rx_source=%s) -- press Ctrl+C to stop\n",
+                     "MATCHING_CORE_ID=%d, rx_source=%s) -- press Ctrl+C to stop.\n"
+                     "hydra_lob: this is a manual smoke test, not a benchmark -- it prints "
+                     "no latency numbers. For a real latency figure, run "
+                     "'blitz_lob --benchmark --dataset <path> --output <path>' instead.\n",
                      mode == hydra::MatchingMode::PRICE_TIME ? "price_time" : "pro_rata",
                      hydra::RX_CORE_ID, hydra::MATCHING_CORE_ID,
                      opts.xdp_iface ? opts.xdp_iface->c_str() : "synthetic");
-
-        // DIAG-TEMP: decomposed (non-blended) raw-sample capture, for
-        // diagnosing which leg (queue-transit / match-time / end-to-end)
-        // is actually elevated in a live run -- revert after this
-        // investigation. Reuses the exact RawSampleSink mechanism
-        // --benchmark already uses (src/benchmark.cpp), just installed for
-        // this run's whole duration instead of a bounded per-trial window,
-        // and read out once after both threads have joined below -- at
-        // that point nothing can still be writing, so (unlike a periodic
-        // mid-run reset would need) there is no reset-vs-concurrent-writer
-        // race to guard against.
-        constexpr std::size_t kDiagRawCapacity = 2'000'000;
-        auto diag_raw_storage = std::make_unique<hydra::LatencySample[]>(kDiagRawCapacity);
-        hydra::RawSampleSink diag_raw_sink;
-        diag_raw_sink.samples = diag_raw_storage.get();
-        diag_raw_sink.capacity = kDiagRawCapacity;
-        ctx.raw_samples.store(&diag_raw_sink, std::memory_order_release);
 
         // std::thread, not std::jthread: rx_thread_fn/matching_thread_fn
         // must both observe the SAME external stop_source, so one
@@ -411,100 +402,17 @@ namespace
         std::thread matching_thread(hydra::matching_thread_fn, stop_source.get_token(),
                                     std::ref(ctx));
 
-        // Live latency reporting: ctx.histogram already receives every
-        // order's queue_transit_ns/match_time_ns/end_to_end_ns from
-        // matching_thread_fn regardless of RX source (synthetic or
-        // AF_XDP) -- it was simply never surfaced before. HdrHistogram is
-        // double-buffered specifically so a control thread can
-        // swap_buffers()+query_percentile() concurrently with the hot
-        // path's record() calls (see histogram.hpp); each swap finalizes
-        // the samples recorded since the previous one into a queryable
-        // snapshot and starts a fresh window, so these numbers cover a
-        // rolling ~5s window, not a cumulative all-time distribution.
-        // NOTE: this is a blended distribution across all three latency
-        // fields (not the same single end-to-end-only metric the
-        // preflight-gated --benchmark reports) -- useful as a live signal
-        // that real traffic is flowing and roughly how fast, not a
-        // substitute for --benchmark's controlled, reproducible number.
-        constexpr int kPollIntervalMs = 100;
-        constexpr int kPollsPerReport = 5000 / kPollIntervalMs; // ~5s
-        int polls_since_report = 0;
-
+        // Deliberately no latency reporting here. This mode exists to prove
+        // the pipeline runs, not to produce a number. There is exactly one
+        // command in this project that produces a latency number:
+        // --benchmark.
         while (!stop_source.stop_requested())
         {
-            std::this_thread::sleep_for(std::chrono::milliseconds(kPollIntervalMs));
-            if (++polls_since_report >= kPollsPerReport)
-            {
-                polls_since_report = 0;
-                histogram->swap_buffers();
-                std::fprintf(stdout,
-                             "hydra_lob: live latency, last ~5s (blended queue-transit + "
-                             "match-time + end-to-end): p50=%.1fns p99=%.1fns p99.9=%.1fns "
-                             "p99.99=%.1fns\n",
-                             histogram->query_percentile(50.0), histogram->query_percentile(99.0),
-                             histogram->query_percentile(99.9), histogram->query_percentile(99.99));
-            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(200));
         }
 
         rx_thread.join();
         matching_thread.join();
-
-        histogram->swap_buffers();
-        std::fprintf(stdout,
-                     "hydra_lob: final live latency snapshot, since last window (blended "
-                     "queue-transit + match-time + end-to-end): p50=%.1fns p99=%.1fns "
-                     "p99.9=%.1fns p99.99=%.1fns\n",
-                     histogram->query_percentile(50.0), histogram->query_percentile(99.0),
-                     histogram->query_percentile(99.9), histogram->query_percentile(99.99));
-
-        // DIAG-TEMP: decomposed readout -- both threads above have
-        // definitively stopped writing by this point (join() guarantees
-        // it), so this is a plain, race-free read of everything captured
-        // over the whole run.
-        {
-            ctx.raw_samples.store(nullptr, std::memory_order_release);
-
-            const std::size_t n = diag_raw_sink.count();
-            std::vector<uint64_t> qt, mt, ee;
-            qt.reserve(n);
-            mt.reserve(n);
-            ee.reserve(n);
-            for (std::size_t i = 0; i < n; ++i)
-            {
-                const hydra::LatencySample &s = diag_raw_storage[i];
-                if (s.is_cancel)
-                {
-                    continue;
-                }
-                qt.push_back(s.queue_transit_ns);
-                mt.push_back(s.match_time_ns);
-                ee.push_back(s.end_to_end_ns);
-            }
-
-            const auto pct = [](std::vector<uint64_t> v, double p) -> double
-            {
-                if (v.empty())
-                {
-                    return 0.0;
-                }
-                std::sort(v.begin(), v.end());
-                std::size_t idx = static_cast<std::size_t>((p / 100.0) * static_cast<double>(v.size()));
-                if (idx >= v.size())
-                {
-                    idx = v.size() - 1;
-                }
-                return static_cast<double>(v[idx]);
-            };
-
-            std::fprintf(stdout,
-                         "DIAG decomposed (n=%zu non-cancel samples, whole run, unblended):\n"
-                         "  queue_transit_ns: p50=%.1f p99=%.1f p99.9=%.1f\n"
-                         "  match_time_ns:    p50=%.1f p99=%.1f p99.9=%.1f\n"
-                         "  end_to_end_ns:    p50=%.1f p99=%.1f p99.9=%.1f\n",
-                         qt.size(), pct(qt, 50.0), pct(qt, 99.0), pct(qt, 99.9),
-                         pct(mt, 50.0), pct(mt, 99.0), pct(mt, 99.9),
-                         pct(ee, 50.0), pct(ee, 99.0), pct(ee, 99.9));
-        }
 
         g_stop_source = nullptr;
         std::signal(SIGINT, SIG_DFL);
@@ -518,12 +426,9 @@ namespace
             std::make_unique<hydra::ObjectPool<hydra::Order, hydra::ORDER_POOL_SIZE>>();
         auto level_pool =
             std::make_unique<hydra::ObjectPool<hydra::Level, hydra::LEVEL_POOL_SIZE>>();
-        auto fill_pool =
-            std::make_unique<hydra::ObjectPool<hydra::FillEvent, hydra::FILL_EVENT_POOL_SIZE>>();
         auto book = std::make_unique<hydra::OrderBook>(*order_pool, *level_pool);
-        auto matcher = std::make_unique<hydra::Matcher>(*book, *fill_pool, opts.mode);
+        auto matcher = std::make_unique<hydra::Matcher>(*book, opts.mode);
         auto queue = std::make_unique<hydra::SpscQueue<hydra::Order, hydra::SPSC_CAPACITY>>();
-        auto histogram = std::make_unique<hydra::HdrHistogram>();
 
         // ns_per_cycle is deliberately left at its default here, not
         // calibrated -- run_benchmark() calibrates once internally and
@@ -536,16 +441,17 @@ namespace
             .matcher = *matcher,
             .order_pool = *order_pool,
             .level_pool = *level_pool,
-            .fill_pool = *fill_pool,
-            .histogram = *histogram,
         };
 
         hydra::BenchmarkConfig cfg{
             .mode = opts.mode,
-            .core = opts.core,
             .trials = opts.trials,
             .output_path = opts.output_path,
-            .dataset_path = opts.dataset_path,
+            // opts.dataset_path is guaranteed set here -- parse_cli() exits
+            // with an error before reaching this point otherwise.
+            .dataset_path = *opts.dataset_path,
+            .verbose = opts.verbose,
+            .allow_dirty = opts.allow_dirty,
         };
 
         hydra::run_benchmark(cfg, ctx);

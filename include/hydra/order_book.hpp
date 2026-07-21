@@ -106,6 +106,40 @@ namespace hydra
             return true;
         }
 
+        // Read-only O(1) lookup by order_id -- used by Matcher::replace() to
+        // snapshot the resting order's side/tif/client_id/qty/price before
+        // deciding which replace path applies (see that function). Returns
+        // nullptr for an unknown/already-gone order_id, mirroring
+        // cancel_order()'s own "not found is a normal race, not an error"
+        // convention.
+        [[nodiscard]] const Order *find_order(uint64_t order_id) const noexcept
+        {
+            const auto it = order_index_.find(order_id);
+            return (it == order_index_.end()) ? nullptr : it->second.order;
+        }
+
+        // Priority-preserving in-place replace: caller (Matcher::replace())
+        // guarantees new_qty <= the order's current qty and that price is
+        // unchanged -- under those two conditions the order cannot newly
+        // cross the book (its marketable price didn't move and its size
+        // only shrank), so no unlink/relink or re-match is needed. O(1):
+        // mutates the order's qty and the level's total_qty by the delta in
+        // place, exactly preserving the order's FIFO position.
+        [[nodiscard]] bool replace_order_in_place(uint64_t order_id, uint32_t new_qty) noexcept
+        {
+            const auto it = order_index_.find(order_id);
+            if (it == order_index_.end()) [[unlikely]]
+            {
+                return false;
+            }
+            Order *const order = it->second.order;
+            Level *const level = it->second.level;
+            const uint32_t delta = order->qty - new_qty;
+            order->qty = new_qty;
+            level->total_qty -= delta;
+            return true;
+        }
+
         [[nodiscard]] std::optional<int64_t> best_bid() const noexcept
         {
             if (bids_.empty()) [[unlikely]]
@@ -174,6 +208,39 @@ namespace hydra
         [[nodiscard]] uint64_t arena_fallback_count() const noexcept
         {
             return fallback_resource_.fallback_count();
+        }
+
+        // Clears all resting orders/levels so a caller can replay an
+        // identical event sequence (same order_ids) against a genuinely
+        // clean book. WHY this exists: run_benchmark()'s trial loop used to
+        // replay the same dataset (fixed order_ids) against this SAME book
+        // across all 5 trials with no reset in between -- any order_id
+        // still resting at the end of trial N would make add_order() for
+        // that same order_id in trial N+1 silently return nullptr (the
+        // duplicate-order_id rejection, correct and tested on its own --
+        // see test_duplicate_id), a no-op the caller (Matcher::match()'s
+        // GTC path) discards without a counter or log line. A rejected
+        // add is cheaper than a real one, so those phantom samples'
+        // match_time_ns/end_to_end_ns were silently biased low, and
+        // trials 2-5 weren't actually independent replays of the same
+        // workload. This method, called between trials, is the fix.
+        //
+        // Only clears order_index_/bids_/asks_ -- does NOT release
+        // individual Order*/Level* back to order_pool_/level_pool_ one at
+        // a time; the caller is expected to also call
+        // order_pool_.reset()/level_pool_.reset() (see benchmark.cpp),
+        // which rebuilds those pools' free lists unconditionally and makes
+        // an itemized release here redundant.
+        //
+        // Caller's responsibility, not enforced here: only call this when
+        // nothing else is concurrently touching the book (e.g. after
+        // confirming the consumer/matching thread has drained and is idle
+        // -- see the call site in benchmark.cpp).
+        void reset() noexcept
+        {
+            bids_.clear();
+            asks_.clear();
+            order_index_.clear();
         }
 
     private:
@@ -297,6 +364,17 @@ namespace hydra
             {
                 level->tail_ = order->prev_;
             }
+            // level->total_qty -= order->qty here assumes order->qty is
+            // already the correct "how much this order still contributes"
+            // at the moment of unlink. Holds for a genuine external cancel
+            // (order->qty is the full untouched resting quantity) and for
+            // a matcher-triggered cancel-on-full-fill (Matcher::apply_fill
+            // zeroes resting->qty *before* calling cancel_order(), so this
+            // line subtracts zero and total_qty was already correctly
+            // decremented by apply_fill's own explicit subtraction) -- see
+            // apply_fill()'s matching comment (matcher.hpp) for the other
+            // half of this contract. Reordering either side would silently
+            // double-decrement total_qty for a fully-filled resting order.
             level->total_qty -= order->qty;
             --level->order_count;
         }

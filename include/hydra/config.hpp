@@ -69,9 +69,11 @@ namespace hydra
     // WHY: Sized to comfortably exceed the maximum number of simultaneously resting
     // orders/levels observed in realistic market-data replay. Exhaustion is a
     // recoverable condition (acquire() returns nullptr) not a crash.
+    // NOTE: no FillEvent pool -- FillEvent notifications are delivered
+    // synchronously and never outlive Matcher::apply_fill(), so there is
+    // nothing for a pool to buy here (see matcher.hpp's apply_fill()).
     constexpr size_t ORDER_POOL_SIZE = 65536;
     constexpr size_t LEVEL_POOL_SIZE = 4096;
-    constexpr size_t FILL_EVENT_POOL_SIZE = 10240;
 
     // ── Benchmark parameters ─────────────────────────────────────────────────────
     // WHY: 10k warmup iterations allow the branch predictor, instruction cache,

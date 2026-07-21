@@ -4,6 +4,22 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
+# WHY no use of CMAKE_BUILD_TYPE anywhere below: every target here has
+# genuinely different, independently-justified flags (Release/-march=native
+# for blitz_lob, -O1 -g -fsanitize=... for the sanitizer/per-phase targets,
+# -O2 with no -march=native for the byte-reproducible dataset generator) --
+# a single global Debug/Release switch can't express that. Target name
+# selects the build flavor instead; -DCMAKE_BUILD_TYPE=... is intentionally
+# a no-op in this project, not an oversight.
+
+# WHY: 10 per-phase exit-condition targets used to mean a developer had to
+# know and invoke every target name by hand (see the shell loop this used
+# to require). ctest wiring below turns that into one command: `ctest
+# --test-dir build --output-on-failure`. Per-phase granularity is still
+# available (`ctest -R phase6`) -- this does not collapse the targets, only
+# the invocation surface.
+enable_testing()
+
 option(ENABLE_AFXDP "Build with AF_XDP support" OFF)
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -29,6 +45,35 @@ if(NOT BLITZ_LOB_GIT_HASH OR NOT BLITZ_LOB_GIT_RESULT EQUAL 0)
 endif()
 
 # ──────────────────────────────────────────────────────────────────────────────
+# Dirty-tree detection
+# WHY: BLITZ_LOB_GIT_HASH alone can look like a trustworthy commit pin while
+#      actually being built from a working tree that has diverged from that
+#      commit -- exactly what produced this project's own "measured against
+#      an uncommitted working tree" caveat. Recomputed at every configure, so
+#      it reflects the tree as it stood at build time, matching what the
+#      resulting binary actually contains. Untracked files don't count as
+#      dirty (a generated results/ CSV sitting in the tree shouldn't flag
+#      every subsequent build) -- only modifications to tracked files do.
+# ──────────────────────────────────────────────────────────────────────────────
+set(BLITZ_LOB_DIRTY 0)
+if(Git_FOUND)
+    execute_process(
+        COMMAND ${GIT_EXECUTABLE} status --porcelain --untracked-files=no
+        WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+        OUTPUT_VARIABLE BLITZ_LOB_GIT_STATUS
+        OUTPUT_STRIP_TRAILING_WHITESPACE
+        ERROR_QUIET
+    )
+    if(BLITZ_LOB_GIT_STATUS)
+        set(BLITZ_LOB_DIRTY 1)
+        message(WARNING "Working tree has uncommitted changes to tracked files -- "
+                         "any benchmark result built from this configure will be "
+                         "stamped dirty=yes and should not be treated as pinned to "
+                         "${BLITZ_LOB_GIT_HASH}.")
+    endif()
+endif()
+
+# ──────────────────────────────────────────────────────────────────────────────
 # Release binary
 # WHY: -march=native only here — sanitizer targets run on CI runners that may
 #      lack extended instruction sets; native optimizations are meaningless for
@@ -43,7 +88,10 @@ target_include_directories(blitz_lob PRIVATE include)
 target_compile_options(blitz_lob PRIVATE
     -O3 -DNDEBUG -march=native -Wall -Wextra -Wpedantic
 )
-target_compile_definitions(blitz_lob PRIVATE HYDRA_LOB_VERSION="${BLITZ_LOB_GIT_HASH}")
+target_compile_definitions(blitz_lob PRIVATE
+    HYDRA_LOB_VERSION="${BLITZ_LOB_GIT_HASH}"
+    HYDRA_LOB_DIRTY=${BLITZ_LOB_DIRTY}
+)
 
 if(ENABLE_AFXDP)
     # ──────────────────────────────────────────────────────────────────────
@@ -103,6 +151,10 @@ target_compile_options(blitz_lob_asan PRIVATE
 target_link_options(blitz_lob_asan PRIVATE
     -fsanitize=address,undefined
 )
+target_compile_definitions(blitz_lob_asan PRIVATE
+    HYDRA_LOB_VERSION="${BLITZ_LOB_GIT_HASH}"
+    HYDRA_LOB_DIRTY=${BLITZ_LOB_DIRTY}
+)
 
 # ──────────────────────────────────────────────────────────────────────────────
 # TSan + UBSan binary  (SEPARATE from asan — never combine address + thread)
@@ -119,18 +171,9 @@ target_compile_options(blitz_lob_tsan PRIVATE
 target_link_options(blitz_lob_tsan PRIVATE
     -fsanitize=thread,undefined
 )
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Canonical correctness suite (Phase 9)
-# WHY: Standalone target — includes headers directly, owns its own main().
-#      Links nothing from src/. No GTest dependency.
-# ──────────────────────────────────────────────────────────────────────────────
-add_executable(blitz_lob_tests
-    tests/test_hydra_lob.cpp
-)
-target_include_directories(blitz_lob_tests PRIVATE include)
-target_compile_options(blitz_lob_tests PRIVATE
-    -O1 -g -Wall -Wextra -Wpedantic
+target_compile_definitions(blitz_lob_tsan PRIVATE
+    HYDRA_LOB_VERSION="${BLITZ_LOB_GIT_HASH}"
+    HYDRA_LOB_DIRTY=${BLITZ_LOB_DIRTY}
 )
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -144,14 +187,15 @@ target_compile_options(blitz_lob_tests PRIVATE
 #      test file actually has content; still-empty phase files are not yet
 #      listed as targets (an empty .cpp with no main() would fail to link).
 #      test_phase1_types    → Phase 1  config/types static_assert validation
-#      test_phase2_timing   → Phase 2  rdtsc clock + histogram smoke test
+#      test_phase2_timing   → Phase 2  rdtsc clock smoke test
 #      test_phase3_pool     → Phase 3  object pool acquire/release/overflow
 #      test_phase4_spsc     → Phase 4  SPSC ring buffer ordering under TSan
 #      test_phase5_orderbook→ Phase 5  add/cancel/best_bid/best_ask
-#      test_phase6_matcher  → Phase 6  price-time, pro-rata, IOC, FOK
+#      test_phase6_matcher  → Phase 6  price-time, pro-rata, IOC, FOK,
+#                                       price improvement, empty-book matching
 #      test_phase7_pipeline → Phase 7  affinity pin + verify, jthread shutdown
 #      test_phase8_benchmark→ Phase 8  dataset determinism + CSV column check
-#      test_phase9_suite    → Phase 9  extended edge cases beyond the 15 core
+#      test_phase9_suite    → Phase 9  extended edge cases beyond phase 5/6
 #      test_phase10_xdp     → Phase 10 AF_XDP compile-gate smoke test
 # ──────────────────────────────────────────────────────────────────────────────
 add_executable(blitz_lob_test_phase1_types
@@ -294,6 +338,25 @@ if(ENABLE_AFXDP)
 endif()
 
 # ──────────────────────────────────────────────────────────────────────────────
+# ctest registration -- the one-command correctness gate.
+# WHY each test's own binary IS the "command": every target above already
+# has its own RUN_TEST/[PASS]/[FAIL] harness (test_harness.hpp) and returns
+# non-zero on any failure, so ctest needs no special assertions of its own
+# -- it just needs to run each binary and trust its exit code, which is
+# exactly what a bare COMMAND add_test() does.
+# ──────────────────────────────────────────────────────────────────────────────
+add_test(NAME phase1_types COMMAND blitz_lob_test_phase1_types)
+add_test(NAME phase2_timing COMMAND blitz_lob_test_phase2_timing)
+add_test(NAME phase3_pool COMMAND blitz_lob_test_phase3_pool)
+add_test(NAME phase4_spsc COMMAND blitz_lob_test_phase4_spsc)
+add_test(NAME phase5_orderbook COMMAND blitz_lob_test_phase5_orderbook)
+add_test(NAME phase6_matcher COMMAND blitz_lob_test_phase6_matcher)
+add_test(NAME phase7_pipeline COMMAND blitz_lob_test_phase7_pipeline)
+add_test(NAME phase8_benchmark COMMAND blitz_lob_test_phase8_benchmark)
+add_test(NAME phase9_suite COMMAND blitz_lob_test_phase9_suite)
+add_test(NAME phase10_xdp COMMAND blitz_lob_test_phase10_xdp)
+
+# ──────────────────────────────────────────────────────────────────────────────
 # Dataset generator tool
 # WHY: -march=native intentionally OMITTED — this tool writes binary files that
 #      must be byte-identical when regenerated on any machine given the same
@@ -306,4 +369,93 @@ add_executable(blitz_gen_dataset
 target_include_directories(blitz_gen_dataset PRIVATE include)
 target_compile_options(blitz_gen_dataset PRIVATE
     -O2 -Wall -Wextra -Wpedantic
+)
+# WHY this doesn't threaten the byte-reproducibility contract above: the
+# version string is only ever printed to stdout / the manifest-entry
+# suggestion (tools/gen_dataset.cpp) -- DatasetGenerator::write_to_file()
+# never writes it into the .bin file itself, so two builds with different
+# git hashes still produce byte-identical output for the same seed+config.
+target_compile_definitions(blitz_gen_dataset PRIVATE
+    HYDRA_LOB_VERSION="${BLITZ_LOB_GIT_HASH}"
+)
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Automated ablation suite (see ablation/ and scripts/run_ablations.sh)
+# WHY EXCLUDE_FROM_ALL, not an ENABLE_ABLATION_* option: unlike ENABLE_AFXDP
+#      (gated because it needs libbpf/libxdp, external deps not every host
+#      has), these targets have no external dependency and always compile
+#      fine -- the only thing that needs gating is "don't build these by
+#      default," which EXCLUDE_FROM_ALL does directly. `cmake --build build`
+#      with no --target never builds any of them; `cmake --build build
+#      --target blitz_lob_ablation_mutex_queue` (or via
+#      scripts/run_ablations.sh) does.
+# WHY the include-directory order matters: each target lists its
+#      ablation/<name>/include directory BEFORE the real include/ -- the
+#      compiler's quote-include search (#include "hydra/...") then resolves
+#      the one header that directory shadows from there, and falls through
+#      to the real include/ for everything else. See
+#      ablation/mutex_queue/include/hydra/spsc_queue.hpp's own WHY for the
+#      full mechanism.
+# ──────────────────────────────────────────────────────────────────────────────
+set(BLITZ_LOB_ABLATION_SOURCES src/main.cpp src/pipeline.cpp src/benchmark.cpp)
+
+add_executable(blitz_lob_ablation_mutex_queue EXCLUDE_FROM_ALL ${BLITZ_LOB_ABLATION_SOURCES})
+target_include_directories(blitz_lob_ablation_mutex_queue PRIVATE
+    ablation/mutex_queue/include include)
+target_compile_options(blitz_lob_ablation_mutex_queue PRIVATE
+    -O3 -DNDEBUG -march=native -Wall -Wextra -Wpedantic
+)
+target_compile_definitions(blitz_lob_ablation_mutex_queue PRIVATE
+    HYDRA_LOB_VERSION="${BLITZ_LOB_GIT_HASH}-ablation-mutex_queue"
+    HYDRA_LOB_DIRTY=${BLITZ_LOB_DIRTY}
+)
+
+add_executable(blitz_lob_ablation_unpinned EXCLUDE_FROM_ALL ${BLITZ_LOB_ABLATION_SOURCES})
+target_include_directories(blitz_lob_ablation_unpinned PRIVATE
+    ablation/unpinned/include include)
+target_compile_options(blitz_lob_ablation_unpinned PRIVATE
+    -O3 -DNDEBUG -march=native -Wall -Wextra -Wpedantic
+)
+target_compile_definitions(blitz_lob_ablation_unpinned PRIVATE
+    HYDRA_LOB_VERSION="${BLITZ_LOB_GIT_HASH}-ablation-unpinned"
+    HYDRA_LOB_DIRTY=${BLITZ_LOB_DIRTY}
+)
+
+add_executable(blitz_lob_ablation_malloc_pool EXCLUDE_FROM_ALL ${BLITZ_LOB_ABLATION_SOURCES})
+target_include_directories(blitz_lob_ablation_malloc_pool PRIVATE
+    ablation/malloc_pool/include include)
+target_compile_options(blitz_lob_ablation_malloc_pool PRIVATE
+    -O3 -DNDEBUG -march=native -Wall -Wextra -Wpedantic
+)
+target_compile_definitions(blitz_lob_ablation_malloc_pool PRIVATE
+    HYDRA_LOB_VERSION="${BLITZ_LOB_GIT_HASH}-ablation-malloc_pool"
+    HYDRA_LOB_DIRTY=${BLITZ_LOB_DIRTY}
+)
+
+# WHY this ablation ALSO needs its own blitz_gen_dataset build: flattening
+# Order changes its on-disk size (embedded in DatasetRecord), so a dataset
+# generated by the real blitz_gen_dataset is not byte-compatible with this
+# ablation's Order layout -- see ablation/flat_layout/include/hydra/
+# dataset_generator.hpp's own WHY.
+add_executable(blitz_lob_ablation_flat_layout EXCLUDE_FROM_ALL ${BLITZ_LOB_ABLATION_SOURCES})
+target_include_directories(blitz_lob_ablation_flat_layout PRIVATE
+    ablation/flat_layout/include include)
+target_compile_options(blitz_lob_ablation_flat_layout PRIVATE
+    -O3 -DNDEBUG -march=native -Wall -Wextra -Wpedantic
+)
+target_compile_definitions(blitz_lob_ablation_flat_layout PRIVATE
+    HYDRA_LOB_VERSION="${BLITZ_LOB_GIT_HASH}-ablation-flat_layout"
+    HYDRA_LOB_DIRTY=${BLITZ_LOB_DIRTY}
+)
+
+add_executable(blitz_gen_dataset_ablation_flat_layout EXCLUDE_FROM_ALL
+    tools/gen_dataset.cpp
+)
+target_include_directories(blitz_gen_dataset_ablation_flat_layout PRIVATE
+    ablation/flat_layout/include include)
+target_compile_options(blitz_gen_dataset_ablation_flat_layout PRIVATE
+    -O2 -Wall -Wextra -Wpedantic
+)
+target_compile_definitions(blitz_gen_dataset_ablation_flat_layout PRIVATE
+    HYDRA_LOB_VERSION="${BLITZ_LOB_GIT_HASH}-ablation-flat_layout"
 )

@@ -1,12 +1,23 @@
 #pragma once
 
-// include/hydra/dataset_generator.hpp
+// ablation/flat_layout/include/hydra/dataset_generator.hpp
 //
-// Deterministic, seeded synthetic order dataset generation. Decouples *what*
-// orders get sent from *how* they get sent, so the exact same order
-// sequence can be replayed across benchmark runs, across machines, or fed
-// into regression tests, instead of regenerating a fresh random sequence
-// inline every time benchmark.cpp runs.
+// Fork of the real include/hydra/dataset_generator.hpp, needed ONLY because
+// this ablation's shadowed types.hpp shrinks Order from 128 to 88 bytes
+// (no hot/cold split, no alignas(64)) -- Order is embedded in DatasetRecord,
+// so the on-disk record size changes too: 1 (event_type) + 63 (reserved) +
+// 88 (Order) + 8 (cancel_order_id) + 8 (arrival_offset_ns) = 168 bytes,
+// naturally 8-byte aligned (Order's alignof drops from 64 to 8 once
+// alignas(64) is gone), vs. the real DatasetRecord's 256 bytes (which pads
+// up to Order's 64-byte alignment requirement). Every other line is
+// identical to the real file -- kept in sync manually since CMake's
+// include-path-shadowing trick (see ablation/mutex_queue/include/hydra/
+// spsc_queue.hpp's WHY) only swaps in a header this ablation target's
+// include path lists first, it doesn't let two headers share a body.
+//
+// Only consumed by blitz_gen_dataset_ablation_flat_layout (produces
+// datasets/ablation4_flat.bin) and blitz_lob_ablation_flat_layout
+// (replays it) -- see scripts/run_ablations.sh.
 
 #include "hydra/types.hpp"
 
@@ -34,21 +45,9 @@ namespace hydra
         double arrival_rate_hz;
         double ioc_ratio;
         double fok_ratio;
-        // Fraction of non-cancel events that become a REPLACE instead of a
-        // NEW_ORDER, once a resting order exists to replace. Drawn from
-        // the same uniform value as cancel_ratio (cancel_ratio + this must
-        // be <= 1.0) -- see DatasetGenerator::generate(). Defaulted to 0.0
-        // so every existing construction site (tests, blitz_gen_dataset)
-        // that doesn't set it keeps generating exactly the datasets it did
-        // before this field existed.
+        // Kept in sync with the real dataset_generator.hpp -- see that
+        // file's comment for the WHY.
         double replace_ratio = 0.0;
-        // Number of distinct synthetic client_ids new orders are drawn
-        // from (client_id = 1 + order_id % client_id_count). Smaller values
-        // deliberately raise the self-trade collision rate -- a
-        // "self-trade-heavy" dataset is just this knob turned down, not a
-        // separate generation mode. Defaulted to 8 to reproduce the
-        // previously-hardcoded kSyntheticClientCount exactly for any
-        // existing construction site that doesn't set it.
         uint64_t client_id_count = 8;
     };
     static_assert(sizeof(DatasetConfig) == 88, "DatasetConfig layout drifted from the computed byte budget");
@@ -60,15 +59,6 @@ namespace hydra
     {
         NEW_ORDER,
         CANCEL,
-        // Modifies the resting order named by cancel_order_id (reused as
-        // "target order_id" for this event type) to (order.price,
-        // order.qty) -- see Matcher::replace() for the priority-preserving
-        // vs. priority-losing semantics this drives. Added as a new enum
-        // value, not a new DatasetRecord field: old dataset files only
-        // ever wrote 0/1 here, so this is a backward-compatible extension
-        // of an existing byte, not a layout change (format_version did not
-        // need to change for this reason alone; see below for why it
-        // changed anyway, for DatasetConfig's own size).
         REPLACE
     };
 
@@ -101,7 +91,14 @@ namespace hydra
         uint64_t cancel_order_id;
         uint64_t arrival_offset_ns;
     };
-    static_assert(sizeof(DatasetRecord) == 256, "DatasetRecord layout drifted from the computed byte budget");
+    // 168, not the real file's 256 -- see this file's own header comment:
+    // Order shrank from 128 to 88 bytes and lost its 64-byte alignment
+    // requirement under this ablation, so DatasetRecord no longer pads up
+    // to a 64-byte multiple.
+    static_assert(sizeof(DatasetRecord) == 168,
+                  "flat-layout ablation DatasetRecord should be 168 bytes -- "
+                  "if this fails, Order's ablated layout has drifted from "
+                  "what this comment assumes");
     static_assert(std::is_trivially_copyable_v<DatasetRecord>,
                   "DatasetRecord must be trivially copyable to read/write with "
                   "a single memcpy/fread/fwrite of raw bytes");
@@ -129,9 +126,7 @@ namespace hydra
             if (cfg_.cancel_ratio + cfg_.replace_ratio > 1.0)
             {
                 throw std::invalid_argument(
-                    "DatasetConfig: cancel_ratio + replace_ratio must be <= 1.0 (got " +
-                    std::to_string(cfg_.cancel_ratio) + " + " +
-                    std::to_string(cfg_.replace_ratio) + ")");
+                    "DatasetConfig: cancel_ratio + replace_ratio must be <= 1.0");
             }
             if (cfg_.min_qty == 0 || cfg_.min_qty > cfg_.max_qty)
             {
@@ -186,18 +181,6 @@ namespace hydra
                 }
                 else if (want_replace)
                 {
-                    // Target order stays resting (not removed from
-                    // resting_ids_) -- unlike a cancel, a replace leaves an
-                    // order id occupying the book, just possibly at a new
-                    // price/qty/queue-position. Picking the new price/qty
-                    // independently of the target's current values (rather
-                    // than tracking each resting order's live quantity
-                    // here, which this generator doesn't do) means most
-                    // generated replaces exercise Matcher::replace()'s
-                    // priority-losing (cancel + re-match) path; the
-                    // priority-preserving in-place path is covered
-                    // precisely by dedicated unit tests instead (see
-                    // tests/test_phase6_matcher.cpp).
                     const std::size_t idx =
                         std::uniform_int_distribution<std::size_t>(0, resting_ids_.size() - 1)(rng_);
                     const uint64_t target_id = resting_ids_[idx];
@@ -334,13 +317,7 @@ namespace hydra
 
     private:
         static constexpr char kMagic[8] = {'H', 'Y', 'D', 'R', 'A', 'L', 'O', 'B'};
-        // Bumped from 2 -> 3: DatasetConfig grew by 16 bytes (replace_ratio,
-        // client_id_count), which changes DatasetFileHeader's total size --
-        // a version-2 file's bytes would otherwise be silently
-        // misinterpreted rather than cleanly rejected by the
-        // format_version check below. EventType::REPLACE itself did NOT
-        // require this bump (see its own comment) -- the bump is entirely
-        // attributable to DatasetConfig's size change.
+        // Kept in sync with the real dataset_generator.hpp's bump (2 -> 3).
         static constexpr uint32_t kFormatVersion = 3;
 
         DatasetConfig cfg_;

@@ -21,7 +21,7 @@ namespace hydra
             bool first = true;
             for (int core = 0; core < CPU_SETSIZE; ++core)
             {
-                if (CPU_ISSET(core, &mask))
+                if (CPU_ISSET(static_cast<size_t>(core), &mask))
                 {
                     if (!first)
                     {
@@ -37,11 +37,18 @@ namespace hydra
 
     } // namespace detail
 
+    // Signals a pthread_setaffinity_np() failure only via errno (this
+    // function itself never throws/returns status) -- callers MUST follow
+    // this with verify_affinity(core_id), which independently re-derives
+    // the actual affinity mask from the kernel and throws on any mismatch,
+    // including a silently-failed pin_to_core(). Every call site in this
+    // codebase already follows this pairing; a lone pin_to_core() call
+    // with no verify_affinity() after it can fail silently.
     inline void pin_to_core(int core_id)
     {
         cpu_set_t cpuset;
         CPU_ZERO(&cpuset);
-        CPU_SET(core_id, &cpuset);
+        CPU_SET(static_cast<size_t>(core_id), &cpuset);
 
         const pthread_t self = pthread_self();
         const int rc = pthread_setaffinity_np(self, sizeof(cpu_set_t), &cpuset);
@@ -65,7 +72,7 @@ namespace hydra
 
         const int actual_count = CPU_COUNT(&actual);
         const bool matches_exactly =
-            (actual_count == 1) && CPU_ISSET(expected_core_id, &actual);
+            (actual_count == 1) && CPU_ISSET(static_cast<size_t>(expected_core_id), &actual);
 
         if (!matches_exactly)
         {

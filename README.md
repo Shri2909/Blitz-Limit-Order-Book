@@ -16,7 +16,7 @@ then, this session, actually *proving* each design decision earned its
 place by temporarily ripping it out, one at a time, and measuring what
 broke.
 
-**Language:** C++20 · **Build:** CMake 3.20+ · **Tests:** 15 canonical + 10 phase-gated (ASan/TSan/UBSan) · **Kernel bypass:** AF_XDP/eBPF · **Measured P99.9:** 1205.0 ns
+**Language:** C++20 · **Build:** CMake 3.20+ · **Tests:** 10 per-phase exit-condition suites (ASan/TSan/UBSan) · **Kernel bypass:** AF_XDP/eBPF · **Measured P99.9:** 1205.0 ns
 
 ---
 
@@ -28,6 +28,7 @@ broke.
 - [Environment requirements](#environment-requirements)
 - [Build & Run](#build--run)
 - [Reproducible Results](#reproducible-results)
+- [Ablation suite](#ablation-suite)
 - [Things to verify before you trust the numbers](#things-to-verify-before-you-trust-the-numbers)
 - [Project structure](#project-structure)
 - [Engineering highlights](#engineering-highlights)
@@ -94,7 +95,6 @@ flowchart LR
         MT["matching_thread_fn()"] --> OB["OrderBook\nprice-ordered maps + intrusive FIFO"]
         OB --> MX["Matcher\nprice-time / pro-rata, IOC / FOK"]
         MX --> FILLS[("FillEvents")]
-        MX --> HIST[["Lock-Free Histogram\ndouble-buffered percentiles"]]
     end
 
     Q --> MT
@@ -118,10 +118,9 @@ flowchart LR
 ```
 
 `Order` itself is laid out deliberately, not just declared — every byte
-offset below is enforced by `static_assert` in `types.hpp` and
-cross-checked at build time against the live struct via
-`metrics/src/struct_layout.cpp`'s `sizeof`/`alignof`/`offsetof`
-(`metrics/out/c1_struct_layout.txt` is the current, regenerable proof):
+offset below is enforced directly by `static_assert` in `types.hpp`
+(`sizeof(Order) == 128`, `alignof(Order) == 64`, and the rest) — the
+actual proof mechanism, not an illustration of one:
 
 ```
 Order — 128 bytes, 2 cache lines
@@ -176,10 +175,14 @@ matcher doesn't need.
   intrusive FIFO (`include/hydra/order_book.hpp`) — O(1) cancel via
   direct pointer unlink and a `std::pmr::unordered_map` index, independent
   of FIFO depth.
-- **`HdrHistogram`** (`include/hydra/histogram.hpp`): lock-free,
-  double-buffered latency histogram — `record()` is wait-free and safe to
-  call from the hot path concurrently with a control thread's
-  `swap_buffers()` + `query_percentile()`.
+- **Latency capture** (`RawSampleSink`, `include/hydra/pipeline.hpp`): a
+  plain pre-sized buffer the matching thread writes each order's
+  queue-transit/match-time/end-to-end sample into. This project used to
+  also carry a lock-free double-buffered `HdrHistogram` alongside it —
+  removed, because the one code path that produces this project's actual
+  latency numbers (`--benchmark`) never read it; it recorded every order's
+  latency on the hot path for a live-mode console readout nobody should
+  have quoted as a result. One capture mechanism, one number.
 - **Hardware clock** (`include/hydra/clock.hpp`): `RDTSCP`-based
   timestamping with `lfence` serialization, one-time calibration against
   `steady_clock`, and automatic fallback to a `steady_clock`-based shim if
@@ -331,27 +334,26 @@ cmake --build build --target blitz_lob_asan -j"$(nproc)"   # ASan + UBSan
 cmake --build build --target blitz_lob_tsan -j"$(nproc)"   # TSan + UBSan
 ```
 
-**Test build + run** — one canonical suite plus ten per-phase exit-condition
-binaries, each its own target/executable (phases 3, 6, 9 built with
-ASan+UBSan; phase 4 built with TSan+UBSan; the rest plain):
+**Test build + run** — ten per-phase exit-condition binaries (phases 3, 6, 9
+built with ASan+UBSan; phase 4 built with TSan+UBSan; the rest plain), all
+wired into `ctest` — one command runs all 10:
 ```bash
-cmake --build build --target blitz_lob_tests -j"$(nproc)" && ./build/blitz_lob_tests
-
-for t in blitz_lob_test_phase1_types blitz_lob_test_phase2_timing \
-         blitz_lob_test_phase3_pool  blitz_lob_test_phase4_spsc \
-         blitz_lob_test_phase5_orderbook blitz_lob_test_phase6_matcher \
-         blitz_lob_test_phase7_pipeline blitz_lob_test_phase8_benchmark \
-         blitz_lob_test_phase9_suite blitz_lob_test_phase10_xdp; do
-    cmake --build build --target "$t" -j"$(nproc)" && "./build/$t"
-done
+cmake --build build -j"$(nproc)"
+ctest --test-dir build --output-on-failure
 ```
+Per-phase granularity is still available when you only want one, e.g.
+`ctest --test-dir build -R phase6_matcher`.
 
 **Benchmark run** (requires the preflight conditions above; see
-[Reproducible Results](#reproducible-results) for the canonical invocation):
+[Reproducible Results](#reproducible-results) for the canonical invocation).
+There is exactly one command that produces a latency number in this
+project — `--benchmark` with `--dataset` — always pinned to `RX_CORE_ID`/
+`MATCHING_CORE_ID` internally, never a caller-chosen core:
 ```bash
 numactl --cpunodebind=0 --membind=0 \
-    ./build/blitz_lob --benchmark --mode price_time --core 4 --trials 5 \
-    --dataset datasets/bench_110k.bin --output results/bench.csv
+    ./build/blitz_lob --benchmark --mode price_time --trials 5 \
+    --dataset datasets/bench_110k.bin \
+    --output "results/$(git rev-parse --short HEAD)/bench.csv"
 ```
 
 **AF_XDP run** (needs a bound interface — a real NIC or a veth pair; see
@@ -369,8 +371,13 @@ see [AF_XDP](#af_xdp-what-has-and-hasnt-been-measured).
 
 ## Reproducible Results
 
-The canonical, comparable path is a **pinned dataset**, not live
-generation — fixed seed, fixed event sequence, deterministic:
+There is exactly one path to a latency number in this project — a
+**pinned dataset** replayed through `--benchmark` — fixed seed, fixed event
+sequence, deterministic. There is no live-generation fallback and no
+"quick look" alternative: those used to exist as a second invocation shape
+of the same flag, which meant `--benchmark` could quietly report two
+different numbers depending on whether `--dataset` was remembered. Removed
+so `--benchmark --dataset ...` is the only way to get a number, full stop.
 
 ```bash
 cmake --build build --target blitz_gen_dataset -j"$(nproc)"
@@ -380,49 +387,84 @@ cmake --build build --target blitz_gen_dataset -j"$(nproc)"
     --output datasets/bench_110k.bin
 
 numactl --cpunodebind=0 --membind=0 \
-    ./build/blitz_lob --benchmark --mode price_time --core 4 --trials 5 \
-    --dataset datasets/bench_110k.bin --output results/bench.csv
+    ./build/blitz_lob --benchmark --mode price_time --trials 5 \
+    --dataset datasets/bench_110k.bin \
+    --output "results/$(git rev-parse --short HEAD)/bench.csv"
 ```
 
-The console prints median P99 only; P99.9/P99.99 require reading
-`results/bench.csv` (columns: `version,trial,iteration,latency_ns,
-queue_transit_ns,match_time_ns,timestamp_unix`) and computing the
+The command refuses to run (before any measurement work) if the build was
+made from a dirty working tree, if `--dataset` is missing, or if
+`RX_CORE_ID`/`MATCHING_CORE_ID` aren't isolated/governed/SMT-off — see
+[Environment requirements](#environment-requirements). Its stdout summary
+and the CSV's leading comment lines both carry the dataset seed, the full
+environment snapshot (isolated cores, governors, SMT sibling lists, git
+hash, dirty flag), the measured order-sample count actually used for the
+order-latency percentile (lower than the raw measured-iteration count,
+since cancels are counted and reported separately, not folded into it —
+see the console's own `median P99 (end-to-end, cancels)` lines), and a
+count of any order-book arena fallback allocations, plus order/level pool
+exhaustion counts (each should always be 0 — nonzero means either the
+"no heap allocation after init" guarantee or a pool's fixed capacity
+didn't hold for that run). A run with `--trials` below the
+canonical 5 is stamped `SMOKETEST` in both places and should not be quoted.
+
+The console prints median P99 only; P99.9/P99.99 require reading the CSV
+(columns: `version,trial,iteration,latency_ns,
+queue_transit_ns,match_time_ns,timestamp_unix,is_cancel`) and computing the
 percentile yourself, e.g.:
 
 ```python
 import csv, statistics
 trials = {}
-with open("results/bench.csv") as f:
+with open("results/<hash>/bench.csv") as f:
     for row in csv.DictReader(l for l in f if not l.startswith('#')):
+        if row["is_cancel"] == "1":
+            continue  # order latency and cancel latency are separate figures -- see below
         trials.setdefault(int(row["trial"]), []).append(int(row["latency_ns"]))
 def pct(vals, p):
     s = sorted(vals); return s[min(int(p/100.0*len(s)), len(s)-1)]
 p999s = [pct(v, 99.9) for v in trials.values()]
-print("median P99.9:", statistics.median(p999s))
+print("median P99.9 (orders):", statistics.median(p999s))
 ```
 
-**Quick look, no setup** — same command, omit `--dataset`, and it
-live-generates an equivalent dataset in-process using the same
-`DEFAULT_*` config from `config.hpp`:
-```bash
-numactl --cpunodebind=0 --membind=0 \
-    ./build/blitz_lob --benchmark --mode price_time --core 4 --trials 5 \
-    --output results/quicklook.csv
-```
-**This is not the reproducible/comparable number.** It's useful for a fast
-sanity check that the pipeline works end-to-end; only the pinned-dataset
-run above should be quoted or compared across machines/commits.
-
-The project also ships a full visual report generator,
-`metrics/generate_metrics.sh` → `metrics/out/report.html`, covering
-correctness-derived proofs, quick pipeline measurements (explicitly
-caveat-banner'd, not the trusted number), a cache-line layout diagram, and
-this same gated benchmark plus `perf stat` hardware counters. See
-`metrics/README.md` for what each category measures and why.
+Cancel latency is a separate figure, not folded into the order P99/P99.9
+above: filter for `row["is_cancel"] == "1"` instead, group by trial the
+same way, and take the median across trials -- the console's own
+`median P99 (end-to-end, cancels)`/`median P99.9 (end-to-end, cancels)`
+lines report exactly this.
 
 Reproducing the ablation table above — exact patch/build/measure/revert
 steps for all four optimizations — is documented in
-**[`docs/DESIGN.md`](docs/DESIGN.md#reproducing-these-numbers)**.
+**[`docs/DESIGN.md`](docs/DESIGN.md#reproducing-these-numbers)**, and is
+now also automated:
+
+## Ablation suite
+
+```bash
+cmake --build build --target \
+    blitz_lob_ablation_mutex_queue blitz_lob_ablation_unpinned \
+    blitz_lob_ablation_malloc_pool blitz_lob_ablation_flat_layout \
+    blitz_gen_dataset_ablation_flat_layout -j"$(nproc)"
+./scripts/run_ablations.sh --trials 5
+```
+
+Builds and runs the baseline plus four ablation targets
+(`blitz_lob_ablation_mutex_queue`, `_unpinned`, `_malloc_pool`,
+`_flat_layout` — see `ablation/` and `CMakeLists.txt`'s "Automated
+ablation suite" section for how each shadows exactly one real header via
+include-path ordering, never mutating `src/`/`include/`), each through the
+same real, gated `--benchmark` path, producing
+`results/<hash>/ablation_summary.{csv,md}` in the same shape as the table
+above. Expect the same *direction* as that table (every ablation slower
+than baseline), not necessarily the same multiplier — different
+machine/session/load.
+
+This project deliberately stops at two benchmarks — the latency number
+above and this ablation suite. Together they're a complete story ("here's
+how fast it is" + "here's proof it's fast for the reasons claimed");
+anything more (rate sweeps, depth sweeps, mode comparisons, five-nines
+tails, soak tests) adds explanation surface without adding a claim
+distinct enough to be worth it.
 
 ---
 
@@ -459,25 +501,28 @@ yourself if a number looks off:
 
 ```
 include/hydra/          Core headers: types, object_pool, spsc_queue,
-                         order_book, matcher, histogram, clock, affinity,
-                         pipeline, config, dataset_generator, benchmark
+                         order_book, matcher, clock, affinity, pipeline,
+                         config, dataset_generator, benchmark
 include/hydra/xdp/       AF_XDP socket wrapper + zero-copy wire parser
                          (compiled only when ENABLE_AFXDP is ON)
 src/                     main.cpp (CLI + entry point), pipeline.cpp
                          (RX/matching thread bodies), benchmark.cpp
                          (preflight-gated harness)
+ablation/                Rejected-alternative headers for the automated
+                         ablation suite (mutex_queue, unpinned,
+                         malloc_pool, flat_layout) -- each shadows exactly
+                         one real header via include-path ordering, never
+                         touches src/ or the real include/. See
+                         scripts/run_ablations.sh.
 net/                     xdp_prog.bpf.c (eBPF redirect program, own
                          clang -target bpf Makefile), xdp_socket_user.cpp
-tests/                   blitz_lob_tests (canonical suite) +
-                         test_phase1..10_*.cpp (per-phase exit-condition
+tests/                   test_phase1..10_*.cpp (per-phase exit-condition
                          tests, see CMakeLists.txt for the ASan/TSan split)
 tools/                   gen_dataset.cpp, send_test_orders.cpp (AF_XDP
                          manual traffic generator)
-scripts/                 setup_veth.sh (AF_XDP dev-box test harness,
-                         network-namespace-isolated veth pair)
-metrics/                 Standalone visual report generator
-                         (generate_metrics.sh, generate_report.py) —
-                         not wired into the main CMake build
+scripts/                 run_ablations.sh (the ablation suite, see
+                         above), setup_veth.sh (AF_XDP dev-box test
+                         harness, network-namespace-isolated veth pair)
 datasets/                Generated dataset files (gitignored) +
                          manifest.txt (reproducibility record of the
                          flags used to produce each one)
@@ -595,11 +640,11 @@ thread handoff) sitting at **p50=684,260ns, p99.9=3,035,560ns**, while
 `match_time_ns` (the matching engine's own per-order cost) stayed healthy
 at **p50=291ns, p99.9=4,693ns**. That decomposed split — obtained by
 temporarily wiring the same `RawSampleSink` mechanism `--benchmark`
-already uses into the live pipeline (`src/main.cpp`, marked `DIAG-TEMP`,
-still present in the code as of this writing) — was the key piece of
-evidence: whatever was wrong was in the *queue handoff*, not the matching
-engine, and not (per the earlier ablation study) the lock-free `SpscQueue`
-itself.
+already uses into the live pipeline (`src/main.cpp`, marked `DIAG-TEMP`
+and since removed once the investigation below resolved) — was the key
+piece of evidence: whatever was wrong was in the *queue handoff*, not the
+matching engine, and not (per the earlier ablation study) the lock-free
+`SpscQueue` itself.
 
 The actual cause, confirmed with hard evidence rather than a guess:
 **a separate benchmark process was left running in the background, pinned
@@ -668,10 +713,12 @@ cat /proc/irq/<N>/effective_affinity_list   # confirms whether it actually took
 
 The live pipeline's `DIAG decomposed` output (separate `queue_transit_ns`/
 `match_time_ns`/`end_to_end_ns` percentiles, printed once at shutdown
-alongside the existing blended histogram report) comes from temporary
-instrumentation added in `src/main.cpp` for this investigation, marked
-`DIAG-TEMP` — it's additive and doesn't change any other behavior, but is
-a candidate for cleanup/removal now that the investigation is resolved.
+alongside the histogram report that existed at the time) was temporary
+instrumentation added to `src/main.cpp` for this investigation, marked
+`DIAG-TEMP`. It has since been removed, along with the histogram report
+itself (see "Latency capture" under [Architecture](#architecture)) — both
+were cleanup candidates once the investigation resolved, and both are now
+gone rather than just flagged for removal.
 
 ---
 
@@ -682,10 +729,6 @@ a candidate for cleanup/removal now that the investigation is resolved.
   rejected alternative and why, the measured before/after (or an explicit
   "not yet measured" where no ablation exists), and file/line references
   into the real implementation.
-- **`metrics/README.md`** — what `metrics/generate_metrics.sh`'s report
-  categories (A: correctness proofs, B: quick pipeline measurements,
-  C: struct layout, D: the real benchmark) each measure and why they're
-  organized that way.
 - **`datasets/manifest.txt`** — the exact `blitz_gen_dataset` flags behind
   every dataset file referenced in this README and in `docs/DESIGN.md`.
 
@@ -693,9 +736,7 @@ a candidate for cleanup/removal now that the investigation is resolved.
 
 ## License
 
-No `LICENSE` file exists in this repository yet — all rights reserved by
-default until one is added. Add a `LICENSE` file before treating this as
-open source in any legal sense.
+MIT — see [`LICENSE`](LICENSE).
 
 ## Contact
 

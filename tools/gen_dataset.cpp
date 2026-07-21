@@ -12,24 +12,52 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <ctime>
 #include <exception>
 #include <stdexcept>
 #include <string>
 #include <vector>
 
+// Same fallback convention as src/benchmark.cpp's HYDRA_LOB_VERSION -- set
+// by CMakeLists.txt from `git rev-parse --short HEAD` at build time, so a
+// dataset's manifest entry can record which generator binary (not just
+// which flags) produced it.
+#ifndef HYDRA_LOB_VERSION
+#define HYDRA_LOB_VERSION "dev-build"
+#endif
+
 namespace
 {
+
+    // UTC, second precision, human-readable -- good enough for "which day
+    // was this generated," not meant for sub-second provenance.
+    [[nodiscard]] std::string utc_timestamp_now()
+    {
+        const std::time_t now = std::time(nullptr);
+        std::tm utc{};
+        gmtime_r(&now, &utc);
+        char buf[32];
+        std::strftime(buf, sizeof(buf), "%Y-%m-%dT%H:%M:%SZ", &utc);
+        return buf;
+    }
 
     void print_usage(const char *prog)
     {
         std::fprintf(stderr,
                      "Usage: %s [--seed N] [--count N] [--mid-price N] [--spread N]\n"
                      "          [--min-qty N] [--max-qty N] [--cancel-ratio F]\n"
-                     "          [--ioc-ratio F] [--fok-ratio F] [--rate-hz N]\n"
+                     "          [--ioc-ratio F] [--fok-ratio F] [--replace-ratio F]\n"
+                     "          [--client-id-count N] [--rate-hz N]\n"
                      "          --output PATH\n"
                      "\n"
                      "All flags except --output default to config.hpp's DEFAULT_*\n"
-                     "constants when omitted.\n"
+                     "constants when omitted (--replace-ratio defaults to 0.0,\n"
+                     "--client-id-count defaults to 8).\n"
+                     "\n"
+                     "--client-id-count controls how many distinct synthetic client_ids\n"
+                     "orders are drawn from; a smaller value deliberately raises the\n"
+                     "self-trade collision rate -- use e.g. --client-id-count 2 for a\n"
+                     "self-trade-heavy workload.\n"
                      "\n"
                      "Example:\n"
                      "  %s --seed 42 --count 110000 --output datasets/bench_110k.bin\n",
@@ -122,6 +150,8 @@ int main(int argc, char **argv)
     double cancel_ratio = hydra::DEFAULT_CANCEL_RATIO;
     double ioc_ratio = hydra::DEFAULT_IOC_RATIO;
     double fok_ratio = hydra::DEFAULT_FOK_RATIO;
+    double replace_ratio = 0.0;
+    uint64_t client_id_count = 8;
     double rate_hz = hydra::DEFAULT_ARRIVAL_RATE_HZ;
     std::string output_path;
 
@@ -173,6 +203,16 @@ int main(int argc, char **argv)
             fok_ratio = parse_double(val, "--fok-ratio");
             continue;
         }
+        if (match_flag(argc, argv, i, "--replace-ratio", val))
+        {
+            replace_ratio = parse_double(val, "--replace-ratio");
+            continue;
+        }
+        if (match_flag(argc, argv, i, "--client-id-count", val))
+        {
+            client_id_count = parse_u64(val, "--client-id-count");
+            continue;
+        }
         if (match_flag(argc, argv, i, "--rate-hz", val))
         {
             rate_hz = parse_double(val, "--rate-hz");
@@ -219,6 +259,10 @@ int main(int argc, char **argv)
     cfg.arrival_rate_hz = rate_hz;
     cfg.ioc_ratio = ioc_ratio;
     cfg.fok_ratio = fok_ratio;
+    cfg.replace_ratio = replace_ratio;
+    cfg.client_id_count = client_id_count;
+
+    const std::string generated_at = utc_timestamp_now();
 
     std::printf("blitz_gen_dataset: resolved config:\n");
     std::printf("  seed               = %llu\n", static_cast<unsigned long long>(cfg.seed));
@@ -231,7 +275,11 @@ int main(int argc, char **argv)
     std::printf("  arrival_rate_hz    = %.6f\n", cfg.arrival_rate_hz);
     std::printf("  ioc_ratio          = %.6f\n", cfg.ioc_ratio);
     std::printf("  fok_ratio          = %.6f\n", cfg.fok_ratio);
+    std::printf("  replace_ratio      = %.6f\n", cfg.replace_ratio);
+    std::printf("  client_id_count    = %llu\n", static_cast<unsigned long long>(cfg.client_id_count));
     std::printf("  output             = %s\n", output_path.c_str());
+    std::printf("  generated_utc      = %s\n", generated_at.c_str());
+    std::printf("  generator_version  = %s\n", HYDRA_LOB_VERSION);
 
     try
     {
@@ -246,5 +294,34 @@ int main(int argc, char **argv)
     }
 
     std::printf("blitz_gen_dataset: wrote %zu events to '%s'\n", count, output_path.c_str());
+
+    const std::size_t last_slash = output_path.find_last_of('/');
+    const std::string basename =
+        (last_slash == std::string::npos) ? output_path : output_path.substr(last_slash + 1);
+
+    // Copy-pasteable datasets/manifest.txt entry -- the manifest is a
+    // manually-maintained reproducibility record (this tool never writes
+    // to it directly, matching the project's existing "flags in
+    // manifest.txt, not the binary, are the source of truth" policy), but
+    // previously recorded flags/seed only, with no generation timestamp or
+    // generator identity -- a silent generator-*logic* change (not caught
+    // by DatasetFileHeader's format_version check) would have been
+    // undetectable from the manifest alone. Printed, not auto-appended:
+    // whether/how to fold this into datasets/manifest.txt's prose entries
+    // is still a human call.
+    std::printf(
+        "\n"
+        "-- datasets/manifest.txt entry (copy/paste, add rationale by hand) --\n"
+        "%s: --seed %llu --count %zu --mid-price %lld --spread %lld\n"
+        "                --min-qty %u --max-qty %u --cancel-ratio %.6f\n"
+        "                --ioc-ratio %.6f --fok-ratio %.6f --replace-ratio %.6f\n"
+        "                --client-id-count %llu --rate-hz %.6f\n"
+        "                (generated_utc=%s generator_version=%s)\n",
+        basename.c_str(), static_cast<unsigned long long>(cfg.seed), cfg.order_count,
+        static_cast<long long>(cfg.mid_price), static_cast<long long>(cfg.price_spread_ticks),
+        cfg.min_qty, cfg.max_qty, cfg.cancel_ratio, cfg.ioc_ratio, cfg.fok_ratio,
+        cfg.replace_ratio, static_cast<unsigned long long>(cfg.client_id_count),
+        cfg.arrival_rate_hz, generated_at.c_str(), HYDRA_LOB_VERSION);
+
     return 0;
 }

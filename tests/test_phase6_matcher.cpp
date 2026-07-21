@@ -55,12 +55,10 @@ namespace hydra::test
                 std::make_unique<ObjectPool<Order, ORDER_POOL_SIZE>>();
             std::unique_ptr<ObjectPool<Level, LEVEL_POOL_SIZE>> level_pool =
                 std::make_unique<ObjectPool<Level, LEVEL_POOL_SIZE>>();
-            std::unique_ptr<ObjectPool<FillEvent, FILL_EVENT_POOL_SIZE>> fill_pool =
-                std::make_unique<ObjectPool<FillEvent, FILL_EVENT_POOL_SIZE>>();
             std::unique_ptr<OrderBook> book =
                 std::make_unique<OrderBook>(*order_pool, *level_pool);
             std::unique_ptr<Matcher> matcher = std::make_unique<Matcher>(
-                *book, *fill_pool, MatchingMode::PRICE_TIME);
+                *book, MatchingMode::PRICE_TIME);
         };
 
         [[nodiscard]] uint32_t find_fill_qty(const std::vector<FillRecord> &fills, uint64_t maker_id)
@@ -92,11 +90,11 @@ namespace hydra::test
                 (void)f.book->add_order(make_order(2, 100, 70, Side::SELL));
 
                 std::vector<FillRecord> fills;
-                const uint32_t n = f.matcher->match(
+                const MatchStats n = f.matcher->match(
                     make_order(10, 100, 50, Side::BUY), [&](const FillEvent &ev)
                     { fills.push_back({ev.maker_order_id, ev.price, ev.qty}); });
 
-                HYDRA_CHECK_EQ(n, uint32_t{2});
+                HYDRA_CHECK_EQ(n.fills_generated, uint32_t{2});
                 HYDRA_CHECK_EQ(fills.size(), std::size_t{2});
                 HYDRA_CHECK_EQ(fills[0].maker_order_id, uint64_t{1});
                 HYDRA_CHECK_EQ(fills[0].qty, uint32_t{30});
@@ -125,11 +123,11 @@ namespace hydra::test
                 (void)f.book->add_order(make_order(2, 100, 70, Side::SELL));
 
                 std::vector<FillRecord> fills;
-                const uint32_t n = f.matcher->match(
+                const MatchStats n = f.matcher->match(
                     make_order(10, 100, 50, Side::BUY), [&](const FillEvent &ev)
                     { fills.push_back({ev.maker_order_id, ev.price, ev.qty}); });
 
-                HYDRA_CHECK_EQ(n, uint32_t{2});
+                HYDRA_CHECK_EQ(n.fills_generated, uint32_t{2});
                 HYDRA_CHECK_EQ(find_fill_qty(fills, 1), uint32_t{15});
                 HYDRA_CHECK_EQ(find_fill_qty(fills, 2), uint32_t{35});
             }
@@ -143,11 +141,11 @@ namespace hydra::test
             (void)f.book->add_order(make_order(3, 100, 10, Side::SELL));
 
             std::vector<FillRecord> fills;
-            const uint32_t n = f.matcher->match(
+            const MatchStats n = f.matcher->match(
                 make_order(10, 100, 15, Side::BUY), [&](const FillEvent &ev)
                 { fills.push_back({ev.maker_order_id, ev.price, ev.qty}); });
 
-            HYDRA_CHECK_EQ(n, uint32_t{2});
+            HYDRA_CHECK_EQ(n.fills_generated, uint32_t{2});
             HYDRA_CHECK_EQ(fills[0].maker_order_id, uint64_t{1});
             HYDRA_CHECK_EQ(fills[0].qty, uint32_t{10});
             HYDRA_CHECK_EQ(fills[1].maker_order_id, uint64_t{2});
@@ -176,7 +174,7 @@ namespace hydra::test
             (void)f.book->add_order(make_order(3, 100, 1, Side::SELL));
 
             std::vector<FillRecord> fills;
-            const uint32_t n = f.matcher->match(
+            const MatchStats n = f.matcher->match(
                 make_order(10, 100, 4, Side::BUY), [&](const FillEvent &ev)
                 { fills.push_back({ev.maker_order_id, ev.price, ev.qty}); });
 
@@ -188,7 +186,7 @@ namespace hydra::test
             // with headroom (order2: floor=0, headroom=1) -> total_share=1
             // (fully filled). order3 gets floor=0 and no residual left ->
             // no fill at all.
-            HYDRA_CHECK_EQ(n, uint32_t{2});
+            HYDRA_CHECK_EQ(n.fills_generated, uint32_t{2});
             HYDRA_CHECK_EQ(find_fill_qty(fills, 1), uint32_t{3});
             HYDRA_CHECK_EQ(find_fill_qty(fills, 2), uint32_t{1});
             HYDRA_CHECK_EQ(find_fill_qty(fills, 3), uint32_t{0});
@@ -209,15 +207,58 @@ namespace hydra::test
             HYDRA_CHECK_EQ(lvl->head_->qty, uint32_t{1});
         }
 
+        // Price improvement: the incoming BUY's limit (105) is worse for the
+        // taker than the resting SELL's price (100) -- the fill must execute
+        // at the maker's (resting) price, never the taker's own limit.
+        // Ported from the retired monolithic suite (test_hydra_lob.cpp);
+        // no other test in this phase-split suite makes this assertion
+        // explicitly (several multi-level tests fill at a maker price that
+        // happens to differ from the taker's limit, but none assert on
+        // fills[].price itself).
+        void test_price_improvement()
+        {
+            Fixture f;
+            (void)f.book->add_order(make_order(1, 100, 5, Side::SELL));
+
+            std::vector<FillRecord> fills;
+            const MatchStats n = f.matcher->match(
+                make_order(10, 105, 5, Side::BUY), [&](const FillEvent &ev)
+                { fills.push_back({ev.maker_order_id, ev.price, ev.qty}); });
+
+            HYDRA_CHECK_EQ(n.fills_generated, uint32_t{1});
+            HYDRA_CHECK_EQ(fills.size(), std::size_t{1});
+            HYDRA_CHECK_EQ(fills[0].price, int64_t{100});
+        }
+
+        // Matching against a book empty on both sides: zero fills, the
+        // on_fill handler never invoked, and the incoming GTC order rests
+        // cleanly afterward. Ported from the retired monolithic suite.
+        void test_empty_book()
+        {
+            Fixture f;
+            HYDRA_CHECK(!f.book->best_bid().has_value());
+            HYDRA_CHECK(!f.book->best_ask().has_value());
+
+            bool handler_called = false;
+            const MatchStats n = f.matcher->match(
+                make_order(1, 100, 10, Side::BUY), [&](const FillEvent &)
+                { handler_called = true; });
+
+            HYDRA_CHECK_EQ(n.fills_generated, uint32_t{0});
+            HYDRA_CHECK(!handler_called);
+            HYDRA_CHECK(f.book->best_bid().has_value());
+            HYDRA_CHECK_EQ(f.book->best_bid().value(), int64_t{100});
+        }
+
         void test_ioc_leaves_no_resting_remainder()
         {
             Fixture f;
             (void)f.book->add_order(make_order(1, 100, 3, Side::SELL));
 
-            const uint32_t n = f.matcher->match(
+            const MatchStats n = f.matcher->match(
                 make_order(10, 100, 10, Side::BUY, TimeInForce::IOC), [](const FillEvent &) {});
 
-            HYDRA_CHECK_EQ(n, uint32_t{1});
+            HYDRA_CHECK_EQ(n.fills_generated, uint32_t{1});
             HYDRA_CHECK(!f.book->best_bid().has_value());
             HYDRA_CHECK_EQ(f.book->bid_level_count(), std::size_t{0});
             // The ask side's order1 is fully consumed too.
@@ -230,11 +271,11 @@ namespace hydra::test
             (void)f.book->add_order(make_order(1, 100, 10, Side::SELL));
 
             bool handler_called = false;
-            const uint32_t n = f.matcher->match(
+            const MatchStats n = f.matcher->match(
                 make_order(10, 100, 10, Side::BUY, TimeInForce::FOK),
                 [&](const FillEvent &) { handler_called = true; });
 
-            HYDRA_CHECK_EQ(n, uint32_t{1});
+            HYDRA_CHECK_EQ(n.fills_generated, uint32_t{1});
             HYDRA_CHECK(handler_called);
             HYDRA_CHECK(!f.book->best_ask().has_value());
             HYDRA_CHECK(!f.book->best_bid().has_value());
@@ -246,11 +287,11 @@ namespace hydra::test
             (void)f.book->add_order(make_order(1, 100, 3, Side::SELL));
 
             bool handler_called = false;
-            const uint32_t n = f.matcher->match(
+            const MatchStats n = f.matcher->match(
                 make_order(10, 100, 10, Side::BUY, TimeInForce::FOK),
                 [&](const FillEvent &) { handler_called = true; });
 
-            HYDRA_CHECK_EQ(n, uint32_t{0});
+            HYDRA_CHECK_EQ(n.fills_generated, uint32_t{0});
             HYDRA_CHECK(!handler_called);
 
             // Book must be byte-for-byte unchanged: same resting qty, same
@@ -282,10 +323,10 @@ namespace hydra::test
             (void)f.book->add_order(make_order(1, 100, 10, Side::SELL));
             (void)f.book->add_order(make_order(2, 100, 10, Side::SELL));
             std::vector<FillRecord> price_time_fills;
-            const uint32_t n1 = f.matcher->match(
+            const MatchStats n1 = f.matcher->match(
                 make_order(10, 100, 10, Side::BUY), [&](const FillEvent &ev)
                 { price_time_fills.push_back({ev.maker_order_id, ev.price, ev.qty}); });
-            HYDRA_CHECK_EQ(n1, uint32_t{1});
+            HYDRA_CHECK_EQ(n1.fills_generated, uint32_t{1});
             HYDRA_CHECK_EQ(price_time_fills[0].maker_order_id, uint64_t{1});
             HYDRA_CHECK_EQ(price_time_fills[0].qty, uint32_t{10});
             HYDRA_CHECK(f.book->cancel_order(2)); // clear the leftover resting order
@@ -296,10 +337,10 @@ namespace hydra::test
             (void)f.book->add_order(make_order(3, 200, 10, Side::SELL));
             (void)f.book->add_order(make_order(4, 200, 10, Side::SELL));
             std::vector<FillRecord> pro_rata_fills;
-            const uint32_t n2 = f.matcher->match(
+            const MatchStats n2 = f.matcher->match(
                 make_order(11, 200, 10, Side::BUY), [&](const FillEvent &ev)
                 { pro_rata_fills.push_back({ev.maker_order_id, ev.price, ev.qty}); });
-            HYDRA_CHECK_EQ(n2, uint32_t{2});
+            HYDRA_CHECK_EQ(n2.fills_generated, uint32_t{2});
             HYDRA_CHECK_EQ(find_fill_qty(pro_rata_fills, 3), uint32_t{5});
             HYDRA_CHECK_EQ(find_fill_qty(pro_rata_fills, 4), uint32_t{5});
         }
@@ -316,11 +357,11 @@ namespace hydra::test
             (void)f.book->add_order(make_order(2, 101, 100, Side::SELL));
 
             std::vector<FillRecord> fills;
-            const uint32_t n = f.matcher->match(
+            const MatchStats n = f.matcher->match(
                 make_order(10, 101, 50, Side::BUY), [&](const FillEvent &ev)
                 { fills.push_back({ev.maker_order_id, ev.price, ev.qty}); });
 
-            HYDRA_CHECK_EQ(n, uint32_t{2});
+            HYDRA_CHECK_EQ(n.fills_generated, uint32_t{2});
             HYDRA_CHECK_EQ(find_fill_qty(fills, 1), uint32_t{10});
             HYDRA_CHECK_EQ(find_fill_qty(fills, 2), uint32_t{40});
 
@@ -348,11 +389,11 @@ namespace hydra::test
             (void)f.book->add_order(make_order(1, 100, 10, Side::SELL));
 
             std::vector<FillRecord> fills;
-            const uint32_t n = f.matcher->match(
+            const MatchStats n = f.matcher->match(
                 make_order(10, 100, 10, Side::BUY), [&](const FillEvent &ev)
                 { fills.push_back({ev.maker_order_id, ev.price, ev.qty}); });
 
-            HYDRA_CHECK_EQ(n, uint32_t{1});
+            HYDRA_CHECK_EQ(n.fills_generated, uint32_t{1});
             HYDRA_CHECK_EQ(fills[0].qty, uint32_t{10});
             HYDRA_CHECK(!f.book->best_ask().has_value());
         }
@@ -365,7 +406,7 @@ namespace hydra::test
             (void)f.book->add_order(make_order(2, 100, 5, Side::SELL, TimeInForce::GTC, 9));
 
             std::vector<FillRecord> fills;
-            const uint32_t n = f.matcher->match(
+            const MatchStats n = f.matcher->match(
                 make_order(10, 100, 5, Side::BUY, TimeInForce::GTC, 7),
                 [&](const FillEvent &ev)
                 { fills.push_back({ev.maker_order_id, ev.price, ev.qty}); });
@@ -374,7 +415,7 @@ namespace hydra::test
             // entirely, leaving order2 as the sole eligible participant and
             // therefore receiving the ENTIRE incoming quantity, not a
             // proportional split against order1's (excluded) quantity.
-            HYDRA_CHECK_EQ(n, uint32_t{1});
+            HYDRA_CHECK_EQ(n.fills_generated, uint32_t{1});
             HYDRA_CHECK_EQ(fills[0].maker_order_id, uint64_t{2});
             HYDRA_CHECK_EQ(fills[0].qty, uint32_t{5});
 
@@ -384,6 +425,155 @@ namespace hydra::test
             HYDRA_CHECK_EQ(lvl->order_count, uint32_t{1});
             HYDRA_CHECK_EQ(lvl->head_->order_id, uint64_t{1});
             HYDRA_CHECK_EQ(lvl->head_->qty, uint32_t{5});
+        }
+
+        // Same price, qty decrease-only: must preserve time priority --
+        // in-place mutation, no unlink/relink, order stays at its original
+        // FIFO position (still head_ of its level).
+        void test_replace_preserves_priority_same_price_qty_decrease()
+        {
+            Fixture f;
+            (void)f.book->add_order(make_order(1, 100, 10, Side::SELL));
+            (void)f.book->add_order(make_order(2, 100, 10, Side::SELL));
+
+            const MatchStats stats = f.matcher->replace(1, 100, 4, [](const FillEvent &) {});
+            HYDRA_CHECK_EQ(stats.fills_generated, uint32_t{0});
+
+            Level *lvl = f.book->best_ask_level();
+            HYDRA_CHECK(lvl != nullptr);
+            HYDRA_CHECK_EQ(lvl->order_count, uint32_t{2});
+            // order1 must still be FIFO head (priority preserved), now qty 4.
+            HYDRA_CHECK_EQ(lvl->head_->order_id, uint64_t{1});
+            HYDRA_CHECK_EQ(lvl->head_->qty, uint32_t{4});
+            HYDRA_CHECK_EQ(lvl->total_qty, uint32_t{14});
+        }
+
+        // A price change loses time priority: order1 (originally FIFO
+        // head) must be cancelled and re-submitted, landing BEHIND order2
+        // at the new price level rather than retaining head-of-queue
+        // status.
+        void test_replace_loses_priority_on_price_change()
+        {
+            Fixture f;
+            (void)f.book->add_order(make_order(1, 100, 10, Side::SELL));
+            (void)f.book->add_order(make_order(2, 101, 10, Side::SELL));
+
+            const MatchStats stats = f.matcher->replace(1, 101, 10, [](const FillEvent &) {});
+            HYDRA_CHECK_EQ(stats.fills_generated, uint32_t{0});
+
+            // order1 no longer at 100 -- that level must be gone entirely.
+            HYDRA_CHECK_EQ(f.book->ask_level_count(), std::size_t{1});
+            Level *lvl = f.book->best_ask_level();
+            HYDRA_CHECK(lvl != nullptr);
+            HYDRA_CHECK_EQ(lvl->price, int64_t{101});
+            HYDRA_CHECK_EQ(lvl->order_count, uint32_t{2});
+            // order2 (never replaced) keeps its original head-of-queue spot;
+            // order1 (replaced) lands behind it, not in front.
+            HYDRA_CHECK_EQ(lvl->head_->order_id, uint64_t{2});
+            HYDRA_CHECK_EQ(lvl->head_->next_->order_id, uint64_t{1});
+        }
+
+        // A quantity INCREASE at the same price also loses priority (per
+        // Matcher::replace()'s documented rule: same-price is only
+        // priority-preserving when qty strictly decreases-or-stays-equal).
+        void test_replace_loses_priority_on_qty_increase()
+        {
+            Fixture f;
+            (void)f.book->add_order(make_order(1, 100, 10, Side::SELL));
+            (void)f.book->add_order(make_order(2, 100, 10, Side::SELL));
+
+            const MatchStats stats = f.matcher->replace(1, 100, 20, [](const FillEvent &) {});
+            HYDRA_CHECK_EQ(stats.fills_generated, uint32_t{0});
+
+            Level *lvl = f.book->best_ask_level();
+            HYDRA_CHECK(lvl != nullptr);
+            HYDRA_CHECK_EQ(lvl->order_count, uint32_t{2});
+            // order2 keeps head-of-queue; order1 (replaced, larger qty)
+            // lands behind it despite being submitted first originally.
+            HYDRA_CHECK_EQ(lvl->head_->order_id, uint64_t{2});
+            HYDRA_CHECK_EQ(lvl->head_->next_->order_id, uint64_t{1});
+            HYDRA_CHECK_EQ(lvl->head_->next_->qty, uint32_t{20});
+        }
+
+        // A replace that moves the order to a newly-crossing price must
+        // actually match against the opposite side, not just silently
+        // reposition in the book.
+        void test_replace_that_crosses_book()
+        {
+            Fixture f;
+            // Valid, non-crossed starting book: order1 rests at 105 (above
+            // the resting bid, so it doesn't cross); order2 rests at 100.
+            (void)f.book->add_order(make_order(1, 105, 10, Side::SELL)); // to be replaced
+            (void)f.book->add_order(make_order(2, 100, 10, Side::BUY));  // resting bid
+
+            std::vector<FillRecord> fills;
+            // A price change unconditionally takes the priority-losing
+            // (cancel + re-match) path -- moving order1's price down to
+            // 100 now crosses the resting bid, which a plain in-place
+            // qty/price mutation would never re-check.
+            const MatchStats stats = f.matcher->replace(
+                1, 100, 10, [&](const FillEvent &ev)
+                { fills.push_back({ev.maker_order_id, ev.price, ev.qty}); });
+
+            HYDRA_CHECK_EQ(stats.fills_generated, uint32_t{1});
+            HYDRA_CHECK_EQ(fills.size(), std::size_t{1});
+            HYDRA_CHECK_EQ(fills[0].maker_order_id, uint64_t{2});
+            HYDRA_CHECK_EQ(fills[0].qty, uint32_t{10});
+            HYDRA_CHECK(!f.book->best_bid().has_value());
+            HYDRA_CHECK(!f.book->best_ask().has_value());
+        }
+
+        void test_replace_nonexistent_order_is_noop()
+        {
+            Fixture f;
+            (void)f.book->add_order(make_order(1, 100, 10, Side::SELL));
+
+            const MatchStats stats = f.matcher->replace(999, 100, 5, [](const FillEvent &) {});
+            HYDRA_CHECK_EQ(stats.fills_generated, uint32_t{0});
+
+            // Book untouched.
+            Level *lvl = f.book->best_ask_level();
+            HYDRA_CHECK(lvl != nullptr);
+            HYDRA_CHECK_EQ(lvl->order_count, uint32_t{1});
+            HYDRA_CHECK_EQ(lvl->head_->order_id, uint64_t{1});
+            HYDRA_CHECK_EQ(lvl->head_->qty, uint32_t{10});
+        }
+
+        // MatchStats accuracy: a multi-level price-time sweep must report
+        // levels_consumed == 2 and resting_orders_examined ==
+        // eligible_orders_examined + self_trade_skips with the self-trade
+        // order (client_id shared with incoming) correctly excluded from
+        // fills but still counted as examined.
+        void test_match_stats_levels_and_examined_counts_price_time()
+        {
+            Fixture f;
+            (void)f.book->add_order(make_order(1, 100, 5, Side::SELL, TimeInForce::GTC, 7)); // self-trade
+            (void)f.book->add_order(make_order(2, 100, 5, Side::SELL, TimeInForce::GTC, 9));
+            (void)f.book->add_order(make_order(3, 101, 20, Side::SELL, TimeInForce::GTC, 9));
+
+            const MatchStats stats = f.matcher->match(
+                make_order(10, 101, 15, Side::BUY, TimeInForce::GTC, 7), [](const FillEvent &) {});
+
+            HYDRA_CHECK_EQ(stats.levels_consumed, uint32_t{2});
+            HYDRA_CHECK_EQ(stats.self_trade_skips, uint32_t{1});
+            HYDRA_CHECK_EQ(stats.resting_orders_examined, uint32_t{3});
+            HYDRA_CHECK_EQ(stats.eligible_orders_examined, uint32_t{2});
+            HYDRA_CHECK_EQ(stats.fills_generated, uint32_t{2});
+            HYDRA_CHECK_EQ(stats.remaining_qty, uint32_t{0});
+        }
+
+        // remaining_qty must reflect a genuine partial fill (incoming
+        // larger than total resting liquidity).
+        void test_match_stats_remaining_qty_on_partial_fill()
+        {
+            Fixture f;
+            (void)f.book->add_order(make_order(1, 100, 5, Side::SELL));
+
+            const MatchStats stats = f.matcher->match(
+                make_order(10, 100, 12, Side::BUY, TimeInForce::IOC), [](const FillEvent &) {});
+
+            HYDRA_CHECK_EQ(stats.fills_generated, uint32_t{1});
+            HYDRA_CHECK_EQ(stats.remaining_qty, uint32_t{7});
         }
 
     } // namespace
@@ -396,6 +586,8 @@ int main()
     RUN_TEST(test_price_time_vs_pro_rata_same_book_state);
     RUN_TEST(test_price_time_strict_fifo_priority);
     RUN_TEST(test_pro_rata_residual_goes_to_largest);
+    RUN_TEST(test_price_improvement);
+    RUN_TEST(test_empty_book);
     RUN_TEST(test_ioc_leaves_no_resting_remainder);
     RUN_TEST(test_fok_fills_completely_when_liquidity_sufficient);
     RUN_TEST(test_fok_mutates_nothing_when_liquidity_insufficient);
@@ -403,6 +595,13 @@ int main()
     RUN_TEST(test_pro_rata_sweeps_multiple_levels_no_crossed_book);
     RUN_TEST(test_pro_rata_sole_order_fully_filled_no_crash);
     RUN_TEST(test_self_trade_prevention_in_pro_rata);
+    RUN_TEST(test_replace_preserves_priority_same_price_qty_decrease);
+    RUN_TEST(test_replace_loses_priority_on_price_change);
+    RUN_TEST(test_replace_loses_priority_on_qty_increase);
+    RUN_TEST(test_replace_that_crosses_book);
+    RUN_TEST(test_replace_nonexistent_order_is_noop);
+    RUN_TEST(test_match_stats_levels_and_examined_counts_price_time);
+    RUN_TEST(test_match_stats_remaining_qty_on_partial_fill);
 
     return report_and_exit_code();
 }

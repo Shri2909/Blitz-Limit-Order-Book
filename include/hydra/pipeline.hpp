@@ -6,7 +6,6 @@
 #include <string>
 
 #include "hydra/config.hpp"
-#include "hydra/histogram.hpp"
 #include "hydra/matcher.hpp"
 #include "hydra/object_pool.hpp"
 #include "hydra/order_book.hpp"
@@ -20,12 +19,49 @@
 namespace hydra
 {
 
+    // Explicit measurement-category breakdown (see
+    // docs/BENCHMARK_METHODOLOGY.md for the exact start/end boundary of
+    // every field below). Replaces the old single fused "queue_transit_ns"
+    // (pop-done doubled as match-start) with a real, separately-timed
+    // pop boundary, plus per-order MatchStats so the CSV/report layer never
+    // has to approximate "levels consumed"/"orders examined" from
+    // externally-observable fill events.
     struct LatencySample
     {
-        uint64_t queue_transit_ns;
+        // t_pop_call_start - order.timestamp_ns. Approximate, disclosed:
+        // includes the producer's own (typically single-digit-ns, measured
+        // separately as its own aggregate -- see ReplayPhaseResult in
+        // benchmark.cpp) push() call duration, since that duration cannot
+        // be attributed back into the transported Order value without
+        // knowing it before the value is copied into the queue. See
+        // docs/BENCHMARK_METHODOLOGY.md.
+        uint64_t queue_residence_ns;
+        // Time inside the one successful SpscQueue::pop() call itself.
+        uint64_t queue_pop_ns;
+        // For an order/replace sample: time inside Matcher::match()/
+        // Matcher::replace(), EXCLUDING fill_publish_ns below (the on_fill
+        // callback is bracketed separately so book-mutation time and
+        // fill-delivery time are cleanly partitioned, not fused). For a
+        // cancel sample: time inside OrderBook::cancel_order() -- same
+        // "time to perform the operation, queue wait excluded" concept
+        // either way, which is why this is one field disambiguated by
+        // is_cancel/is_replace rather than several.
         uint64_t match_time_ns;
+        // Cumulative time inside the on_fill() callback across every fill
+        // this order generated (0 if fills_generated == 0). Always
+        // measured (not flag-gated): the added cost is one serialized
+        // RDTSCP pair per generated fill, paid only on orders that actually
+        // cross, and disclosed via the report's "Clock overhead" field.
+        uint64_t fill_publish_ns;
         uint64_t end_to_end_ns;
+        uint32_t fills_generated = 0;
+        uint32_t levels_consumed = 0;
+        uint32_t resting_orders_examined = 0;
+        uint32_t eligible_orders_examined = 0;
+        uint32_t self_trade_skips = 0;
+        uint32_t remaining_qty = 0;
         bool is_cancel = false;
+        bool is_replace = false;
     };
 
     struct RawSampleSink
@@ -63,8 +99,6 @@ namespace hydra
         Matcher &matcher;
         ObjectPool<Order, ORDER_POOL_SIZE> &order_pool;
         ObjectPool<Level, LEVEL_POOL_SIZE> &level_pool;
-        ObjectPool<FillEvent, FILL_EVENT_POOL_SIZE> &fill_pool;
-        HdrHistogram &histogram;
 
         // Calibrated ONCE (see calibrate_ns_per_cycle() in clock.hpp) by
         // whoever constructs the pipeline, before any thread starts, and

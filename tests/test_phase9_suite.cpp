@@ -6,9 +6,10 @@
 // comment block's "extended edge cases beyond the 15 core" -- scenarios the
 // canonical suite deliberately doesn't cover (it's fixed at 15 by design),
 // but that this codebase's actual behavior should still be pinned down:
-// pool exhaustion mid-match (not just mid-add), multi-level IOC/FOK sweeps,
-// self-trade skipping across a level boundary, cross-call partial-fill
-// sequences, and a large-scale internal-consistency invariant check.
+// order/level pool exhaustion during the GTC-rest step (not just a direct
+// add), multi-level IOC/FOK sweeps, self-trade skipping across a level
+// boundary, cross-call partial-fill sequences, and a large-scale
+// internal-consistency invariant check.
 //===----------------------------------------------------------------------===
 
 #include "hydra/matcher.hpp"
@@ -50,12 +51,10 @@ namespace hydra::test
                 std::make_unique<ObjectPool<Order, ORDER_POOL_SIZE>>();
             std::unique_ptr<ObjectPool<Level, LEVEL_POOL_SIZE>> level_pool =
                 std::make_unique<ObjectPool<Level, LEVEL_POOL_SIZE>>();
-            std::unique_ptr<ObjectPool<FillEvent, FILL_EVENT_POOL_SIZE>> fill_pool =
-                std::make_unique<ObjectPool<FillEvent, FILL_EVENT_POOL_SIZE>>();
             std::unique_ptr<OrderBook> book =
                 std::make_unique<OrderBook>(*order_pool, *level_pool);
             std::unique_ptr<Matcher> matcher = std::make_unique<Matcher>(
-                *book, *fill_pool, MatchingMode::PRICE_TIME);
+                *book, MatchingMode::PRICE_TIME);
         };
 
         [[nodiscard]] uint32_t find_fill_qty(const std::vector<FillRecord> &fills, uint64_t maker_id)
@@ -68,41 +67,6 @@ namespace hydra::test
                 }
             }
             return 0;
-        }
-
-        // FillEvent pool exhaustion mid-match: drain the pool completely
-        // BEFORE calling match(), so apply_fill()'s own fill_pool_.acquire()
-        // is guaranteed to fail. Confirms the trade still executes (fully)
-        // and on_fill still fires via the stack-local fallback -- the fix
-        // for what used to be a silently dropped fill.
-        void test_fill_pool_exhaustion_still_delivers_fill_and_executes_trade()
-        {
-            Fixture f;
-            (void)f.book->add_order(make_order(1, 100, 10, Side::SELL));
-
-            std::vector<FillEvent *> held;
-            held.reserve(FILL_EVENT_POOL_SIZE);
-            for (std::size_t i = 0; i < FILL_EVENT_POOL_SIZE; ++i)
-            {
-                FillEvent *fe = f.fill_pool->acquire();
-                HYDRA_CHECK(fe != nullptr);
-                held.push_back(fe);
-            }
-            HYDRA_CHECK_EQ(f.fill_pool->exhaustion_count(), uint64_t{0});
-            HYDRA_CHECK_EQ(f.matcher->fill_pool_exhaustion_count(), uint64_t{0});
-
-            bool handler_called = false;
-            uint32_t delivered_qty = 0;
-            const uint32_t n = f.matcher->match(
-                make_order(10, 100, 10, Side::BUY), [&](const FillEvent &ev)
-                { handler_called = true; delivered_qty = ev.qty; });
-
-            HYDRA_CHECK_EQ(n, uint32_t{1});
-            HYDRA_CHECK(handler_called);
-            HYDRA_CHECK_EQ(delivered_qty, uint32_t{10});
-            HYDRA_CHECK_EQ(f.matcher->fill_pool_exhaustion_count(), uint64_t{1});
-            // Trade genuinely executed despite the exhausted event pool.
-            HYDRA_CHECK(!f.book->best_ask().has_value());
         }
 
         // Order pool exhaustion specifically during the GTC "rest the
@@ -124,10 +88,10 @@ namespace hydra::test
                 held.push_back(o);
             }
 
-            const uint32_t n = f.matcher->match(
+            const MatchStats n = f.matcher->match(
                 make_order(10, 100, 10, Side::BUY), [](const FillEvent &) {});
 
-            HYDRA_CHECK_EQ(n, uint32_t{0});
+            HYDRA_CHECK_EQ(n.fills_generated, uint32_t{0});
             HYDRA_CHECK(!f.book->best_bid().has_value());
         }
 
@@ -150,10 +114,10 @@ namespace hydra::test
                 held.push_back(lvl);
             }
 
-            const uint32_t n = f.matcher->match(
+            const MatchStats n = f.matcher->match(
                 make_order(10, 100, 10, Side::BUY), [](const FillEvent &) {});
 
-            HYDRA_CHECK_EQ(n, uint32_t{0});
+            HYDRA_CHECK_EQ(n.fills_generated, uint32_t{0});
             HYDRA_CHECK(!f.book->best_bid().has_value());
             // The Order acquired for the failed rest attempt must have been
             // released back, not leaked.
@@ -167,11 +131,11 @@ namespace hydra::test
             (void)f.book->add_order(make_order(2, 101, 10, Side::SELL));
 
             std::vector<FillRecord> fills;
-            const uint32_t n = f.matcher->match(
+            const MatchStats n = f.matcher->match(
                 make_order(10, 101, 25, Side::BUY, TimeInForce::IOC), [&](const FillEvent &ev)
                 { fills.push_back({ev.maker_order_id, ev.price, ev.qty}); });
 
-            HYDRA_CHECK_EQ(n, uint32_t{2});
+            HYDRA_CHECK_EQ(n.fills_generated, uint32_t{2});
             HYDRA_CHECK_EQ(find_fill_qty(fills, 1), uint32_t{10});
             HYDRA_CHECK_EQ(find_fill_qty(fills, 2), uint32_t{10});
             // Both levels fully drained; 5 units of unfillable IOC quantity
@@ -189,11 +153,11 @@ namespace hydra::test
                 (void)f.book->add_order(make_order(2, 101, 15, Side::SELL));
 
                 std::vector<FillRecord> fills;
-                const uint32_t n = f.matcher->match(
+                const MatchStats n = f.matcher->match(
                     make_order(10, 101, 20, Side::BUY, TimeInForce::FOK), [&](const FillEvent &ev)
                     { fills.push_back({ev.maker_order_id, ev.price, ev.qty}); });
 
-                HYDRA_CHECK_EQ(n, uint32_t{2});
+                HYDRA_CHECK_EQ(n.fills_generated, uint32_t{2});
                 HYDRA_CHECK_EQ(find_fill_qty(fills, 1), uint32_t{10});
                 HYDRA_CHECK_EQ(find_fill_qty(fills, 2), uint32_t{10});
                 HYDRA_CHECK(f.book->best_ask().has_value());
@@ -212,11 +176,11 @@ namespace hydra::test
                 (void)f.book->add_order(make_order(2, 101, 15, Side::SELL));
 
                 bool handler_called = false;
-                const uint32_t n = f.matcher->match(
+                const MatchStats n = f.matcher->match(
                     make_order(10, 101, 30, Side::BUY, TimeInForce::FOK),
                     [&](const FillEvent &) { handler_called = true; });
 
-                HYDRA_CHECK_EQ(n, uint32_t{0});
+                HYDRA_CHECK_EQ(n.fills_generated, uint32_t{0});
                 HYDRA_CHECK(!handler_called);
                 HYDRA_CHECK_EQ(f.book->best_ask().value(), int64_t{100});
                 Level *lvl0 = f.book->best_ask_level();
@@ -240,12 +204,12 @@ namespace hydra::test
             (void)f.book->add_order(make_order(3, 101, 10, Side::SELL, TimeInForce::GTC, 9));
 
             std::vector<FillRecord> fills;
-            const uint32_t n = f.matcher->match(
+            const MatchStats n = f.matcher->match(
                 make_order(10, 101, 25, Side::BUY, TimeInForce::GTC, 7),
                 [&](const FillEvent &ev)
                 { fills.push_back({ev.maker_order_id, ev.price, ev.qty}); });
 
-            HYDRA_CHECK_EQ(n, uint32_t{2});
+            HYDRA_CHECK_EQ(n.fills_generated, uint32_t{2});
             HYDRA_CHECK_EQ(find_fill_qty(fills, 2), uint32_t{10});
             HYDRA_CHECK_EQ(find_fill_qty(fills, 3), uint32_t{10});
             HYDRA_CHECK_EQ(find_fill_qty(fills, 1), uint32_t{0}); // never touched
@@ -272,9 +236,9 @@ namespace hydra::test
             Fixture f;
             (void)f.book->add_order(make_order(1, 100, 10, Side::SELL));
 
-            const uint32_t n = f.matcher->match(make_order(10, 100, 4, Side::BUY),
+            const MatchStats n = f.matcher->match(make_order(10, 100, 4, Side::BUY),
                                                 [](const FillEvent &) {});
-            HYDRA_CHECK_EQ(n, uint32_t{1});
+            HYDRA_CHECK_EQ(n.fills_generated, uint32_t{1});
 
             Level *lvl = f.book->best_ask_level();
             HYDRA_CHECK(lvl != nullptr);
@@ -295,21 +259,21 @@ namespace hydra::test
             Fixture f;
             (void)f.book->add_order(make_order(1, 100, 30, Side::SELL));
 
-            const uint32_t n1 = f.matcher->match(make_order(10, 100, 10, Side::BUY),
+            const MatchStats n1 = f.matcher->match(make_order(10, 100, 10, Side::BUY),
                                                  [](const FillEvent &) {});
-            HYDRA_CHECK_EQ(n1, uint32_t{1});
+            HYDRA_CHECK_EQ(n1.fills_generated, uint32_t{1});
             HYDRA_CHECK(f.book->best_ask().has_value());
             HYDRA_CHECK_EQ(f.book->best_ask_level()->head_->qty, uint32_t{20});
 
-            const uint32_t n2 = f.matcher->match(make_order(11, 100, 15, Side::BUY),
+            const MatchStats n2 = f.matcher->match(make_order(11, 100, 15, Side::BUY),
                                                  [](const FillEvent &) {});
-            HYDRA_CHECK_EQ(n2, uint32_t{1});
+            HYDRA_CHECK_EQ(n2.fills_generated, uint32_t{1});
             HYDRA_CHECK(f.book->best_ask().has_value());
             HYDRA_CHECK_EQ(f.book->best_ask_level()->head_->qty, uint32_t{5});
 
-            const uint32_t n3 = f.matcher->match(make_order(12, 100, 5, Side::BUY),
+            const MatchStats n3 = f.matcher->match(make_order(12, 100, 5, Side::BUY),
                                                  [](const FillEvent &) {});
-            HYDRA_CHECK_EQ(n3, uint32_t{1});
+            HYDRA_CHECK_EQ(n3.fills_generated, uint32_t{1});
             HYDRA_CHECK(!f.book->best_ask().has_value());
         }
 
@@ -345,10 +309,10 @@ namespace hydra::test
             // plenty of untouched levels to check the invariant against.
             const uint32_t sweep_qty = static_cast<uint32_t>(total_liquidity / 3);
             uint64_t total_filled = 0;
-            const uint32_t n = f.matcher->match(
+            const MatchStats n = f.matcher->match(
                 make_order(999'999, 100 + kLevels, sweep_qty, Side::BUY),
                 [&](const FillEvent &ev) { total_filled += ev.qty; });
-            HYDRA_CHECK(n > 0);
+            HYDRA_CHECK(n.fills_generated > 0);
             HYDRA_CHECK_EQ(total_filled, static_cast<uint64_t>(sweep_qty));
 
             // Walk every remaining level and verify total_qty matches the
@@ -381,7 +345,6 @@ int main()
 {
     using namespace hydra::test;
 
-    RUN_TEST(test_fill_pool_exhaustion_still_delivers_fill_and_executes_trade);
     RUN_TEST(test_order_pool_exhaustion_during_rest_after_no_liquidity);
     RUN_TEST(test_level_pool_exhaustion_during_rest_at_new_price);
     RUN_TEST(test_ioc_sweeps_multiple_levels_before_discarding_remainder);

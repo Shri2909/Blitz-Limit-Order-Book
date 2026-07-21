@@ -220,19 +220,29 @@ namespace hydra::test
 
         // The core Phase 8 exit-condition test. See file header for why a
         // preflight rejection here is treated as a pass, not a failure.
+        //
+        // run_benchmark() requires a real dataset file (there is no
+        // live-generation fallback -- see benchmark.hpp's file-level WHY),
+        // so this test generates one sized to WARMUP_ITERATIONS +
+        // MEASURED_ITERATIONS, exactly like a real invocation would.
         void test_run_benchmark_produces_valid_csv_when_environment_permits()
         {
             const auto dir = std::filesystem::temp_directory_path();
             const std::string csv_path = (dir / "hydra_phase8_bench.csv").string();
+            const std::string dataset_path = (dir / "hydra_phase8_bench_dataset.bin").string();
             std::filesystem::remove(csv_path);
+            std::filesystem::remove(dataset_path);
+
+            {
+                DatasetGenerator gen(make_small_config(42, WARMUP_ITERATIONS + MEASURED_ITERATIONS));
+                gen.write_to_file(gen.generate(), dataset_path);
+            }
 
             auto order_pool = std::make_unique<ObjectPool<Order, ORDER_POOL_SIZE>>();
             auto level_pool = std::make_unique<ObjectPool<Level, LEVEL_POOL_SIZE>>();
-            auto fill_pool = std::make_unique<ObjectPool<FillEvent, FILL_EVENT_POOL_SIZE>>();
             auto book = std::make_unique<OrderBook>(*order_pool, *level_pool);
-            auto matcher = std::make_unique<Matcher>(*book, *fill_pool, MatchingMode::PRICE_TIME);
+            auto matcher = std::make_unique<Matcher>(*book, MatchingMode::PRICE_TIME);
             auto queue = std::make_unique<SpscQueue<Order, SPSC_CAPACITY>>();
-            auto histogram = std::make_unique<HdrHistogram>();
 
             PipelineContext ctx{
                 .queue = *queue,
@@ -240,16 +250,14 @@ namespace hydra::test
                 .matcher = *matcher,
                 .order_pool = *order_pool,
                 .level_pool = *level_pool,
-                .fill_pool = *fill_pool,
-                .histogram = *histogram,
             };
 
             BenchmarkConfig cfg{
                 .mode = MatchingMode::PRICE_TIME,
-                .core = 0,
-                .trials = 1,
+                .trials = 1, // a smoketest trial count on purpose -- this test
+                             // only validates CSV shape, not a citable result
                 .output_path = csv_path,
-                .dataset_path = std::nullopt, // live-generation mode
+                .dataset_path = dataset_path,
             };
 
             bool ran_for_real = false;
@@ -285,14 +293,34 @@ namespace hydra::test
             }
 
             // Reaching here means this IS a properly configured benchmark
-            // machine -- validate the real artifact it produced.
+            // machine -- validate the real artifacts it produced: the
+            // summary CSV (one row per trial, header is the very first
+            // line -- no leading '#' comment lines in the new schema),
+            // the raw per-sample CSV, and the metadata JSON, all derived
+            // from cfg.output_path (see derive_path() in benchmark.cpp).
             std::ifstream csv(csv_path);
             HYDRA_CHECK(static_cast<bool>(csv));
             std::string header_line;
-            std::getline(csv, header_line);
+            HYDRA_CHECK(static_cast<bool>(std::getline(csv, header_line)));
             HYDRA_CHECK_EQ(header_line,
-                          std::string("version,trial,iteration,latency_ns,queue_transit_ns,"
-                                      "match_time_ns,timestamp_unix"));
+                          std::string("run_id,commit_hash,trial,matching_mode,workload_type,"
+                                      "dataset,dataset_hash,dataset_records,warmup_operations,"
+                                      "measured_operations,producer_cpu,consumer_cpu,numa_node,"
+                                      "clock_source,timestamp_overhead_ns,p50_ns_per_order,"
+                                      "p90_ns_per_order,p99_ns_per_order,p999_ns_per_order,"
+                                      "mean_ns_per_order,max_ns_per_order,"
+                                      "throughput_orders_per_second,crossing_order_count,"
+                                      "non_crossing_order_count,partial_fill_count,"
+                                      "multi_level_sweep_count,fok_order_count,"
+                                      "self_trade_skip_count,resting_orders_examined,"
+                                      "eligible_orders_examined,generated_fill_count,"
+                                      "mean_fills_per_match,max_fill_fanout,"
+                                      "mean_levels_consumed,remainder_units_distributed,"
+                                      "allocation_invariant_failures,dropped_events,"
+                                      "arena_fallback_count,pool_exhaustion_count,"
+                                      "unexpected_allocation_count,state_hash,"
+                                      "reference_validation_status,determinism_status,valid,"
+                                      "invalid_reason"));
 
             std::size_t data_row_count = 0;
             std::string row;
@@ -303,8 +331,18 @@ namespace hydra::test
                     ++data_row_count;
                 }
             }
-            std::fprintf(stderr, "    CSV has %zu data row(s) after the header\n", data_row_count);
+            std::fprintf(stderr, "    summary CSV has %zu data row(s) after the header\n",
+                         data_row_count);
             HYDRA_CHECK(data_row_count > 0);
+
+            const std::string raw_csv_path =
+                csv_path.substr(0, csv_path.find_last_of('.')) + ".raw.csv";
+            const std::string meta_json_path =
+                csv_path.substr(0, csv_path.find_last_of('.')) + ".meta.json";
+            std::ifstream raw_csv(raw_csv_path);
+            HYDRA_CHECK(static_cast<bool>(raw_csv));
+            std::ifstream meta_json(meta_json_path);
+            HYDRA_CHECK(static_cast<bool>(meta_json));
         }
 
     } // namespace

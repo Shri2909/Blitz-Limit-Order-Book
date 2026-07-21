@@ -21,10 +21,3 @@ datasets/*
 # CMake cache
 compile_commands.json
 .cache/
-
-# metrics/ -- generated visual-proof report and its scratch build outputs.
-# WHY: regenerable in one command (./metrics/generate_metrics.sh) from the
-#      current code and whatever machine runs it; committing a stale report
-#      would silently drift from the code it claims to measure.
-metrics/out/
-metrics/bin/

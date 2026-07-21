@@ -4,17 +4,18 @@
 //
 // Turns incoming aggressive orders into fills against the resting book, in
 // two selectable allocation modes (price-time / pro-rata). Owns no memory
-// of its own -- references OrderBook and an ObjectPool<FillEvent,...>
-// handed to it at construction (ownership/wiring policy), same as
-// order_book.hpp's own OrderBook.
+// of its own -- references the OrderBook handed to it at construction
+// (ownership/wiring policy). FillEvent notifications are delivered
+// synchronously to the caller's on_fill callback and never pooled or
+// otherwise retained -- see apply_fill()'s own comment for why.
 
-#include "hydra/config.hpp"
-#include "hydra/object_pool.hpp"
 #include "hydra/order_book.hpp"
 #include "hydra/types.hpp"
 
 #include <atomic>
 #include <cstdint>
+#include <cstring>
+#include <utility>
 
 namespace hydra
 {
@@ -28,9 +29,8 @@ namespace hydra
     class Matcher
     {
     public:
-        Matcher(OrderBook &book, ObjectPool<FillEvent, FILL_EVENT_POOL_SIZE> &fill_pool,
-                MatchingMode initial_mode) noexcept
-            : book_(book), fill_pool_(fill_pool), mode_(initial_mode) {}
+        Matcher(OrderBook &book, MatchingMode initial_mode) noexcept
+            : book_(book), mode_(initial_mode) {}
 
         Matcher(const Matcher &) = delete;
         Matcher &operator=(const Matcher &) = delete;
@@ -45,13 +45,8 @@ namespace hydra
             return mode_.load(std::memory_order_relaxed);
         }
 
-        [[nodiscard]] uint64_t fill_pool_exhaustion_count() const noexcept
-        {
-            return fill_pool_exhaustion_count_.load(std::memory_order_relaxed);
-        }
-
         template <typename FillHandler>
-        [[nodiscard]] uint32_t match(Order incoming, FillHandler &&on_fill) noexcept
+        [[nodiscard]] MatchStats match(const Order &incoming, FillHandler &&on_fill) noexcept
         {
             const MatchingMode mode = mode_.load(std::memory_order_relaxed);
 
@@ -62,35 +57,100 @@ namespace hydra
                                                : available_pro_rata(incoming);
                 if (available < incoming.qty) [[unlikely]]
                 {
-                    return 0;
+                    // remaining_qty == incoming.qty here (not the
+                    // struct-default 0): nothing filled, so the entire
+                    // incoming quantity is "still unfilled" -- keeping
+                    // remaining_qty's meaning ("unfilled quantity")
+                    // consistent across every return path, including this
+                    // rejected-FOK one, rather than letting it default to a
+                    // value that would misread as "fully filled."
+                    MatchStats rejected{};
+                    rejected.remaining_qty = incoming.qty;
+                    return rejected;
                 }
             }
 
             uint32_t remaining = incoming.qty;
-            uint32_t fills_generated = 0;
+            MatchStats stats{};
             if (mode == MatchingMode::PRICE_TIME)
             {
-                sweep_price_time<false>(incoming, remaining, fills_generated, on_fill);
+                sweep_price_time<false>(incoming, remaining, stats, on_fill);
             }
             else
             {
-                pro_rata_sweep<false>(incoming, remaining, fills_generated, on_fill);
+                pro_rata_sweep<false>(incoming, remaining, stats, on_fill);
             }
 
             if (incoming.tif == TimeInForce::GTC && remaining > 0) [[unlikely]]
             {
-                incoming.qty = remaining;
-                [[maybe_unused]] Order *rested = book_.add_order(incoming);
+                // Mutable copy constructed only here, on the minority path
+                // that actually rests a remainder -- every fully-filled,
+                // IOC, or rejected-FOK order (the common case) now avoids
+                // copying the 128-byte Order at all, since incoming is a
+                // const reference above rather than a by-value parameter.
+                Order resting_copy = incoming;
+                resting_copy.qty = remaining;
+                [[maybe_unused]] Order *rested = book_.add_order(resting_copy);
             }
 
-            return fills_generated;
+            stats.remaining_qty = remaining;
+            return stats;
+        }
+
+        // Modifies the resting order named by order_id to (new_price,
+        // new_qty). Standard exchange modify-order semantics: a same-price,
+        // quantity-decrease-only replace preserves time priority (O(1),
+        // in-place -- it cannot newly cross the book, since the order's
+        // marketable price didn't move and its size only shrank). Any other
+        // replace (price change, or a quantity increase) loses time
+        // priority: the old resting order is cancelled and the modified
+        // order is re-submitted through the normal matching sweep as a
+        // fresh incoming order, since a price/qty change can newly cross
+        // the opposite side. Returns an empty MatchStats (no fills) for the
+        // priority-preserving path, or the real MatchStats from match() for
+        // the priority-losing path. A no-op (empty MatchStats, book
+        // untouched) if order_id is not currently resting.
+        template <typename FillHandler>
+        [[nodiscard]] MatchStats replace(uint64_t order_id, int64_t new_price, uint32_t new_qty,
+                                         FillHandler &&on_fill) noexcept
+        {
+            const Order *const existing = book_.find_order(order_id);
+            if (existing == nullptr) [[unlikely]]
+            {
+                return MatchStats{};
+            }
+
+            if (new_price == existing->price && new_qty <= existing->qty)
+            {
+                [[maybe_unused]] const bool replaced =
+                    book_.replace_order_in_place(order_id, new_qty);
+                return MatchStats{};
+            }
+
+            Order incoming{};
+            incoming.order_id = existing->order_id;
+            incoming.price = new_price;
+            incoming.qty = new_qty;
+            incoming.side = existing->side;
+            incoming.tif = existing->tif;
+            incoming.event_tag = OrderEventTag::NEW_OR_CANCEL;
+            incoming.client_id = existing->client_id;
+            incoming.timestamp_ns = existing->timestamp_ns;
+            std::memcpy(incoming.client_tag, existing->client_tag, sizeof(incoming.client_tag));
+
+            // Discarded intentionally: order_id was just found live in the
+            // book above (find_order() succeeded), so cancel_order()
+            // succeeding is guaranteed here -- there is no failure mode to
+            // react to, matching apply_fill()'s identical convention below.
+            [[maybe_unused]] const bool cancelled = book_.cancel_order(order_id);
+            return match(incoming, std::forward<FillHandler>(on_fill));
         }
 
     private:
         template <typename FillHandler>
         void apply_fill(Order *resting, Level *level, uint32_t fill_qty,
                         const Order &incoming, uint32_t &remaining,
-                        uint32_t &fills_generated, FillHandler &&on_fill) noexcept
+                        MatchStats &stats, FillHandler &&on_fill) noexcept
         {
             FillEvent fill_storage{};
             fill_storage.maker_order_id = resting->order_id;
@@ -99,29 +159,27 @@ namespace hydra
             fill_storage.qty = fill_qty;
             fill_storage.timestamp_ns = incoming.timestamp_ns;
 
-            // Every executed trade must reach the caller, even if the
-            // FillEvent pool is momentarily exhausted -- silently executing a
-            // trade with no corresponding event would be a lost fill with no
-            // error signal beyond an opaque counter. The pool is used when
-            // available (kept for parity with the other pooled types and for
-            // the exhaustion telemetry below); local storage is the fallback
-            // delivery path, never a dropped delivery.
-            FillEvent *fill = fill_pool_.acquire();
-            if (fill != nullptr) [[likely]]
-            {
-                *fill = fill_storage;
-                on_fill(*fill);
-                fill_pool_.release(fill);
-            }
-            else [[unlikely]]
-            {
-                fill_pool_exhaustion_count_.fetch_add(1, std::memory_order_relaxed);
-                on_fill(fill_storage);
-            }
-            ++fills_generated;
+            // Delivered directly, never pooled: fill_storage never outlives
+            // this call on any path -- on_fill() is always synchronous, and
+            // nothing downstream (the live pipeline's no-op handler, or
+            // benchmark.cpp's sample recorder) retains a pointer past the
+            // callback returning. A pool round-trip here would only add an
+            // acquire/copy/release for an object with nothing to gain from
+            // pooling -- the same "hot-path cost, zero consumer" shape this
+            // project already removed once elsewhere (HdrHistogram).
+            on_fill(fill_storage);
+            ++stats.fills_generated;
 
             remaining -= fill_qty;
             resting->qty -= fill_qty;
+            // Zeroing resting->qty here, strictly before cancel_order()
+            // below, is load-bearing: OrderBook::unlink_from_level() also
+            // decrements level->total_qty by order->qty at unlink time, so
+            // that decrement must already see 0 by the time cancel_order()
+            // runs, or level->total_qty would be double-decremented for a
+            // resting order that just got fully filled. See
+            // unlink_from_level()'s own comment (order_book.hpp) for the
+            // other half of this contract.
             level->total_qty -= fill_qty;
             if (resting->qty == 0)
             {
@@ -138,9 +196,15 @@ namespace hydra
                                                 : (level->price >= incoming.price);
         }
 
+        // Not accumulated on the DryRun (FOK-availability) path: `stats` is
+        // reserved for the real commit-pass traversal, so a FOK order's
+        // pre-check sweep never double-counts levels/orders examined
+        // against the same order's later real sweep -- see
+        // available_price_time()/available_pro_rata() below, which pass a
+        // throwaway local instead of the caller's real MatchStats.
         template <bool DryRun, typename FillHandler>
         void sweep_price_time(const Order &incoming, uint32_t &remaining,
-                              uint32_t &fills_generated, FillHandler &&on_fill) noexcept
+                              MatchStats &stats, FillHandler &&on_fill) noexcept
         {
             Level *level = (incoming.side == Side::BUY) ? book_.best_ask_level()
                                                         : book_.best_bid_level();
@@ -150,6 +214,10 @@ namespace hydra
                 Level *const next_level = (incoming.side == Side::BUY)
                                               ? book_.next_ask_level(level->price)
                                               : book_.next_bid_level(level->price);
+                if constexpr (!DryRun)
+                {
+                    ++stats.levels_consumed;
+                }
 
                 Order *next_resting = nullptr;
                 for (Order *resting = level->head_; resting != nullptr && remaining > 0;
@@ -157,9 +225,23 @@ namespace hydra
                 {
                     next_resting = resting->next_;
 
+                    if constexpr (!DryRun)
+                    {
+                        ++stats.resting_orders_examined;
+                    }
+
                     if (OrderBook::is_self_trade(*resting, incoming)) [[unlikely]]
                     {
+                        if constexpr (!DryRun)
+                        {
+                            ++stats.self_trade_skips;
+                        }
                         continue;
+                    }
+
+                    if constexpr (!DryRun)
+                    {
+                        ++stats.eligible_orders_examined;
                     }
 
                     const uint32_t fill_qty = std::min(remaining, resting->qty);
@@ -170,7 +252,7 @@ namespace hydra
                     else
                     {
                         apply_fill(resting, level, fill_qty, incoming, remaining,
-                                   fills_generated, on_fill);
+                                   stats, on_fill);
                     }
                 }
 
@@ -181,8 +263,8 @@ namespace hydra
         [[nodiscard]] uint32_t available_price_time(const Order &incoming) noexcept
         {
             uint32_t remaining = incoming.qty;
-            uint32_t unused_fill_count = 0;
-            sweep_price_time<true>(incoming, remaining, unused_fill_count,
+            MatchStats unused_stats{};
+            sweep_price_time<true>(incoming, remaining, unused_stats,
                                    [](const FillEvent &) noexcept {});
             return incoming.qty - remaining;
         }
@@ -194,7 +276,7 @@ namespace hydra
         // best one).
         template <bool DryRun, typename FillHandler>
         void pro_rata_at_level(Level *level, const Order &incoming, uint32_t &remaining,
-                               uint32_t &fills_generated, FillHandler &&on_fill) noexcept
+                               MatchStats &stats, FillHandler &&on_fill) noexcept
         {
             Order *const fifo_head = level->head_;
 
@@ -202,6 +284,16 @@ namespace hydra
             Order *largest = nullptr;
             for (Order *r = fifo_head; r != nullptr; r = r->next_)
             {
+                // Counted here, once per unique resting order per level per
+                // match() call, regardless of DryRun -- this is the single
+                // pass every order at the level is guaranteed to be visited
+                // in exactly once (the later apply-pass below re-visits the
+                // same nodes only on the real commit path, which would
+                // double-count "examined" if counted there too).
+                if constexpr (!DryRun)
+                {
+                    ++stats.resting_orders_examined;
+                }
                 if (!OrderBook::is_self_trade(*r, incoming))
                 {
                     eligible_total += r->qty;
@@ -209,6 +301,14 @@ namespace hydra
                     {
                         largest = r;
                     }
+                    if constexpr (!DryRun)
+                    {
+                        ++stats.eligible_orders_examined;
+                    }
+                }
+                else if constexpr (!DryRun)
+                {
+                    ++stats.self_trade_skips;
                 }
             }
             if (eligible_total == 0) [[unlikely]]
@@ -274,7 +374,7 @@ namespace hydra
                     if (total_share > 0)
                     {
                         apply_fill(r, level, total_share, incoming, remaining,
-                                   fills_generated, on_fill);
+                                   stats, on_fill);
                     }
                 }
 
@@ -286,7 +386,7 @@ namespace hydra
                 if (largest_total_share > 0)
                 {
                     apply_fill(largest, level, largest_total_share, incoming, remaining,
-                               fills_generated, on_fill);
+                               stats, on_fill);
                 }
             }
         }
@@ -302,7 +402,7 @@ namespace hydra
         // still crosses the opposite side -- an invalid, crossed book.
         template <bool DryRun, typename FillHandler>
         void pro_rata_sweep(const Order &incoming, uint32_t &remaining,
-                            uint32_t &fills_generated, FillHandler &&on_fill) noexcept
+                            MatchStats &stats, FillHandler &&on_fill) noexcept
         {
             Level *level = (incoming.side == Side::BUY) ? book_.best_ask_level()
                                                         : book_.best_bid_level();
@@ -312,8 +412,12 @@ namespace hydra
                 Level *const next_level = (incoming.side == Side::BUY)
                                               ? book_.next_ask_level(level->price)
                                               : book_.next_bid_level(level->price);
+                if constexpr (!DryRun)
+                {
+                    ++stats.levels_consumed;
+                }
 
-                pro_rata_at_level<DryRun>(level, incoming, remaining, fills_generated, on_fill);
+                pro_rata_at_level<DryRun>(level, incoming, remaining, stats, on_fill);
 
                 level = next_level;
             }
@@ -322,16 +426,14 @@ namespace hydra
         [[nodiscard]] uint32_t available_pro_rata(const Order &incoming) noexcept
         {
             uint32_t remaining = incoming.qty;
-            uint32_t unused_fill_count = 0;
-            pro_rata_sweep<true>(incoming, remaining, unused_fill_count,
+            MatchStats unused_stats{};
+            pro_rata_sweep<true>(incoming, remaining, unused_stats,
                                  [](const FillEvent &) noexcept {});
             return incoming.qty - remaining;
         }
 
         OrderBook &book_;
-        ObjectPool<FillEvent, FILL_EVENT_POOL_SIZE> &fill_pool_;
         std::atomic<MatchingMode> mode_;
-        std::atomic<uint64_t> fill_pool_exhaustion_count_{0};
     };
 
 } // namespace hydra

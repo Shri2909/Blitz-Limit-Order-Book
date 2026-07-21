@@ -3,6 +3,7 @@
 #include "hydra/affinity.hpp"
 #include "hydra/clock.hpp"
 
+#include <algorithm>
 #include <cstdio>
 #include <random>
 
@@ -100,17 +101,25 @@ namespace hydra
         }
 
         const double ns_per_cycle = ctx.ns_per_cycle;
+        const auto now_ns = [ns_per_cycle]() -> uint64_t
+        {
+            return static_cast<uint64_t>(static_cast<double>(rdtsc_now()) * ns_per_cycle);
+        };
 
         Order order{};
         while (!stop.stop_requested())
         {
             bool popped = false;
+            uint64_t t_pop_start_ns = 0;
+            uint64_t t_pop_end_ns = 0;
             for (int attempt = 0;
                  attempt < kBoundedSpinAttempts && !stop.stop_requested();
                  ++attempt)
             {
+                t_pop_start_ns = now_ns();
                 if (ctx.queue.pop(order))
                 {
+                    t_pop_end_ns = now_ns();
                     popped = true;
                     break;
                 }
@@ -120,47 +129,84 @@ namespace hydra
                 continue;
             }
 
-            if (order.qty == 0) [[unlikely]]
+            const uint64_t t1_ns = order.timestamp_ns;
+            const uint64_t queue_residence_ns = t_pop_start_ns - t1_ns;
+            const uint64_t queue_pop_ns = t_pop_end_ns - t_pop_start_ns;
+
+            if (order.event_tag == OrderEventTag::NEW_OR_CANCEL && order.qty == 0) [[unlikely]]
             {
+                // Cancels used to record an all-zero sample here and were
+                // excluded from every reported figure; every recorded
+                // sample is now here, distinguishable via is_cancel, not
+                // just the order/replace ones.
+                const uint64_t tc_start_ns = now_ns();
+
                 // Discarded intentionally: a cancel referencing an order
                 // that's already filled/cancelled is a normal race in a
                 // live book (or a replayed dataset), not an error condition
                 // this hot path needs to react to.
                 [[maybe_unused]] const bool cancelled = ctx.book.cancel_order(order.order_id);
+
+                const uint64_t tc_end_ns = now_ns();
+
                 RawSampleSink *sink = ctx.raw_samples.load(std::memory_order_acquire);
                 if (sink != nullptr)
                 {
-                    sink->record(LatencySample{0, 0, 0, true});
+                    LatencySample s{};
+                    s.queue_residence_ns = queue_residence_ns;
+                    s.queue_pop_ns = queue_pop_ns;
+                    s.match_time_ns = tc_end_ns - tc_start_ns;
+                    s.end_to_end_ns = tc_end_ns - t1_ns;
+                    s.is_cancel = true;
+                    sink->record(s);
                 }
                 continue;
             }
 
-            const uint64_t t2_ns = static_cast<uint64_t>(
-                static_cast<double>(rdtsc_now()) * ns_per_cycle);
-            const uint64_t t3_ns = static_cast<uint64_t>(
-                static_cast<double>(rdtsc_now()) * ns_per_cycle);
+            // Cumulative on_fill() time, bracketed separately from the
+            // surrounding match_time_ns so book-mutation cost and
+            // fill-delivery cost are cleanly partitioned rather than fused
+            // into one number -- see LatencySample::fill_publish_ns.
+            uint64_t fill_publish_ns = 0;
+            const auto timed_on_fill = [&](const FillEvent &fill)
+            {
+                const uint64_t pub_start_ns = now_ns();
+                (void)fill;
+                const uint64_t pub_end_ns = now_ns();
+                fill_publish_ns += (pub_end_ns - pub_start_ns);
+            };
 
-            [[maybe_unused]] const uint32_t fills_generated =
-                ctx.matcher.match(order, [&](const FillEvent &fill)
-                                  { (void)fill; });
+            const bool is_replace = (order.event_tag == OrderEventTag::REPLACE);
 
-            const uint64_t t4_ns = static_cast<uint64_t>(
-                static_cast<double>(rdtsc_now()) * ns_per_cycle);
+            const uint64_t t_match_start_ns = now_ns();
+            const MatchStats stats = is_replace
+                                         ? ctx.matcher.replace(order.order_id, order.price,
+                                                               order.qty, timed_on_fill)
+                                         : ctx.matcher.match(order, timed_on_fill);
+            const uint64_t t_match_end_ns = now_ns();
 
-            const uint64_t t1_ns = order.timestamp_ns;
-
-            const uint64_t queue_transit_ns = t2_ns - t1_ns;
-            const uint64_t match_time_ns = t4_ns - t3_ns;
-            const uint64_t end_to_end_ns = t4_ns - t1_ns;
-
-            ctx.histogram.record(queue_transit_ns);
-            ctx.histogram.record(match_time_ns);
-            ctx.histogram.record(end_to_end_ns);
+            const uint64_t match_time_ns =
+                (t_match_end_ns - t_match_start_ns) -
+                std::min(fill_publish_ns, t_match_end_ns - t_match_start_ns);
+            const uint64_t end_to_end_ns = t_match_end_ns - t1_ns;
 
             RawSampleSink *sink = ctx.raw_samples.load(std::memory_order_acquire);
             if (sink != nullptr)
             {
-                sink->record(LatencySample{queue_transit_ns, match_time_ns, end_to_end_ns});
+                LatencySample s{};
+                s.queue_residence_ns = queue_residence_ns;
+                s.queue_pop_ns = queue_pop_ns;
+                s.match_time_ns = match_time_ns;
+                s.fill_publish_ns = fill_publish_ns;
+                s.end_to_end_ns = end_to_end_ns;
+                s.fills_generated = stats.fills_generated;
+                s.levels_consumed = stats.levels_consumed;
+                s.resting_orders_examined = stats.resting_orders_examined;
+                s.eligible_orders_examined = stats.eligible_orders_examined;
+                s.self_trade_skips = stats.self_trade_skips;
+                s.remaining_qty = stats.remaining_qty;
+                s.is_replace = is_replace;
+                sink->record(s);
             }
         }
     }

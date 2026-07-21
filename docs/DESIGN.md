@@ -11,6 +11,18 @@ implementation, benchmarked against the same matched dataset, then reverted
 — not a permanent branch or variant kept in the tree. The fifth (AF_XDP) has
 no benchmark integration to ablate against at all yet, and is marked as such.
 
+**These four ablations are now reproducible with one command,
+`./scripts/run_ablations.sh`**, not just by hand-patching source as
+described below. Each rejected alternative lives permanently in its own
+directory under `ablation/` (never mutating `src/`/`include/`) and builds
+as a separate, not-built-by-default CMake target that shadows exactly one
+real header via include-path ordering — see `ablation/mutex_queue/include/
+hydra/spsc_queue.hpp`'s own comment for the mechanism, and README.md's
+"Extended benchmark suite" section for the full command list. The
+hand-patch/revert steps under "Reproducing these numbers" below are kept
+as an explanation of what each ablation *is*, not as the recommended way
+to reproduce the numbers anymore.
+
 **Current measured baseline** (the reference every ablation below is
 compared to): replaying the pinned dataset described in "Reproducing these
 numbers," across 5 trials — **median P99: 819.0 ns**, **median P99.9:
@@ -155,13 +167,14 @@ Reverted immediately after measuring.
 | `new`/`delete` per order | 1110.0 ns | 5409.0 ns | 9711.0 ns |
 | **Delta** | **~4.5x worse** | **~48x worse** |
 
-One additional real, currently-measured characteristic of the *current*
-design (not a before/after — there is no "before" data point for this one)
-is available from `metrics/`'s Category A1 sweep
-(`metrics/out/a1_cancel_latency.csv`): head and tail cancel latency stays
-in the same rough range (32–182ns) across FIFO depths from 100 to 40,000
-resting orders, consistent with the O(1) cancel design described below
-rather than latency scaling with depth.
+One additional real characteristic of the *current* design (not a
+before/after — there is no "before" data point for this one) is proven
+directly in the test suite, not a separate benchmark: `tests/
+test_phase5_orderbook.cpp`'s `test_cancel_is_position_independent_micro_benchmark`
+(head vs. tail position within one fixed-depth FIFO) and
+`test_cancel_latency_is_depth_independent` (depth 100 vs. 40,000) both
+assert cancel cost stays flat rather than scaling with depth, consistent
+with the O(1) cancel design described below.
 
 **Current implementation notes.** `include/hydra/object_pool.hpp`:
 `ObjectPool<T,N>` (line 23) holds one `alignas(64) std::array<Slot,N>`
@@ -249,12 +262,11 @@ is `alignas(64)`, exactly 128 bytes (`static_assert` at line 49), split
 into a hot 64-byte line (`order_id`, `price`, `qty`, `side`, `tif`,
 26 bytes of `hot_padding` reserved for the `prev_`/`next_` pointers that
 follow) and a cold 64-byte line (`timestamp_ns`, `client_id`,
-`client_tag[32]`, `cold_padding`). Layout is cross-checked against the live
-struct definition at build time via `metrics/src/struct_layout.cpp`
-(`sizeof`/`alignof`/`offsetof`), not hand-drawn — current output in
-`metrics/out/c1_struct_layout.txt` confirms `order_size=128`,
-`order_align=64`, and the exact byte offsets matching the layout described
-above. `Level` (line 62) is separately `alignas(64)`, exactly 64 bytes.
+`client_tag[32]`, `cold_padding`). The layout claim is the `static_assert`s
+themselves (`sizeof(Order) == 128`, `alignof(Order) == 64`, and the rest,
+`types.hpp:49-60`) — the actual proof mechanism, checked on every build,
+not a separately generated diagram that could drift out of sync with it.
+`Level` (line 62) is separately `alignas(64)`, exactly 64 bytes.
 
 ---
 
@@ -306,6 +318,14 @@ between the mapped frame and the populated `Order`.
 
 ## Reproducing these numbers
 
+**Recommended: `./scripts/run_ablations.sh`** builds the baseline and all
+four ablation targets and runs all five through the real, gated
+`--benchmark` path automatically, writing
+`results/<hash>/ablation_summary.{csv,md}` in the same shape as the table
+above. The manual patch/build/measure/revert steps below explain what each
+ablation target actually *is* and remain valid as a from-scratch
+description, but are no longer how you'd reproduce the numbers day to day.
+
 **The baseline and the SPSC/pinning/pooling ablations** all replay the same
 matched dataset:
 
@@ -323,14 +343,16 @@ cmake --build build --target blitz_lob blitz_gen_dataset -j"$(nproc)"
 # and tells you which check failed. Root is not required for numactl/affinity
 # on this host; add sudo if your system's policy requires it.
 numactl --cpunodebind=0 --membind=0 \
-    ./build/blitz_lob --benchmark --mode price_time --core 4 --trials 5 \
+    ./build/blitz_lob --benchmark --mode price_time --trials 5 \
     --dataset datasets/bench_110k.bin --output results/bench.csv
 ```
 
 `results/bench.csv` columns: `version,trial,iteration,latency_ns,
-queue_transit_ns,match_time_ns,timestamp_unix`. Compute P99.9 per trial and
-take the median across trials, per `README.md`'s "Reproducible Results"
-section, to reproduce the 1205.0 ns figure above.
+queue_transit_ns,match_time_ns,timestamp_unix,is_cancel`. Compute P99.9 per
+trial (filtering `is_cancel=0` for the order-latency figure -- cancel
+latency is a separate figure, see README.md's "Reproducible Results"
+section) and take the median across trials, per `README.md`'s "Reproducible
+Results" section, to reproduce the 1205.0 ns figure above.
 
 **To reproduce an ablation**, apply the corresponding temporary patch, run
 the identical command above, then revert:
@@ -338,10 +360,13 @@ the identical command above, then revert:
 - **SPSC queue**: replace `include/hydra/spsc_queue.hpp`'s internals with a
   `std::mutex` + `std::queue<T>` behind the same `push()`/`pop()`/
   `capacity()`/`approx_size()` signatures.
-- **Core pinning**: comment out `pin_to_core(cfg.core)`/
-  `verify_affinity(cfg.core)` in `src/benchmark.cpp`'s `run_benchmark()`,
+- **Core pinning**: comment out `pin_to_core(RX_CORE_ID)`/
+  `verify_affinity(RX_CORE_ID)` in `src/benchmark.cpp`'s `run_benchmark()`,
   and `pin_to_core(MATCHING_CORE_ID)`/`verify_affinity(MATCHING_CORE_ID)`
-  in `src/pipeline.cpp`'s `matching_thread_fn()`.
+  in `src/pipeline.cpp`'s `matching_thread_fn()`. (These used to be
+  `pin_to_core(cfg.core)`/`verify_affinity(cfg.core)` — a caller-supplied
+  core that could silently disagree with the core `run_preflight_checks()`
+  actually validated; now hardcoded to remove that gap entirely.)
 - **Object pooling**: replace `ObjectPool::acquire()`/`release()`'s bodies
   with `::new(std::nothrow) T(...)` / `delete ptr`, bypassing the free-list.
 
@@ -369,25 +394,23 @@ cmake --build build --target blitz_lob blitz_gen_dataset -j"$(nproc)"
     --output datasets/ablation4_flat.bin
 
 numactl --cpunodebind=0 --membind=0 \
-    ./build/blitz_lob --benchmark --mode price_time --core 4 --trials 5 \
+    ./build/blitz_lob --benchmark --mode price_time --trials 5 \
     --dataset datasets/ablation4_flat.bin --output results/ablation4.csv
 ```
 
 **Verify every revert is clean** before trusting any subsequent run:
 ```bash
 grep -rn "ABLATION" include/ src/ tools/    # must return nothing
-cmake --build build --target blitz_lob_tests -j"$(nproc)" && ./build/blitz_lob_tests
+ctest --test-dir build --output-on-failure
 ```
 
-`metrics/out/a1_cancel_latency.csv` and `metrics/out/c1_struct_layout.txt`
-regenerate via:
+The O(1)-cancel and struct-layout claims re-verify on any host, no
+preflight tuning required, via the correctness suite:
 ```bash
-./metrics/generate_metrics.sh
+cmake --build build --target blitz_lob_test_phase5_orderbook blitz_lob_test_phase1_types -j"$(nproc)"
+./build/blitz_lob_test_phase5_orderbook   # cancel position/depth independence
+./build/blitz_lob_test_phase1_types       # types.hpp static_asserts compile-checked on every build
 ```
-These two categories (A: correctness-derived proofs; C: struct layout) do
-not depend on the preflight-gated environment and will regenerate on any
-host; Category D (the real benchmark) will still refuse to run without the
-tuning above.
 
 **AF_XDP** has no ablation command because it has no benchmark integration
 to ablate against yet — see its section above.

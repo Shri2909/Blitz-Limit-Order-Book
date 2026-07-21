@@ -134,6 +134,48 @@ namespace hydra
             return exhaustion_count_.load(std::memory_order_relaxed);
         }
 
+        // Rebuilds the free list from scratch, treating every slot as free
+        // again -- WITHOUT calling ~T() on whatever might still be
+        // "acquired" in those slots. Safe only because every T this pool is
+        // instantiated with in this codebase (Order/Level/FillEvent) is
+        // trivially destructible (each has its own static_assert to that
+        // effect in types.hpp) -- skipping the destructor call is a true
+        // no-op for these types, not a leak or a skipped side effect. The
+        // static_assert below turns "someone instantiates ObjectPool with a
+        // non-trivial T" into a compile error here instead of a silent
+        // correctness bug.
+        //
+        // WHY this exists: run_benchmark()'s trial loop needs each trial to
+        // replay the identical dataset against a genuinely clean pool (see
+        // OrderBook::reset()'s own WHY for the full story) without paying
+        // the cost -- and, more importantly, the reference-stability
+        // requirement PipelineContext imposes -- of destroying and
+        // reconstructing the whole ObjectPool between trials.
+        //
+        // Deliberately does NOT reset exhaustion_count_: "did the pool ever
+        // run out over the whole run" stays the more useful, cumulative
+        // signal, matching how it's already read once at the end of a full
+        // run rather than per-trial.
+        //
+        // Caller's responsibility, not enforced here: only call this when
+        // nothing else is concurrently acquiring/releasing from this pool
+        // (e.g. after confirming the consumer thread has drained and is
+        // idle -- see the call site in benchmark.cpp).
+        void reset() noexcept
+        {
+            static_assert(std::is_trivially_destructible_v<T>,
+                          "ObjectPool::reset() skips destructor calls on any "
+                          "still-\"acquired\" slot -- only safe if T is "
+                          "trivially destructible; revisit this method if "
+                          "that ever stops being true for some T");
+            for (std::size_t i = 0; i + 1 < N; ++i)
+            {
+                slab_[i].next = &slab_[i + 1];
+            }
+            slab_[N - 1].next = nullptr;
+            free_head_ = &slab_[0];
+        }
+
     private:
         alignas(64) std::array<Slot, N> slab_;
         Slot *free_head_;

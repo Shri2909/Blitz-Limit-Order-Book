@@ -118,7 +118,6 @@ namespace hydra::test
             HYDRA_CHECK((SPSC_CAPACITY & (SPSC_CAPACITY - 1)) == 0);
             HYDRA_CHECK(ORDER_POOL_SIZE > 0);
             HYDRA_CHECK(LEVEL_POOL_SIZE > 0);
-            HYDRA_CHECK(FILL_EVENT_POOL_SIZE > 0);
         }
 
         void test_config_benchmark_constants()
