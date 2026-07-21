@@ -25,13 +25,26 @@ to reproduce the numbers anymore.
 
 **Current measured baseline** (the reference every ablation below is
 compared to): replaying the pinned dataset described in "Reproducing these
-numbers," across 5 trials — **median P99: 819.0 ns**, **median P99.9:
-1205.0 ns**, spread (max−min) of P99.9 across trials: **201.0 ns** —
-measured 2026-07-15 against the current working tree (see the commit-pinning
-caveat in `README.md`). P99.9 is the figure each ablation table below
-compares against; P99 is included here since it's the number `--benchmark`
-prints directly to its own console output, unlike P99.9 which requires
-reading the CSV.
+numbers," across 5 trials — **median P99: 1222.0 ns**, **median P99.9:
+1762.0 ns**, spread (max−min) of P99.9 across trials: **137.0 ns** —
+measured 2026-07-21 at commit `98a597b`, clean working tree
+(`dirty=false`, confirmed against `git status`, not merely self-reported).
+Raw evidence: `results/98a597b/ablation_baseline_price_time.csv` /
+`.meta.json`; consolidated in `CONSOLIDATED_BENCHMARK_RESULTS.md`. This
+supersedes an earlier version of this baseline (819.0 ns / 1205.0 ns) that
+was measured against an uncommitted working tree with no traceable commit
+— that number should no longer be cited. P99.9 is the figure each ablation
+table below compares against; P99 is included here since it's the number
+`--benchmark` prints directly to its own console output, unlike P99.9
+which requires reading the CSV.
+
+Two of the four ablation verdicts below changed materially between that
+earlier run and this one — core pinning and cache-line layout are now
+**INCONCLUSIVE under price-time matching**, not the clean proofs previously
+reported. This isn't a sign the earlier conclusions were fabricated so much
+as a reminder that a single 5-trial run of a noise-sensitive ablation
+(especially "unpinned") can land anywhere; see each section below for the
+specific numbers and the pro-rata cross-check.
 
 ---
 
@@ -61,9 +74,13 @@ so no new dataset was needed. Reverted immediately after measuring.
 
 | | Median P99 | Median P99.9 | Spread (max−min, P99.9) |
 |---|---|---|---|
-| Lock-free SPSC (current) | 819.0 ns | **1205.0 ns** | 201.0 ns |
-| `std::mutex` + `std::queue` | 5924.0 ns | 13049.0 ns | 4949.0 ns |
-| **Delta** | **~10.8x worse** | **~24.6x worse** |
+| Lock-free SPSC (current) | 1222.0 ns | **1762.0 ns** | 137.0 ns |
+| `std::mutex` + `std::queue` | 5484.0 ns | 7770.0 ns | 915.0 ns |
+| **Delta** | **~4.49x worse** | **~4.41x worse** | **~6.68x worse** |
+
+Verdict: **PROVEN** — consistent in direction and comfortably outside
+trial-to-trial noise on both matching policies (pro-rata: 3,065.0 ns →
+7,774.0 ns P99.9, ~2.54x worse; `results/98a597b/ablation_summary.md`).
 
 **Current implementation notes.** `include/hydra/spsc_queue.hpp:25-27`:
 `buffer_`, `tail_`, and `head_` are each independently `alignas(64)` — the
@@ -110,14 +127,29 @@ tuning around them. Reverted immediately after measuring.
 
 | | Median P99 | Median P99.9 | Spread (max−min, P99.9) |
 |---|---|---|---|
-| Pinned (current) | 819.0 ns | **1205.0 ns** | 201.0 ns |
-| Unpinned | 2377.0 ns | 18532.0 ns | 51975.0 ns |
-| **Delta** | **~15.4x worse** | **~258x worse** |
+| Pinned (current) | 1222.0 ns | **1762.0 ns** | 137.0 ns |
+| Unpinned | 1098.0 ns | 9216.0 ns | 139917.0 ns |
+| **Delta** | **~0.90x (lower — noise)** | **~5.23x worse** | **~1021x worse** |
 
-The spread explosion (258x) is the more telling number here: an unpinned
-thread's tail latency is dominated by *when* the scheduler happens to
-migrate or preempt it, which varies enormously run to run — one trial in
-this ablation hit a 66524ns P99.9 in isolation, others under 19000ns.
+Verdict: **INCONCLUSIVE under price-time.** Unpinned's own *median P99*
+comes in *lower* than pinned's — the effect only shows up in the P99.9
+tail, and that tail measurement itself swings across five orders of
+magnitude within this one ablation's 5 trials (4,729 ns to 144,646 ns
+P99.9, on the identical binary). A median-of-5 comparison can't cleanly
+separate "pinning helps" from "unpinned happened to get an unlucky
+scheduler trial" at that noise level.
+
+This is not a failure of the pinning hypothesis — it's exactly the
+instability core pinning exists to remove, observed directly. The same
+ablation under **pro-rata matching is clean: PROVEN, ~1.60x worse**
+(3,065.0 ns → 4,906.0 ns P99.9; `results/98a597b/ablation_summary.md`),
+which is the more trustworthy signal for this design decision until a
+price-time run with more trials (or a longer measurement window) resolves
+the tail noise. The spread explosion (~1021x under price-time) is itself
+the more telling number regardless of policy: an unpinned thread's tail
+latency is dominated by *when* the scheduler happens to migrate or preempt
+it, which varies enormously run to run — one trial in this ablation hit
+144,646 ns P99.9 in isolation, others as low as 4,729 ns.
 
 **Current implementation notes.** `include/hydra/affinity.hpp`:
 `pin_to_core()` (line 40) calls `pthread_setaffinity_np` with a single-core
@@ -163,9 +195,13 @@ Reverted immediately after measuring.
 
 | | Median P99 | Median P99.9 | Spread (max−min, P99.9) |
 |---|---|---|---|
-| Object pool (current) | 819.0 ns | **1205.0 ns** | 201.0 ns |
-| `new`/`delete` per order | 1110.0 ns | 5409.0 ns | 9711.0 ns |
-| **Delta** | **~4.5x worse** | **~48x worse** |
+| Object pool (current) | 1222.0 ns | **1762.0 ns** | 137.0 ns |
+| `new`/`delete` per order | 2167.0 ns | 6079.0 ns | 850.0 ns |
+| **Delta** | **~1.77x worse** | **~3.45x worse** | **~6.20x worse** |
+
+Verdict: **PROVEN** — consistent on both matching policies (pro-rata:
+3,065.0 ns → 6,948.0 ns P99.9, ~2.27x worse;
+`results/98a597b/ablation_summary.md`).
 
 One additional real characteristic of the *current* design (not a
 before/after — there is no "before" data point for this one) is proven
@@ -231,18 +267,23 @@ the serialized record size differs. Reverted immediately after measuring.
 
 | | Median P99 | Median P99.9 | Spread (max−min, P99.9) |
 |---|---|---|---|
-| Hot/cold split, 128 bytes (current) | 819.0 ns | **1205.0 ns** | 201.0 ns |
-| Flat, unseparated, 88 bytes | 1036.0 ns | 3773.0 ns | 2089.0 ns |
-| **Delta** | **~3.1x worse** | **~10.4x worse** |
+| Hot/cold split, 128 bytes (current) | 1222.0 ns | **1762.0 ns** | 137.0 ns |
+| Flat, unseparated, 88 bytes | 1231.0 ns | 1797.0 ns | 77.0 ns |
+| **Delta** | **~1.01x worse** | **~1.02x worse** | **~0.56x (smaller)** |
 
-This is the smallest effect of the four ablations, which is plausible —
-cache-line layout is a subtler effect than lock contention or allocator
+Verdict: **INCONCLUSIVE**, on both matching policies (pro-rata: 3,065.0 ns
+→ 3,554.0 ns P99.9, ~1.16x worse). This is a real downgrade from a
+previous version of this ablation, which reported ~3.1x/~10.4x. At ~1.02x,
+the effect is smaller than the ablation's *own* trial-to-trial spread
+(77.0 ns), which if anything argues there's no measurable signal here at
+all under the current methodology — not merely a small one. Cache-line
+layout is plausibly a subtler mechanism than lock contention or allocator
 overhead, and is measured here as end-to-end latency, not IPC (see below).
-One transparency note: because the flattened struct is also smaller
-(88 vs 128 bytes), this comparison bundles "removing the hot/cold split"
-together with "reducing total struct size" — an ablation that preserved
-128 bytes while un-separating the fields would isolate the layout variable
-alone, and wasn't attempted here.
+One transparency note that still applies regardless of magnitude: because
+the flattened struct is also smaller (88 vs 128 bytes), this comparison
+bundles "removing the hot/cold split" together with "reducing total struct
+size" — an ablation that preserved 128 bytes while un-separating the
+fields would isolate the layout variable alone, and wasn't attempted here.
 
 Separately, `include/hydra/types.hpp:26-31`'s own comment gives a target
 IPC shift ("~1.2 baseline... to ~2.1 after this split") and labels it
@@ -253,20 +294,28 @@ both `CMakeLists.txt` and `tests/`, is Phase 10 — AF_XDP), and `perf stat`
 does not work on this machine (`perf_event_paranoid=4` blocks it, confirmed
 by testing) — so that specific IPC figure remains unmeasured. **Do not
 quote the 1.2→2.1 IPC figure as an achieved result anywhere**; the
-1205.0ns vs 3773.0ns latency comparison above is a real, separate
-measurement of the same underlying design decision, not a substitute for
-that IPC number.
+1762.0ns vs 1797.0ns latency comparison above is a real, separate
+measurement of the same underlying design decision, but — unlike when
+this paragraph was first written — that comparison is now itself
+INCONCLUSIVE (~1.02x), so it should not be substituted for the IPC claim
+either. Right now neither figure supports a strong claim about this
+specific optimization's payoff; the `static_assert`-enforced layout itself
+is the only unconditionally true statement available.
 
-**Current implementation notes.** `include/hydra/types.hpp:32-47`: `Order`
-is `alignas(64)`, exactly 128 bytes (`static_assert` at line 49), split
+**Current implementation notes.** `include/hydra/types.hpp:47-63`: `Order`
+is `alignas(64)`, exactly 128 bytes (`static_assert` at line 65), split
 into a hot 64-byte line (`order_id`, `price`, `qty`, `side`, `tif`,
-26 bytes of `hot_padding` reserved for the `prev_`/`next_` pointers that
-follow) and a cold 64-byte line (`timestamp_ns`, `client_id`,
-`client_tag[32]`, `cold_padding`). The layout claim is the `static_assert`s
-themselves (`sizeof(Order) == 128`, `alignof(Order) == 64`, and the rest,
-`types.hpp:49-60`) — the actual proof mechanism, checked on every build,
-not a separately generated diagram that could drift out of sync with it.
-`Level` (line 62) is separately `alignas(64)`, exactly 64 bytes.
+`event_tag`, then 25 bytes of `hot_padding` reserved so the `prev_`/`next_`
+pointers that follow land exactly on the line boundary) and a cold 64-byte
+line (`timestamp_ns`, `client_id`, `client_tag[32]`, `cold_padding`). The
+layout claim is the `static_assert`s themselves (`sizeof(Order) == 128`,
+`alignof(Order) == 64`, and the rest, `types.hpp:65-78`) — the actual proof
+mechanism, checked on every build, not a separately generated diagram that
+could drift out of sync with it (see `charts/04_cache_line_layout.png` for
+that diagram, hand-verified against this exact struct — 25 bytes of
+`hot_padding`, not 26, and `event_tag` is a real field, both easy to get
+wrong transcribing this by hand). `Level` (line 80) is separately
+`alignas(64)`, exactly 64 bytes.
 
 ---
 
@@ -352,7 +401,7 @@ queue_transit_ns,match_time_ns,timestamp_unix,is_cancel`. Compute P99.9 per
 trial (filtering `is_cancel=0` for the order-latency figure -- cancel
 latency is a separate figure, see README.md's "Reproducible Results"
 section) and take the median across trials, per `README.md`'s "Reproducible
-Results" section, to reproduce the 1205.0 ns figure above.
+Results" section, to reproduce the 1762.0 ns figure above.
 
 **To reproduce an ablation**, apply the corresponding temporary patch, run
 the identical command above, then revert:
@@ -377,10 +426,13 @@ on-disk size:
 # Temporarily flatten Order in include/hydra/types.hpp to:
 #   struct Order {
 #       uint64_t order_id; int64_t price; uint32_t qty;
-#       Side side; TimeInForce tif;
+#       Side side; TimeInForce tif; OrderEventTag event_tag;
 #       Order *prev_; Order *next_;
 #       uint64_t timestamp_ns; uint64_t client_id; char client_tag[32];
 #   };
+# (this must include event_tag, or the flattened struct's logical fields
+# don't match the real Order and the ablation isn't measuring the same thing --
+# see ablation/flat_layout/include/hydra/types.hpp for the actual variant used)
 # and drop the sizeof(Order)==128 / %64==0 / alignof==64 static_asserts
 # (keep is_trivially_copyable_v). Then also comment out
 # dataset_generator.hpp's `static_assert(sizeof(DatasetRecord) == 256, ...)`
