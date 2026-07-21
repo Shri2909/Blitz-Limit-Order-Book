@@ -157,10 +157,10 @@ namespace hydra
         // doesn't override it.
         constexpr uint32_t AFXDP_DEFAULT_QUEUE_ID = 0;
 
-        // UDP port the order-entry wire protocol uses; net/xdp_prog.bpf.c
-        // redirects UDP traffic on the bound queue regardless of port
-        // (port filtering is left to the matching pipeline), but tooling
-        // needs one concrete default to talk to.
+        // UDP port the order-entry wire protocol uses. net/xdp_prog.bpf.c
+        // checks the UDP destination port against this exact value and
+        // rejects (XDP_PASS, HYDRA_STAT_WRONG_PORT) anything else -- see
+        // that file's own comment for why this must track this constant.
         constexpr uint16_t AFXDP_ORDER_ENTRY_UDP_PORT = 40000;
 
     } // namespace config

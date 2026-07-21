@@ -103,6 +103,11 @@ namespace hydra::xdp
     //     around this call (pipeline.cpp), not carried on the wire, so
     //     latency measurement reflects this host's clock, not the
     //     sender's.
+    //   - out.event_tag: not carried on the wire either (this protocol has
+    //     no room for it) -- relies on the same ObjectPool::acquire()
+    //     value-initialization guarantee as prev_/next_ below to come out
+    //     as OrderEventTag::NEW_OR_CANCEL (== 0), which is the only event
+    //     type this RX path ever produces.
     //   - out.prev_ / out.next_: intrusive FIFO-list pointers owned by
     //     order_book.hpp, set only when the order is actually inserted
     //     into a price level's FIFO. A freshly parsed Order that hasn't

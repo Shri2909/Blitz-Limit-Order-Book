@@ -2,12 +2,15 @@
 
 // include/hydra/stats.hpp
 //
-// Pure, header-only statistics functions shared by the benchmark harness
-// (src/benchmark.cpp) and the ablation report tool (tools/blitz_ablation_report.cpp),
-// so percentile/spread/verdict logic lives in exactly one tested place
-// instead of being re-derived (or re-approximated in shell/Python) per
-// caller. See docs/BENCHMARK_METHODOLOGY.md for the precise definition of
-// every statistic below and the reasoning behind the verdict thresholds.
+// Pure, header-only statistics functions used by the benchmark harness
+// (src/benchmark.cpp) so percentile/spread/verdict logic lives in exactly
+// one tested place. classify_ablation() below is also the reference this
+// project's own methodology notes says scripts/run_ablations.sh's embedded
+// Python verdict logic is ported from -- a dedicated compiled ablation-report
+// tool was scoped but deferred, so that Python port is the only other
+// consumer of this same logic today, not this header directly. See
+// METHODOLOGY.md for the precise definition of every statistic below and
+// the reasoning behind the verdict thresholds.
 
 #include <algorithm>
 #include <cmath>
