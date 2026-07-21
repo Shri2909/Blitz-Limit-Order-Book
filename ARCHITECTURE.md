@@ -105,7 +105,7 @@ sequenceDiagram
     participant POOL as Object Pools
     participant SINK as RawSampleSink
 
-    RX->>RX: build Order; timestamp_ns = rdtsc_now() * ns_per_cycle
+    RX->>RX: build Order -- timestamp_ns = rdtsc_now() * ns_per_cycle
     RX->>Q: push(order)
     Note right of RX: full? spin-retry up to 1,000x,<br/>then drop + count (pipeline.cpp:61-75)
 
