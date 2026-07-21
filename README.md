@@ -1,5 +1,12 @@
 # Blitz Limit Order Book (HYDRA-LOB)
 
+![C++20](https://img.shields.io/badge/language-C%2B%2B20-2a78d6?style=flat-square)
+![CMake](https://img.shields.io/badge/build-CMake%203.20%2B-2a78d6?style=flat-square)
+![Tests](https://img.shields.io/badge/tests-10%2F10%20passing-0ca30c?style=flat-square)
+![Sanitizers](https://img.shields.io/badge/sanitizers-ASan%20%C2%B7%20TSan%20%C2%B7%20UBSan-0ca30c?style=flat-square)
+![Kernel Bypass](https://img.shields.io/badge/kernel%20bypass-AF__XDP%2FeBPF-eb6834?style=flat-square)
+![License](https://img.shields.io/badge/license-MIT-52514e?style=flat-square)
+
 **A lock-free limit order book and matching engine in C++20, engineered as
 a measurement problem as much as a matching problem.**
 
@@ -16,7 +23,14 @@ then, this session, actually *proving* each design decision earned its
 place by temporarily ripping it out, one at a time, and measuring what
 broke.
 
-**Language:** C++20 · **Build:** CMake 3.20+ · **Tests:** 10 per-phase exit-condition suites (ASan/TSan/UBSan) · **Kernel bypass:** AF_XDP/eBPF · **Measured P99.9:** 1205.0 ns
+<p align="center"><img src="charts/00_hero_stats.png" alt="Headline numbers: P99.9 tail latency, sustained throughput, test suites passing, dropped events" width="100%"></p>
+
+Four numbers that summarize the whole project: how fast the tail is, how
+much throughput it sustains, how much of the test suite is green, and how
+many of the last 70 measured trials silently dropped an event. All four
+are computed live from `results/98a597b/` and the last local `ctest` run
+by [`charts/generate_charts.py`](charts/generate_charts.py) — nothing in
+this band is typed in by hand.
 
 ---
 
@@ -40,18 +54,32 @@ broke.
 
 ## Headline metrics
 
-**Measured: 1205.0 ns median P99.9 end-to-end matching latency** (price-time
+**Measured: 1850.0 ns median P99.9 end-to-end matching latency** (price-time
 mode), dataset seed `42`, 5 trials × 85,118 measured samples/trial, on a
 single-socket 12th-gen Intel host with cores 4/5 isolated
 (`isolcpus`/`nohz_full`/`rcu_nocbs`), governor pinned to `performance`, SMT
-disabled, NUMA-bound via `numactl`. Measured 2026-07-15 against the current
-working tree (see the commit-pinning note below).
+disabled, NUMA-bound via `numactl`. Measured 2026-07-21 at commit `98a597b`
+(clean working tree, `dirty=false` self-reported and independently confirmed
+against `git status`) — raw evidence in `results/98a597b/price_time.csv` /
+`.meta.json`, consolidated in [`CONSOLIDATED_BENCHMARK_RESULTS.md`](CONSOLIDATED_BENCHMARK_RESULTS.md).
 
 | Percentile | Median (5 trials) | Spread across trials (max−min) |
 |---|---|---|
-| P99 | 819.0 ns | — |
-| **P99.9** | **1205.0 ns** | **201.0 ns** |
-| P99.99 | ~5.7 µs | — |
+| P99 | 1225.0 ns | — |
+| **P99.9** | **1850.0 ns** | **146.0 ns** |
+| P99.99 | ~8.3 µs | — |
+
+<p align="center"><img src="charts/02_tail_latency_profile.png" alt="Tail latency profile: P50 through P99.99, price-time vs pro-rata, log scale" width="100%"></p>
+
+**What this diagram shows:** the same median-of-5-trials latency figure at
+five percentiles, price-time and pro-rata plotted separately, log-scaled
+because the interesting behavior only shows up once you stop looking at
+averages. **What it proves:** P50 and P99 look almost boring — both
+matching policies sit under 1.5 µs through P99. The story is the last two
+points: P99.9 roughly doubles P99, and P99.99 is nearly **7x** P99. That
+gap is exactly why this project reports P99.9 as the headline number
+instead of a mean or a P50 — either of those would hide the behavior this
+chart makes obvious.
 
 > **What this number is, precisely:** queue-transit + match-time for the
 > in-process matching path, replaying a deterministic, generated dataset
@@ -60,11 +88,13 @@ working tree (see the commit-pinning note below).
 > AF_XDP ingestion has been verified correct end-to-end but is not the
 > source of this number — see [AF_XDP](#af_xdp-what-has-and-hasnt-been-measured).
 >
-> **Commit pinning note (flagged, unresolved):** this number was measured
-> against an uncommitted working tree. `git rev-parse --short HEAD` at the
-> time of writing is `d976b20`, but that commit predates this measurement's
-> code. Commit the current tree before treating a specific hash as
-> authoritative for this number.
+> **Commit pinning: resolved.** An earlier version of this number was
+> measured against an uncommitted working tree with no traceable commit.
+> This figure is not that number — it's a fresh run at committed, clean
+> `98a597b`, with per-trial CSVs and a `.meta.json` (`commit_hash`,
+> `working_tree_dirty`, dataset hash, env snapshot) for every trial. Treat
+> any P99.9 figure in this repo without an equivalent `results/<hash>/`
+> evidence file as unverified.
 
 ---
 
@@ -119,33 +149,48 @@ flowchart LR
 
 `Order` itself is laid out deliberately, not just declared — every byte
 offset below is enforced directly by `static_assert` in `types.hpp`
-(`sizeof(Order) == 128`, `alignof(Order) == 64`, and the rest) — the
-actual proof mechanism, not an illustration of one:
+(`sizeof(Order) == 128`, `alignof(Order) == 64`, and the rest):
+
+<p align="center"><img src="charts/04_cache_line_layout.png" alt="Order struct cache-line layout: hot 64-byte line vs cold 64-byte line, byte-accurate" width="100%"></p>
+
+**What this diagram shows:** the physical byte layout of `Order`, split
+across its two 64-byte cache lines — every field drawn to scale by its
+actual byte width, colored by whether the matcher touches it on the hot
+path (blue), only for audit/reporting (slate), or reserved purely to force
+the alignment (hatched gray). **What it proves:** everything the matcher
+touches per order (`order_id` through `next_`) fits in the first 64-byte
+line; everything that exists only for audit/reporting sits in the second,
+so a hot-path cache miss never has to pull in bytes the matcher doesn't
+need. The diagram is generated from the same field list transcribed
+directly from `types.hpp`, so it can't silently drift from the struct the
+way a hand-maintained comment can — the layout claim is the `static_assert`
+itself, this is just a picture of it.
+
+<details>
+<summary>Byte-offset table (text form, for searching/copying)</summary>
 
 ```
 Order — 128 bytes, 2 cache lines
 
 CACHE LINE 0 — hot (bytes 0–63): touched on every match-path access
-   0– 7   order_id        uint64_t      8B
-   8–15   price           int64_t       8B
-  16–19   qty             uint32_t      4B
-  20      side            Side          1B
-  21      tif             TimeInForce   1B
-  22–47   hot_padding     uint8_t[26]  26B   (reserved so prev_/next_ land here)
-  48–55   prev_           Order*        8B
-  56–63   next_           Order*        8B
-                                             ── 64-byte cache-line boundary ──
+   0– 7   order_id        uint64_t          8B
+   8–15   price           int64_t           8B
+  16–19   qty             uint32_t          4B
+  20      side            Side              1B
+  21      tif             TimeInForce       1B
+  22      event_tag       OrderEventTag     1B
+  23–47   hot_padding     uint8_t[25]      25B   (reserved so prev_/next_ land on the boundary)
+  48–55   prev_           Order*            8B
+  56–63   next_           Order*            8B
+                                                  ── 64-byte cache-line boundary ──
 CACHE LINE 1 — cold (bytes 64–127): audit/reporting only, never touched by Matcher
-  64–71   timestamp_ns    uint64_t      8B
-  72–79   client_id       uint64_t      8B
-  80–111  client_tag      char[32]     32B
- 112–127  cold_padding    uint8_t[16]  16B
+  64–71   timestamp_ns    uint64_t          8B
+  72–79   client_id       uint64_t          8B
+  80–111  client_tag      char[32]         32B
+ 112–127  cold_padding    uint8_t[16]      16B
 ```
 
-Everything the matcher touches per order (`order_id` through `next_`) fits
-in the first line; everything that exists only for audit/reporting sits in
-the second, so a hot-path cache miss never has to pull in bytes the
-matcher doesn't need.
+</details>
 
 **Component reference:**
 
@@ -166,8 +211,8 @@ matcher doesn't need.
   hot path, exhaustion is a recoverable `nullptr`, not a crash.
 - **`Order`/`Level`/`FillEvent`** (`include/hydra/types.hpp`): `Order` is
   `alignas(64)`, exactly 128 bytes (two cache lines), explicitly split
-  into a hot line (`order_id`, `price`, `qty`, `side`, `tif`, intrusive
-  `prev_`/`next_` FIFO pointers) and a cold line (`timestamp_ns`,
+  into a hot line (`order_id`, `price`, `qty`, `side`, `tif`, `event_tag`,
+  intrusive `prev_`/`next_` FIFO pointers) and a cold line (`timestamp_ns`,
   `client_id`, `client_tag`) — enforced by `static_assert`, not just
   documented.
 - **`Matcher`** (`include/hydra/matcher.hpp`): price-time and pro-rata
@@ -205,43 +250,64 @@ alternative, rebuild, replay the identical dataset, measure, then revert.
 No permanent branches, no invented numbers — full methodology and file/line
 references in **[`docs/DESIGN.md`](docs/DESIGN.md)**.
 
-| Design decision | Current (median P99.9) | Rejected alternative | P99.9 delta | Spread delta |
-|---|---|---|---|---|
-| Lock-free SPSC queue | **1205.0 ns** | `std::mutex` + `std::queue`: 13049.0 ns | **~10.8x worse** | ~24.6x worse |
-| Core pinning + isolation | **1205.0 ns** | Unpinned OS-scheduled threads: 18532.0 ns | **~15.4x worse** | ~258x worse |
-| Fixed-slab object pooling | **1205.0 ns** | `new`/`delete` per order: 5409.0 ns | **~4.5x worse** | ~48x worse |
-| Cache-line hot/cold split | **1205.0 ns** | Flat, unseparated `Order` layout: 3773.0 ns | **~3.1x worse** | ~10.4x worse |
+| Design decision | Current (median P99.9) | Rejected alternative | P99.9 delta | Spread delta | Verdict |
+|---|---|---|---|---|---|
+| Lock-free SPSC queue | **1762.0 ns** | `std::mutex` + `std::queue`: 7770.0 ns | **~4.41x worse** | ~6.68x worse | PROVEN |
+| Core pinning + isolation | **1762.0 ns** | Unpinned OS-scheduled threads: 9216.0 ns | **~5.23x worse** | ~1021x worse | INCONCLUSIVE¹ |
+| Fixed-slab object pooling | **1762.0 ns** | `new`/`delete` per order: 6079.0 ns | **~3.45x worse** | ~6.20x worse | PROVEN |
+| Cache-line hot/cold split | **1762.0 ns** | Flat, unseparated `Order` layout: 1797.0 ns | **~1.02x worse** | ~0.56x (smaller) | INCONCLUSIVE |
 
-```
-P99.9 tail latency — current design vs. rejected alternative (ns, lower is better)
-each # ≈ 250 ns
+<p align="center"><img src="charts/01_ablation_impact.png" alt="Ablation impact: current design vs rejected alternative for each of the four optimizations" width="100%"></p>
 
-SPSC queue
-  lock-free (current)        ##### 1205
-  mutex + std::queue         #################################################### 13049
-
-Core pinning
-  pinned (current)           ##### 1205
-  unpinned                   ########################################################################## 18532
-
-Object pooling
-  pool (current)             ##### 1205
-  new/delete                 ###################### 5409
-
-Cache-line layout
-  hot/cold split (current)   ##### 1205
-  flat layout                ############### 3773
-```
+**What this diagram shows:** the same table above, as bars — current
+design in blue, the rejected "obvious" alternative in orange, for all four
+optimizations, price-time matching. **What it proves:** two of these are
+unambiguous (SPSC queue, object pooling) — the rejected alternative is
+multiple times worse and the bars make that impossible to miss. The other
+two are drawn at the same scale on purpose: core pinning's bar gap looks
+just as dramatic, but the ⚠ next to it is the point of this chart — a
+big-looking bar gap and a *proven* effect are not the same claim, and the
+next chart shows exactly why.
 
 The spread column is arguably the more interesting one: an unpinned
 thread's tail latency is dominated by *when* the scheduler happens to
-migrate or preempt it, which is why that ablation shows the largest
-variance blowup (258x) even though it isn't the largest median blowup.
-Cache-line layout shows the smallest effect of the four, which is
-plausible — it's a subtler mechanism than lock contention or allocator
-overhead, not a smaller *real* effect necessarily, and that ablation
-bundles "removing the split" with "reducing total struct size" (128→88
-bytes); see `docs/DESIGN.md` for the full caveat.
+migrate or preempt it — the unpinned ablation's own 5 trials range from
+4,729 ns to 144,646 ns P99.9 on the *same binary*, a ~1021x spread blowup
+over baseline's own 137 ns trial-to-trial spread. Cache-line layout shows
+essentially no effect at all under this policy — 1.02x, and its spread is
+actually *smaller* than baseline's, which is itself evidence there's no
+real signal here, not just a small one.
+
+¹ **Core pinning is INCONCLUSIVE under price-time specifically because the
+noise dominates the median**: unpinned's own median P99 (1098.0 ns) is
+*lower* than pinned's (1225.0 ns) — the effect only shows up in the tail,
+and that tail measurement swings by five orders of magnitude across
+identical trials. The same ablation under **pro-rata** matching is clean —
+PROVEN, ~1.60x worse (3,065.0 ns → 4,906.0 ns P99.9, full table in
+`results/98a597b/ablation_summary.md`) — so this isn't "pinning doesn't
+matter," it's "this specific measurement, on this policy, this run,
+couldn't isolate the effect from scheduler noise." See `docs/DESIGN.md`
+for the full caveat, including the earlier (pre-fresh-run) version of this
+table where both of these were reported as clean proofs at larger
+multipliers — that version is superseded by this one.
+
+### Why core pinning isn't optional
+
+<p align="center"><img src="charts/03_scheduler_noise.png" alt="Scheduler noise: pinned vs unpinned P99.9, five trials each, log scale" width="100%"></p>
+
+**What this diagram shows:** every dot is one full 5-trial benchmark run's
+P99.9 — five pinned runs, five unpinned runs, same binary, same dataset,
+log-scaled because the unpinned spread doesn't fit any linear axis.
+**What it proves:** this is the evidence behind footnote ¹ above, made
+visible instead of just stated. The pinned dots cluster in a 137 ns band;
+the unpinned dots land anywhere from 4,729 ns to 144,646 ns depending on
+what the OS scheduler happened to do that run — a ~30x range across
+supposedly identical trials. That instability is *why* the ablation table
+reads INCONCLUSIVE rather than a failure of the pinning hypothesis: a
+median-of-5 comparison can't cleanly separate "pinning helps" from
+"unpinned got an unlucky scheduler trial" when the unpinned distribution
+looks like this. It's also the more honest answer than just asserting core
+pinning matters — the chart is the argument.
 
 One optimization — the AF_XDP kernel-bypass RX path — has no equivalent
 ablation yet, because `--benchmark` has no AF_XDP integration to ablate
@@ -466,6 +532,13 @@ anything more (rate sweeps, depth sweeps, mode comparisons, five-nines
 tails, soak tests) adds explanation surface without adding a claim
 distinct enough to be worth it.
 
+Every chart in this README is regenerated from these same evidence files
+by one script — nothing above is hand-plotted:
+```bash
+pip install -r charts/requirements.txt
+python3 charts/generate_charts.py --commit "$(git rev-parse --short HEAD)"
+```
+
 ---
 
 ## Things to verify before you trust the numbers
@@ -489,11 +562,13 @@ yourself if a number looks off:
       package — heavy load on *non-isolated* cores can still measurably
       inflate both the median and the trial-to-trial variance of the
       isolated cores' results, even though isolation prevents anything
-      from being scheduled directly onto them. Verified directly this
-      session: the same benchmark went from 1895.0 ns/7382.0 ns
-      (P99/P99.9) with a browser running to 819.0 ns/1205.0 ns with it
-      closed — the isolation was correct the whole time, the browser
-      was the confound.
+      from being scheduled directly onto them. Verified directly in an
+      earlier session (figures below are from that specific paired
+      comparison, not the current headline number above): the same
+      benchmark went from 1895.0 ns/7382.0 ns (P99/P99.9) with a browser
+      running to 819.0 ns/1205.0 ns with it closed — the isolation was
+      correct the whole time, the browser was the confound. Every run in
+      the current `results/98a597b/` set was taken with Chrome closed.
 
 ---
 
@@ -523,6 +598,11 @@ tools/                   gen_dataset.cpp, send_test_orders.cpp (AF_XDP
 scripts/                 run_ablations.sh (the ablation suite, see
                          above), setup_veth.sh (AF_XDP dev-box test
                          harness, network-namespace-isolated veth pair)
+charts/                  generate_charts.py -- reads results/<commit>/*.csv
+                         directly (no hardcoded numbers) and renders every
+                         chart in this README; requirements.txt; the PNGs
+                         themselves, committed so the README renders
+                         without anyone having to run the script first
 datasets/                Generated dataset files (gitignored) +
                          manifest.txt (reproducibility record of the
                          flags used to produce each one)
@@ -724,11 +804,29 @@ gone rather than just flagged for removal.
 
 ## Further reading
 
+- **[`ARCHITECTURE.md`](ARCHITECTURE.md)** — seven diagrams underneath the
+  pipeline overview above: the exact call sequence for one order, the
+  concurrency/ownership model, the AF_XDP packet journey at ring-buffer
+  granularity, the order lifecycle state machine, the object pool
+  lifecycle, and every failure mode with its exact detection/response —
+  each with `file:line` references back into the real implementation.
 - **[`docs/DESIGN.md`](docs/DESIGN.md)** — the full engineering rationale
   behind every decision in this codebase: the problem each one solves, the
   rejected alternative and why, the measured before/after (or an explicit
   "not yet measured" where no ablation exists), and file/line references
   into the real implementation.
+- **[`CONSOLIDATED_BENCHMARK_RESULTS.md`](CONSOLIDATED_BENCHMARK_RESULTS.md)**
+  — every benchmark run behind the numbers in this README, read directly
+  from `results/98a597b/*.csv`/`*.meta.json`: all 4 canonical + 10 ablation
+  runs, per-trial breakdowns, workload composition, and the full ablation
+  verdict table (PROVEN/INCONCLUSIVE). This is the source of truth for any
+  P99/P99.9 figure quoted here — a number without a matching
+  `results/<hash>/` file backing it should not be trusted.
+- **[`charts/generate_charts.py`](charts/generate_charts.py)** — the
+  script behind every chart in this README. Reads `results/<commit>/*.csv`
+  and the local `ctest` log directly; nothing it plots is hand-typed. Run
+  it again after any fresh benchmark/ablation pass to regenerate all five
+  PNGs against that run's own evidence.
 - **`datasets/manifest.txt`** — the exact `blitz_gen_dataset` flags behind
   every dataset file referenced in this README and in `docs/DESIGN.md`.
 
