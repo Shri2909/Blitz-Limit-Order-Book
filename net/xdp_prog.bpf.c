@@ -115,11 +115,13 @@ int hydra_xdp_redirect(struct xdp_md *ctx)
 	 * non-initial fragment has ip->protocol == IPPROTO_UDP but no UDP
 	 * header at this offset at all (it's raw payload continuation
 	 * bytes), which parse_udphdr() below has no way to detect on its
-	 * own -- it would just read garbage as if it were a udphdr. The
-	 * order-entry wire protocol (72 bytes total, see
-	 * zero_copy_parser.hpp's OrderWireFormat) never legitimately
-	 * fragments, so any fragment here is by definition not real order
-	 * traffic. bpf_ntohs() first: frag_off is network-byte-order. */
+	 * own -- it would just read garbage as if it were a udphdr. A full
+	 * order-entry packet is only 72 bytes on the wire (14 Ethernet + 20
+	 * IPv4 + 8 UDP + the 30-byte OrderWireFormat payload, see
+	 * zero_copy_parser.hpp), nowhere near any real-world MTU, so it
+	 * never legitimately fragments -- any fragment here is by
+	 * definition not real order traffic. bpf_ntohs() first: frag_off is
+	 * network-byte-order. */
 	if (bpf_ntohs(iph->frag_off) & (HYDRA_IP_MF | HYDRA_IP_OFFMASK)) {
 		bump_stat(HYDRA_STAT_FRAGMENTED);
 		return XDP_PASS;

@@ -466,14 +466,15 @@ int main(int argc, char **argv)
     if (opts.want_test)
     {
         std::fprintf(stdout,
-                     "Tests are a separate binary (Phase 9's \"standalone target, no GTest "
-                     "dependency\" design) -- this binary never links test code. Run:\n"
-                     "  cmake --build build --target blitz_lob_tests\n"
-                     "  ./build/blitz_lob_tests\n"
+                     "Tests are separate binaries (ten per-phase exit-condition targets, "
+                     "no GTest dependency) -- this binary never links test code. Run all 10:\n"
+                     "  cmake --build build -j$(nproc)\n"
+                     "  ctest --test-dir build --output-on-failure\n"
                      "\n"
-                     "Per-phase exit-condition tests (Phases 1-9) are separate targets too,\n"
-                     "e.g. blitz_lob_test_phase6_matcher -- see CMakeLists.txt's per-phase\n"
-                     "target block for the full list.\n");
+                     "Or build/run one phase directly, e.g.:\n"
+                     "  cmake --build build --target blitz_lob_test_phase6_matcher\n"
+                     "  ./build/blitz_lob_test_phase6_matcher\n"
+                     "See CMakeLists.txt's per-phase target block for the full list.\n");
         return 0;
     }
 

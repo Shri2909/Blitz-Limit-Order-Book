@@ -57,7 +57,7 @@ namespace
                      "  --seed N          RNG seed for price/qty/side (default: 42)\n"
                      "  --client-count N  rotate order.client_id through N synthetic\n"
                      "                    clients (1..N by order_id), same scheme as\n"
-                     "                    dataset_generator.hpp's kSyntheticClientCount\n"
+                     "                    dataset_generator.hpp's DatasetConfig::client_id_count\n"
                      "                    (default: 8) -- WHY: OrderBook::is_self_trade()\n"
                      "                    skips a fill whenever resting.client_id ==\n"
                      "                    incoming.client_id; every order sharing one\n"
@@ -281,8 +281,8 @@ int main(int argc, char **argv)
         // nothing ever fills, and the book grows unbounded as each new order
         // scans an ever-larger pile of permanently-unmatchable resting
         // orders. Same rotation scheme as dataset_generator.hpp's
-        // kSyntheticClientCount so live AF_XDP traffic exercises the same
-        // realistic fill/rest mix a dataset replay does.
+        // DatasetConfig::client_id_count so live AF_XDP traffic exercises
+        // the same realistic fill/rest mix a dataset replay does.
         const uint64_t effective_client_id =
             client_id_explicit ? client_id : (1 + (order_id % client_count));
 

@@ -1,11 +1,14 @@
 //===----------------------------------------------------------------------===
 // tests/test_phase9_suite.cpp
 //
-// Phase 9's canonical 15-case suite lives in test_hydra_lob.cpp per its own
-// exit condition ("exactly these 15 named tests"). This file is the CMake
-// comment block's "extended edge cases beyond the 15 core" -- scenarios the
-// canonical suite deliberately doesn't cover (it's fixed at 15 by design),
-// but that this codebase's actual behavior should still be pinned down:
+// Phase 9's canonical 15-case suite lived in test_hydra_lob.cpp per its own
+// exit condition ("exactly these 15 named tests") -- that file was the
+// retired monolithic suite (see test_phase6_matcher.cpp's own reference to
+// it) and no longer exists; its 15 cases were absorbed into the per-phase
+// split this suite is now part of. This file is the CMake comment block's
+// "extended edge cases beyond the 15 core" -- scenarios the canonical suite
+// deliberately doesn't cover (it was fixed at 15 by design), but that this
+// codebase's actual behavior should still be pinned down:
 // order/level pool exhaustion during the GTC-rest step (not just a direct
 // add), multi-level IOC/FOK sweeps, self-trade skipping across a level
 // boundary, cross-call partial-fill sequences, and a large-scale

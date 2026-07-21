@@ -384,4 +384,4 @@ namespace hydra
 
 #endif // ENABLE_AFXDP
 
-}
+} // namespace hydra

@@ -42,10 +42,10 @@ namespace hydra::test
             HYDRA_CHECK(std::is_trivially_copyable_v<Order>);
             HYDRA_CHECK(sizeof(Order) % 64 == 0);
 
-            // Hot fields (order_id, price, qty, side, tif, prev_, next_) must
-            // all fit inside the first 64-byte line -- this is the entire
-            // point of the hot/cold split. next_ is the last hot field, so
-            // its end offset is the boundary to check.
+            // Hot fields (order_id, price, qty, side, tif, event_tag, prev_,
+            // next_) must all fit inside the first 64-byte line -- this is
+            // the entire point of the hot/cold split. next_ is the last hot
+            // field, so its end offset is the boundary to check.
             const std::size_t hot_boundary =
                 offsetof(Order, next_) + sizeof(Order::next_);
             HYDRA_CHECK(hot_boundary <= 64);

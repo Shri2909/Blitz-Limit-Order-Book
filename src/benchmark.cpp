@@ -636,7 +636,8 @@ namespace hydra
                                const std::vector<TrialStats> &trial_stats,
                                const std::vector<uint64_t> &state_hashes,
                                bool determinism_pass, bool overall_valid,
-                               const std::string &invalid_reason)
+                               const std::string &invalid_reason,
+                               std::size_t fok_order_count)
         {
             std::ofstream out(path, std::ios::trunc);
             if (!out)
@@ -673,7 +674,7 @@ namespace hydra
                     << s.order_pct.p999 << ',' << s.order_pct.mean << ',' << s.order_pct.max << ','
                     << s.throughput_orders_per_sec << ',' << s.crossing_order_count << ','
                     << s.non_crossing_order_count << ',' << s.partial_fill_count << ','
-                    << s.multi_level_sweep_count << ',' << 0 /* fok_order_count filled below */
+                    << s.multi_level_sweep_count << ',' << fok_order_count
                     << ',' << s.self_trade_skip_count << ',' << s.resting_orders_examined << ','
                     << s.eligible_orders_examined << ',' << s.generated_fill_count << ','
                     << s.mean_fills_per_match << ',' << s.max_fill_fanout << ','
@@ -1271,7 +1272,8 @@ namespace hydra
 
         write_summary_csv(summary_csv_path, run_id, cfg.mode, cfg.dataset_path, dataset_hash,
                           events.size(), clock_overhead_ns, trial_stats, state_hashes,
-                          determinism_pass, overall_valid, invalid_reason_str);
+                          determinism_pass, overall_valid, invalid_reason_str,
+                          composition.fok_count);
         write_raw_csv(raw_csv_path, trial_records);
         write_metadata_json(meta_json_path, run_id, cfg.mode, env_snapshot, cfg.dataset_path,
                             dataset_hash,
