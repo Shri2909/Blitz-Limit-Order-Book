@@ -1,0 +1,90 @@
+
+======================================================================
+AAPL -- risk parameters (closing analysis)
+======================================================================
+[1] Markout with confidence intervals]
+  horizon    mean P&L    SE(naive)  SE(HAC)   95% CI (HAC)            t-stat(HAC)  significant?
+     0.1s    +1.631c  0.030c    0.069c   [+1.495, +1.766]c    +23.63      yes (|t|>1.96)  -> profitable
+     0.5s    +1.143c  0.040c    0.109c   [+0.930, +1.357]c    +10.48      yes (|t|>1.96)  -> profitable
+     1.0s    +0.681c  0.045c    0.122c   [+0.442, +0.920]c     +5.58      yes (|t|>1.96)  -> profitable
+     5.0s    -0.210c  0.072c    0.213c   [-0.627, +0.208]c     -0.98      NOT significant  -> CI spans zero
+    30.0s    +0.228c  0.144c    0.404c   [-0.564, +1.020]c     +0.56      NOT significant  -> CI spans zero
+[2] Data-derived inventory limit]
+  trade-sign autocorr used for this fit: lag1=+0.715 lag5=+0.335 lag20=+0.115
+  fitted persistence rho=0.9146  ->  expected same-direction run length ~= 11.7 fills
+  median lit-fill size = 75 shares
+  suggested q_max = 3x expected run length x median fill size = 2,634 shares
+  -> holding q_max shares, a 60s adverse move carries a 1-sigma TOTAL P&L swing of ~$719.97 (sigma=0.03528 $/sqrt(s))
+  NOTE: the 3x safety multiplier and the 60s risk-evaluation window are free choices, not derived from data -- everything else in this q_max is measured.
+
+======================================================================
+AMZN -- risk parameters (closing analysis)
+======================================================================
+[1] Markout with confidence intervals]
+  horizon    mean P&L    SE(naive)  SE(HAC)   95% CI (HAC)            t-stat(HAC)  significant?
+     0.1s    +2.544c  0.044c    0.122c   [+2.305, +2.783]c    +20.85      yes (|t|>1.96)  -> profitable
+     0.5s    +1.656c  0.047c    0.129c   [+1.404, +1.908]c    +12.87      yes (|t|>1.96)  -> profitable
+     1.0s    +1.010c  0.053c    0.148c   [+0.718, +1.301]c     +6.80      yes (|t|>1.96)  -> profitable
+     5.0s    -0.142c  0.070c    0.204c   [-0.541, +0.258]c     -0.70      NOT significant  -> CI spans zero
+    30.0s    -1.477c  0.152c    0.466c   [-2.389, -0.564]c     -3.17      yes (|t|>1.96)  -> LOSS
+[2] Data-derived inventory limit]
+  trade-sign autocorr used for this fit: lag1=+0.720 lag5=+0.340 lag20=+0.133
+  fitted persistence rho=0.9214  ->  expected same-direction run length ~= 12.7 fills
+  median lit-fill size = 60 shares
+  suggested q_max = 3x expected run length x median fill size = 2,291 shares
+  -> holding q_max shares, a 60s adverse move carries a 1-sigma TOTAL P&L swing of ~$351.63 (sigma=0.01982 $/sqrt(s))
+  NOTE: the 3x safety multiplier and the 60s risk-evaluation window are free choices, not derived from data -- everything else in this q_max is measured.
+
+======================================================================
+GOOG -- risk parameters (closing analysis)
+======================================================================
+[1] Markout with confidence intervals]
+  horizon    mean P&L    SE(naive)  SE(HAC)   95% CI (HAC)            t-stat(HAC)  significant?
+     0.1s    +4.007c  0.105c    0.235c   [+3.546, +4.468]c    +17.03      yes (|t|>1.96)  -> profitable
+     0.5s    +3.381c  0.104c    0.244c   [+2.902, +3.859]c    +13.85      yes (|t|>1.96)  -> profitable
+     1.0s    +2.786c  0.109c    0.261c   [+2.275, +3.298]c    +10.67      yes (|t|>1.96)  -> profitable
+     5.0s    +1.294c  0.143c    0.337c   [+0.635, +1.954]c     +3.85      yes (|t|>1.96)  -> profitable
+    30.0s    +0.001c  0.255c    0.661c   [-1.294, +1.296]c     +0.00      NOT significant  -> CI spans zero
+[2] Data-derived inventory limit]
+  trade-sign autocorr used for this fit: lag1=+0.720 lag5=+0.304 lag20=+0.057
+  fitted persistence rho=0.8803  ->  expected same-direction run length ~= 8.4 fills
+  median lit-fill size = 64 shares
+  suggested q_max = 3x expected run length x median fill size = 1,605 shares
+  -> holding q_max shares, a 60s adverse move carries a 1-sigma TOTAL P&L swing of ~$500.38 (sigma=0.04026 $/sqrt(s))
+  NOTE: the 3x safety multiplier and the 60s risk-evaluation window are free choices, not derived from data -- everything else in this q_max is measured.
+
+======================================================================
+INTC -- risk parameters (closing analysis)
+======================================================================
+[1] Markout with confidence intervals]
+  horizon    mean P&L    SE(naive)  SE(HAC)   95% CI (HAC)            t-stat(HAC)  significant?
+     0.1s    -0.111c  0.003c    0.011c   [-0.132, -0.089]c    -10.17      yes (|t|>1.96)  -> LOSS
+     0.5s    -0.135c  0.004c    0.012c   [-0.159, -0.111]c    -11.06      yes (|t|>1.96)  -> LOSS
+     1.0s    -0.156c  0.004c    0.012c   [-0.180, -0.132]c    -12.58      yes (|t|>1.96)  -> LOSS
+     5.0s    -0.266c  0.006c    0.018c   [-0.302, -0.230]c    -14.57      yes (|t|>1.96)  -> LOSS
+    30.0s    -0.399c  0.010c    0.035c   [-0.468, -0.330]c    -11.41      yes (|t|>1.96)  -> LOSS
+[2] Data-derived inventory limit]
+  trade-sign autocorr used for this fit: lag1=+0.907 lag5=+0.696 lag20=+0.318
+  fitted persistence rho=0.9471  ->  expected same-direction run length ~= 18.9 fills
+  median lit-fill size = 100 shares
+  suggested q_max = 3x expected run length x median fill size = 5,670 shares
+  -> holding q_max shares, a 60s adverse move carries a 1-sigma TOTAL P&L swing of ~$99.66 (sigma=0.00227 $/sqrt(s))
+  NOTE: the 3x safety multiplier and the 60s risk-evaluation window are free choices, not derived from data -- everything else in this q_max is measured.
+
+======================================================================
+MSFT -- risk parameters (closing analysis)
+======================================================================
+[1] Markout with confidence intervals]
+  horizon    mean P&L    SE(naive)  SE(HAC)   95% CI (HAC)            t-stat(HAC)  significant?
+     0.1s    -0.194c  0.003c    0.010c   [-0.212, -0.175]c    -20.06      yes (|t|>1.96)  -> LOSS
+     0.5s    -0.229c  0.003c    0.011c   [-0.250, -0.208]c    -21.17      yes (|t|>1.96)  -> LOSS
+     1.0s    -0.249c  0.004c    0.012c   [-0.272, -0.225]c    -20.38      yes (|t|>1.96)  -> LOSS
+     5.0s    -0.302c  0.005c    0.018c   [-0.337, -0.266]c    -16.81      yes (|t|>1.96)  -> LOSS
+    30.0s    -0.335c  0.011c    0.036c   [-0.406, -0.263]c     -9.19      yes (|t|>1.96)  -> LOSS
+[2] Data-derived inventory limit]
+  trade-sign autocorr used for this fit: lag1=+0.898 lag5=+0.675 lag20=+0.242
+  fitted persistence rho=0.9335  ->  expected same-direction run length ~= 15.0 fills
+  median lit-fill size = 100 shares
+  suggested q_max = 3x expected run length x median fill size = 4,508 shares
+  -> holding q_max shares, a 60s adverse move carries a 1-sigma TOTAL P&L swing of ~$91.43 (sigma=0.00262 $/sqrt(s))
+  NOTE: the 3x safety multiplier and the 60s risk-evaluation window are free choices, not derived from data -- everything else in this q_max is measured.

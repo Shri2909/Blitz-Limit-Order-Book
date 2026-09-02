@@ -1,0 +1,107 @@
+# Real Dataset Manifest — new-feature/
+
+Provenance record for real (non-synthetic) market data used to calibrate
+and stress-test the Avellaneda-Stoikov market-making backtester. Raw CSVs
+are .gitignored (repo root `.gitignore`'s `*.csv` rule) — this file is the
+reproducibility record, same convention as the top-level `datasets/manifest.txt`.
+
+## Panel: five names, one session (2012-06-21), 10 price levels
+
+All five files come from the same source/session/format described in the
+AAPL entry below. Deliberately a **cross-sectional, single-session panel**,
+not a multi-day one — the free LOBSTER sample only offers 2012-06-21. That
+still buys real diversity in price level and liquidity regime, which is
+what lets the calibration step check whether σ/k estimates are at least
+*directionally* stable across names, not just report one unverifiable
+number:
+
+| Ticker | Price regime (2012) | Total messages | Fills (type 4+5) | Message file | Orderbook file |
+|---|---|---|---|---|---|
+| AAPL | ~$585, low float-adjusted liquidity | 400,391 | 34,990 | 16 MB | 90 MB |
+| AMZN | ~$220, mid liquidity | 269,748 | 11,419 | 11 MB | 61 MB |
+| GOOG | ~$570, low liquidity, thin book | 147,916 | 11,678 | 5.9 MB | 33 MB |
+| INTC | ~$27, high liquidity, tight tick | 624,040 | 32,483 | 25 MB | 152 MB |
+| MSFT | ~$32, high liquidity, tight tick | 668,765 | 33,414 | 27 MB | 163 MB |
+
+**Skipped**: SPY. The free sample for SPY is a different shape from the
+other five — split hourly at 30/50 levels, and the only available slice is
+09:30–10:30 (not the full session the other five have), with the 30-level
+orderbook file alone ~894 MB for that one hour. Inconsistent session
+length plus disproportionate size for what it adds — left out rather than
+silently mixed into a panel that's otherwise apples-to-apples on session
+coverage. Straightforward to add later (same source, same download
+pattern) if ETF microstructure is specifically wanted.
+
+## AAPL_2012-06-21 (10 price levels)
+
+- **Source**: LOBSTER (Limit Order Book System) sample data, reconstructed
+  from real NASDAQ TotalView-ITCH messages.
+  https://huggingface.co/datasets/totalorganfailure/lobster-data
+  (mirror of the official https://lobsterdata.com sample files)
+- **Instrument**: AAPL, 2012-06-21, full regular trading session
+  (34200.000s–57600.000s = 09:30:00–16:00:00 exchange time)
+- **Depth**: 10 price levels each side
+- **Files**:
+  - `AAPL_2012-06-21_message_10.csv` — event stream. Columns: `time`
+    (seconds since midnight, fractional), `event_type`
+    (1=new limit order, 2=partial cancel, 3=full deletion,
+    4=visible execution, 5=hidden execution, 7=trading halt),
+    `order_id`, `size`, `price` (fixed-point, multiply by 1e-4 for USD),
+    `direction` (1=buy, -1=sell).
+  - `AAPL_2012-06-21_orderbook_10.csv` — one row per message-file row,
+    same line count, columns repeat 10x as
+    `ask_price_i, ask_size_i, bid_price_i, bid_size_i` for i=1..10,
+    prices in the same 1e-4 fixed-point format.
+- **Row count**: 400,391 (both files, line-aligned — row N of the
+  orderbook file is the book state immediately after row N of the
+  message file).
+- **Downloaded**: 2026-09-01
+- **SHA-256** (verified against the source's own git-lfs oid):
+  - `AAPL_2012-06-21_message_10.csv`:
+    `6562394b996138d5c4527b1282e77a1a385e844110550c34628fbd73bc5411e5`
+  - `AAPL_2012-06-21_orderbook_10.csv`:
+    `ed75450031996e81bdc5fc985f6afe6851c81d7b2b39bccf13c56d845fe6ff5d`
+
+**Why this dataset**: real, exchange-sourced (NASDAQ ITCH-derived) limit
+order book data is what the A-S calibration step (σ, k estimation) and the
+model-assumption diagnostics (Poisson-arrival check, autocorrelation check
+— see the "real dataset" discussion this feature was scoped from) need to
+mean anything. It is not crypto and not live-traded — an offline CSV used
+only for calibration/backtesting, consistent with this project's synthetic-
+benchmark-only trading posture. LOBSTER is the standard dataset in the
+academic market-microstructure literature for exactly this kind of study,
+which makes it a defensible, recognizable source rather than an arbitrary
+CSV.
+
+**Re-downloading**: content-addressed on Hugging Face. Message files are
+small enough some are plain git blobs (verify with `git hash-object`
+instead of `sha256sum` — noted per file below), orderbook files are all
+git-lfs (verify with `sha256sum`). Generic pattern for any ticker `$T`:
+```bash
+curl -L -o "${T}_2012-06-21_message_10.csv" \
+  "https://huggingface.co/datasets/totalorganfailure/lobster-data/resolve/main/LOBSTER_SampleFile_${T}_2012-06-21_10/${T}_2012-06-21_34200000_57600000_message_10.csv"
+curl -L -o "${T}_2012-06-21_orderbook_10.csv" \
+  "https://huggingface.co/datasets/totalorganfailure/lobster-data/resolve/main/LOBSTER_SampleFile_${T}_2012-06-21_10/${T}_2012-06-21_34200000_57600000_orderbook_10.csv"
+```
+
+## Checksums — all five names
+
+Downloaded 2026-09-01. Orderbook files verified by `sha256sum` against the
+source's git-lfs oid; message files by `sha256sum` where LFS-tracked or
+`git hash-object` (git blob SHA-1) where not — the type used is noted.
+
+| File | Type | Hash |
+|---|---|---|
+| `AAPL_2012-06-21_message_10.csv` | sha256 | `6562394b996138d5c4527b1282e77a1a385e844110550c34628fbd73bc5411e5` |
+| `AAPL_2012-06-21_orderbook_10.csv` | sha256 | `ed75450031996e81bdc5fc985f6afe6851c81d7b2b39bccf13c56d845fe6ff5d` |
+| `AMZN_2012-06-21_message_10.csv` | sha256 | `c85a75b51f3616a683f825c2e03f984535e9329a8be5ab12325130d32223a2c5` |
+| `AMZN_2012-06-21_orderbook_10.csv` | sha256 | `decfe952b3fa06c9922dc8fba763a37a0fb032d4231767997e4abf2aa0d29b50` |
+| `GOOG_2012-06-21_message_10.csv` | git blob sha1 | `dd7f19715f5fd76cb4d52240c38c1a274d8e74a9` |
+| `GOOG_2012-06-21_orderbook_10.csv` | sha256 | `9ebe00b4f1aee57aa73dcb979e1074d16554296ca32b87440ce756c60974bb53` |
+| `INTC_2012-06-21_message_10.csv` | sha256 | `199c55b35f6c62f07b058922038c0b8d168bc3be9d2de94da19c901cd3f29927` |
+| `INTC_2012-06-21_orderbook_10.csv` | sha256 | `6bc4c4dc1e92d78e46d04f9e7914df2d8c2a9231928493e7395a9085e1fc91ab` |
+| `MSFT_2012-06-21_message_10.csv` | sha256 | `669e5c35b1eab0f7336fa9ed919002e65b08d2aabd96bb4ae88d647184e7a18d` |
+| `MSFT_2012-06-21_orderbook_10.csv` | sha256 | `ec2f53467cf7bfb00b5702381bea7b4a061bb4c1730454df3679b272b3561c0e` |
+
+Every message/orderbook file pair has been confirmed line-count-aligned
+(same row count each side — see the panel table above).

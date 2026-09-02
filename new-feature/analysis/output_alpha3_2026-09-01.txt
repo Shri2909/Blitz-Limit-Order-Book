@@ -1,0 +1,87 @@
+
+======================================================================
+AAPL -- alpha research, phase 7 (composite + VPIN)
+======================================================================
+[Composite signal]
+  component OFI            IC@5s: Pearson=+0.3042 Spearman=+0.3665
+  component TradeFlowMom   IC@5s: Pearson=+0.1391 Spearman=+0.2059
+  EQUAL-WEIGHT composite IC@5s: Pearson=+0.2687 Spearman=+0.3061  (does not beat best single component [best single = +0.3665])
+  OLS-weighted composite (fit on H1 only: OFI=+0.024, TradeFlowMom=+0.003) -> scored on H2: Pearson=+0.3260 Spearman=+0.3633
+  (for comparison, equal-weight composite scored on H2 alone: Pearson=+0.2848 Spearman=+0.3072)
+[VPIN]
+  197 volume buckets over the session (V=9230 shares/bucket, rolling window=20 buckets) -- note: this is a deliberately finer bucketing than Easley et al.'s 50-per-day convention, chosen to get a usable sample size from a single session; treat n=197 as still modest for IC purposes.
+  VPIN -> |forward return| @5s: Pearson=-0.0042 Spearman=+0.0344  (n=197)
+  VPIN -> |forward return| @30s: Pearson=+0.1070 Spearman=+0.0286  (n=195)
+  VPIN -> |forward return| @60s: Pearson=+0.1283 Spearman=+0.1073  (n=193)
+  fill markout @5s BY VPIN-at-fill-time quartile (Q1 calmest -> Q4 most toxic): Q1=-4.912c  Q2=-5.605c  Q3=-4.571c  Q4=-6.491c
+  -> no clean monotonic relationship between VPIN and markout
+
+======================================================================
+AMZN -- alpha research, phase 7 (composite + VPIN)
+======================================================================
+[Composite signal]
+  component OFI            IC@5s: Pearson=+0.2077 Spearman=+0.3360
+  component TradeFlowMom   IC@5s: Pearson=+0.1894 Spearman=+0.2235
+  EQUAL-WEIGHT composite IC@5s: Pearson=+0.2595 Spearman=+0.3072  (does not beat best single component [best single = +0.3360])
+  OLS-weighted composite (fit on H1 only: OFI=+0.007, TradeFlowMom=+0.010) -> scored on H2: Pearson=+0.2723 Spearman=+0.3159
+  (for comparison, equal-weight composite scored on H2 alone: Pearson=+0.2881 Spearman=+0.3225)
+[VPIN]
+  194 volume buckets over the session (V=3066 shares/bucket, rolling window=20 buckets) -- note: this is a deliberately finer bucketing than Easley et al.'s 50-per-day convention, chosen to get a usable sample size from a single session; treat n=194 as still modest for IC purposes.
+  VPIN -> |forward return| @5s: Pearson=+0.1080 Spearman=+0.0760  (n=193)
+  VPIN -> |forward return| @30s: Pearson=+0.0614 Spearman=+0.0956  (n=188)
+  VPIN -> |forward return| @60s: Pearson=-0.1183 Spearman=+0.0446  (n=185)
+  fill markout @5s BY VPIN-at-fill-time quartile (Q1 calmest -> Q4 most toxic): Q1=-4.232c  Q2=-5.646c  Q3=-6.121c  Q4=-5.313c
+  -> no clean monotonic relationship between VPIN and markout
+
+======================================================================
+GOOG -- alpha research, phase 7 (composite + VPIN)
+======================================================================
+[Composite signal]
+  component OFI            IC@5s: Pearson=+0.2400 Spearman=+0.3064
+  component TradeFlowMom   IC@5s: Pearson=+0.1511 Spearman=+0.2147
+  EQUAL-WEIGHT composite IC@5s: Pearson=+0.2479 Spearman=+0.2907  (does not beat best single component [best single = +0.3064])
+  OLS-weighted composite (fit on H1 only: OFI=+0.017, TradeFlowMom=+0.013) -> scored on H2: Pearson=+0.3109 Spearman=+0.3173
+  (for comparison, equal-weight composite scored on H2 alone: Pearson=+0.2986 Spearman=+0.3157)
+[VPIN]
+  194 volume buckets over the session (V=2463 shares/bucket, rolling window=20 buckets) -- note: this is a deliberately finer bucketing than Easley et al.'s 50-per-day convention, chosen to get a usable sample size from a single session; treat n=194 as still modest for IC purposes.
+  VPIN -> |forward return| @5s: Pearson=+0.0540 Spearman=-0.0871  (n=193)
+  VPIN -> |forward return| @30s: Pearson=+0.2567 Spearman=+0.0639  (n=190)
+  VPIN -> |forward return| @60s: Pearson=+0.1226 Spearman=-0.0077  (n=188)
+  fill markout @5s BY VPIN-at-fill-time quartile (Q1 calmest -> Q4 most toxic): Q1=-7.603c  Q2=-8.873c  Q3=-8.932c  Q4=-8.507c
+  -> no clean monotonic relationship between VPIN and markout
+
+======================================================================
+INTC -- alpha research, phase 7 (composite + VPIN)
+======================================================================
+[Composite signal]
+  component OFI            IC@5s: Pearson=+0.3883 Spearman=+0.2396
+  component TradeFlowMom   IC@5s: Pearson=+0.1903 Spearman=+0.2292
+  component MicroDev       IC@5s: Pearson=+0.2327 Spearman=+0.2448
+  EQUAL-WEIGHT composite IC@5s: Pearson=+0.3928 Spearman=+0.3212  (beats best single component [best single = +0.2448])
+  OLS-weighted composite (fit on H1 only: OFI=+0.003, TradeFlowMom=+0.000, MicroDev=+0.001) -> scored on H2: Pearson=+0.4785 Spearman=+0.3431
+  (for comparison, equal-weight composite scored on H2 alone: Pearson=+0.4400 Spearman=+0.3268)
+[VPIN]
+  197 volume buckets over the session (V=46876 shares/bucket, rolling window=20 buckets) -- note: this is a deliberately finer bucketing than Easley et al.'s 50-per-day convention, chosen to get a usable sample size from a single session; treat n=197 as still modest for IC purposes.
+  VPIN -> |forward return| @5s: Pearson=-0.0776 Spearman=-0.1057  (n=194)
+  VPIN -> |forward return| @30s: Pearson=-0.1034 Spearman=-0.1118  (n=190)
+  VPIN -> |forward return| @60s: Pearson=-0.2432 Spearman=-0.2143  (n=188)
+  fill markout @5s BY VPIN-at-fill-time quartile (Q1 calmest -> Q4 most toxic): Q1=-0.716c  Q2=-0.774c  Q3=-0.844c  Q4=-0.799c
+  -> no clean monotonic relationship between VPIN and markout
+
+======================================================================
+MSFT -- alpha research, phase 7 (composite + VPIN)
+======================================================================
+[Composite signal]
+  component OFI            IC@5s: Pearson=+0.4001 Spearman=+0.2630
+  component TradeFlowMom   IC@5s: Pearson=+0.1622 Spearman=+0.2273
+  component MicroDev       IC@5s: Pearson=+0.2450 Spearman=+0.2583
+  EQUAL-WEIGHT composite IC@5s: Pearson=+0.3943 Spearman=+0.3486  (beats best single component [best single = +0.2630])
+  OLS-weighted composite (fit on H1 only: OFI=+0.003, TradeFlowMom=+0.000, MicroDev=+0.001) -> scored on H2: Pearson=+0.4786 Spearman=+0.3696
+  (for comparison, equal-weight composite scored on H2 alone: Pearson=+0.4196 Spearman=+0.3399)
+[VPIN]
+  196 volume buckets over the session (V=49438 shares/bucket, rolling window=20 buckets) -- note: this is a deliberately finer bucketing than Easley et al.'s 50-per-day convention, chosen to get a usable sample size from a single session; treat n=196 as still modest for IC purposes.
+  VPIN -> |forward return| @5s: Pearson=+0.0953 Spearman=+0.0228  (n=194)
+  VPIN -> |forward return| @30s: Pearson=+0.1185 Spearman=+0.0900  (n=190)
+  VPIN -> |forward return| @60s: Pearson=+0.0817 Spearman=+0.0276  (n=186)
+  fill markout @5s BY VPIN-at-fill-time quartile (Q1 calmest -> Q4 most toxic): Q1=-0.818c  Q2=-0.827c  Q3=-0.860c  Q4=-0.774c
+  -> no clean monotonic relationship between VPIN and markout

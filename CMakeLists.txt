@@ -197,6 +197,15 @@ target_compile_definitions(blitz_lob_tsan PRIVATE
 #      test_phase8_benchmark→ Phase 8  dataset determinism + CSV column check
 #      test_phase9_suite    → Phase 9  extended edge cases beyond phase 5/6
 #      test_phase10_xdp     → Phase 10 AF_XDP compile-gate smoke test
+#      test_asmm_phase11    → Phase 11 Avellaneda-Stoikov market-maker:
+#                                       A-S formula correctness, OFI parity
+#                                       with the Python reference, OFI
+#                                       trailing-window semantics, LOBSTER
+#                                       event->OrderBook mapping,
+#                                       inventory/cash accounting, q_max
+#                                       suppression, gamma magnitude sanity.
+#                                       Sources live under new-feature/ (see
+#                                       new-feature/final_plan.md).
 # ──────────────────────────────────────────────────────────────────────────────
 add_executable(blitz_lob_test_phase1_types
     tests/test_phase1_types.cpp
@@ -355,6 +364,51 @@ add_test(NAME phase7_pipeline COMMAND blitz_lob_test_phase7_pipeline)
 add_test(NAME phase8_benchmark COMMAND blitz_lob_test_phase8_benchmark)
 add_test(NAME phase9_suite COMMAND blitz_lob_test_phase9_suite)
 add_test(NAME phase10_xdp COMMAND blitz_lob_test_phase10_xdp)
+add_test(NAME asmm_phase11 COMMAND blitz_lob_test_asmm_phase11)
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Avellaneda-Stoikov market-maker backtest (new-feature/)
+# WHY -O2 and no -march=native, unlike blitz_lob: this is the same
+#      reproducibility contract blitz_gen_dataset follows -- the markout
+#      CSVs it emits should be re-derivable on any machine from the same
+#      inputs, and it is not a latency-critical binary. It replays real
+#      LOBSTER data, so its "performance" requirement is just "finishes a
+#      6.5-hour session quickly", which -O2 already does in seconds.
+# WHY both include dirs: it consumes the project's real OrderBook/Matcher
+#      from include/, plus its own headers from new-feature/include/.
+# ──────────────────────────────────────────────────────────────────────────────
+add_executable(blitz_asmm_backtest
+    new-feature/tools/blitz_asmm_backtest.cpp
+)
+target_include_directories(blitz_asmm_backtest PRIVATE include new-feature/include)
+target_compile_options(blitz_asmm_backtest PRIVATE
+    -O2 -Wall -Wextra -Wpedantic
+)
+target_compile_definitions(blitz_asmm_backtest PRIVATE
+    HYDRA_LOB_VERSION="${BLITZ_LOB_GIT_HASH}"
+)
+
+# Replay-fidelity checker: reconstructs the book from a real LOBSTER
+# message file with NO strategy inserted and asserts it matches the real
+# orderbook file row for row. This is the gate that must pass before any
+# backtest number from this feature is trusted.
+add_executable(blitz_asmm_verify_replay
+    new-feature/tools/verify_replay_fidelity.cpp
+)
+target_include_directories(blitz_asmm_verify_replay PRIVATE include new-feature/include)
+target_compile_options(blitz_asmm_verify_replay PRIVATE
+    -O2 -Wall -Wextra -Wpedantic
+)
+
+add_executable(blitz_lob_test_asmm_phase11
+    new-feature/tests/test_asmm_phase11_formulas.cpp
+)
+target_include_directories(blitz_lob_test_asmm_phase11 PRIVATE
+    include new-feature/include tests
+)
+target_compile_options(blitz_lob_test_asmm_phase11 PRIVATE
+    -O1 -g -Wall -Wextra -Wpedantic
+)
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Dataset generator tool
