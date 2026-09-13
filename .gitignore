@@ -1,10 +1,8 @@
 # Build outputs
 build/
 build-xdp/
-build-asmm/
 *.o
 *.obj
-__pycache__/
 
 # Generated benchmark/dataset artifacts
 # WHY: dataset files are deterministic and regenerable via blitz_gen_dataset
