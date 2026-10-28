@@ -21,3 +21,6 @@ datasets/*
 # CMake cache
 compile_commands.json
 .cache/
+
+# Local forensic-audit workspace (reports/tests/logs) -- kept out of the public repo
+audit/

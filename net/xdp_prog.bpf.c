@@ -29,6 +29,13 @@
 #include <bpf/bpf_endian.h>
 #include <bpf/bpf_helpers.h>
 
+/* XDP-05: the user-space parser (zero_copy_parser.hpp) unwraps exactly ONE
+ * VLAN tag by design and rejects QinQ. Cap the classifier at the same single
+ * tag (parsing_helpers.h defaults VLAN_MAX_DEPTH to 2) so the kernel does not
+ * redirect a double-tagged frame the parser would then drop -- i.e. so the two
+ * agree on every packet shape, as the docs claim. Must be defined before the
+ * include below. */
+#define VLAN_MAX_DEPTH 1
 #include "parsing_helpers.h"
 
 /* Must track hydra::config::AFXDP_ORDER_ENTRY_UDP_PORT (include/hydra/config.hpp).
@@ -38,6 +45,12 @@
  * vendored/no-cross-repo-dependency policy -- if you change one, change
  * both. */
 #define HYDRA_ORDER_ENTRY_UDP_PORT 40000
+
+/* Must track sizeof(hydra::xdp::OrderWireFormat) (zero_copy_parser.hpp, 30
+ * bytes). XDP-05: redirect only frames whose UDP payload is at least a full
+ * order message, so the kernel never hands the AF_XDP socket a short frame the
+ * parser must reject -- keeping the classifier and parser in agreement. */
+#define HYDRA_ORDER_WIRE_BYTES 30
 
 /* IP_MF / IP_OFFMASK are userspace (netinet/ip.h) macros, not available
  * from the kernel uapi headers this BPF program is restricted to -- defined
@@ -140,6 +153,15 @@ int hydra_xdp_redirect(struct xdp_md *ctx)
 		int udp_len = parse_udphdr(&nh, data_end, &udph);
 
 		if (udp_len < 0 || bpf_ntohs(udph->dest) != HYDRA_ORDER_ENTRY_UDP_PORT) {
+			bump_stat(HYDRA_STAT_WRONG_PORT);
+			return XDP_PASS;
+		}
+
+		/* XDP-05: a UDP payload shorter than a full order message is not
+		 * order-entry traffic the parser can use; passing it keeps the
+		 * classifier in agreement with parse_order_zero_copy() instead of
+		 * redirecting a frame the parser would drop as too short. */
+		if (udp_len < HYDRA_ORDER_WIRE_BYTES) {
 			bump_stat(HYDRA_STAT_WRONG_PORT);
 			return XDP_PASS;
 		}

@@ -74,7 +74,12 @@ namespace hydra
     struct alignas(64) Level
     {
         int64_t price;
-        uint32_t total_qty;
+        // Mirrors the real types.hpp (MATCH-02 overflow fix): total_qty is a
+        // uint64_t so the per-level sum can't wrap. Level is NOT the variable
+        // this flat_layout ablation isolates (only Order's layout is), so it
+        // must track the real header exactly -- see Order below for the one
+        // intended difference.
+        uint64_t total_qty;
         uint32_t order_count;
         Order *head_;
         Order *tail_;

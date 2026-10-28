@@ -16,6 +16,7 @@
 //
 // This entire file compiles to nothing when ENABLE_AFXDP is undefined.
 
+#include <cstddef>
 #include <cstdint>
 #include <cstring>
 
@@ -120,37 +121,52 @@ namespace hydra::xdp
     //   - out.client_tag: this order-entry protocol has no room for a
     //     free-text client tag; left as whatever the destination Order
     //     already had (typically zero-initialized).
+    namespace detail
+    {
+        // ING-06: Ethernet(14)+IPv4(20)+UDP(8) puts the IPv4 header at a
+        // 2-mod-4 offset and OrderWireFormat at offset 42 (2-mod-8), so reading
+        // multi-byte fields through a reinterpret_cast<const iphdr*>/<...*> is a
+        // misaligned load -- UB that UBSan flags on every frame. Read every
+        // multi-byte field with a byte-wise copy instead. This is NOT a packet
+        // copy: nothing is staged through an intermediate buffer, and the
+        // payload is still read in place field by field -- the zero-copy
+        // property that matters (no per-packet allocation / no full-frame
+        // memcpy on the hot path) is preserved.
+        template <typename T>
+        [[nodiscard]] inline T rd(const uint8_t *p) noexcept
+        {
+            T v;
+            std::memcpy(&v, p, sizeof(T));
+            return v;
+        }
+    } // namespace detail
+
     [[nodiscard]] inline bool parse_order_zero_copy(const uint8_t *frame,
                                                      uint32_t frame_len,
                                                      hydra::Order &out) noexcept
     {
         std::size_t offset = 0;
 
-        if (frame_len < offset + sizeof(ethhdr))
+        if (frame == nullptr || frame_len < offset + sizeof(ethhdr))
         {
             return false;
         }
-        const auto *eth = reinterpret_cast<const ethhdr *>(frame + offset);
+        // eth->h_proto sits at offset 12; read it unaligned-safe.
+        uint16_t ethertype = detail::rd<uint16_t>(frame + 12);
         offset += sizeof(ethhdr);
 
-        uint16_t ethertype = eth->h_proto;
         if (ethertype == htons(ETH_P_8021Q) || ethertype == htons(ETH_P_8021AD))
         {
-            // Single VLAN tag only -- matches this parser's bounded,
-            // non-looping design. A double-tagged (QinQ) frame is
-            // rejected here rather than chasing an unbounded tag count;
-            // the eBPF classifier accepts up to 2 tags when deciding
-            // whether to redirect (see parse_ethhdr_vlan()'s
-            // VLAN_MAX_DEPTH), so a QinQ order-entry frame would still be
-            // redirected here and then correctly counted as a
-            // parse_error rather than silently misread.
+            // Single VLAN tag only -- matches this parser's bounded, non-looping
+            // design. A double-tagged (QinQ) frame is rejected here (the eBPF
+            // classifier accepts up to 2 tags, so a QinQ order frame would be
+            // redirected and then counted as a parse_error rather than misread).
             if (frame_len < offset + sizeof(VlanTag))
             {
                 return false;
             }
-            const auto *vlan = reinterpret_cast<const VlanTag *>(frame + offset);
+            ethertype = detail::rd<uint16_t>(frame + offset + offsetof(VlanTag, encapsulated_proto));
             offset += sizeof(VlanTag);
-            ethertype = vlan->encapsulated_proto;
         }
         if (ethertype != htons(ETH_P_IP))
         {
@@ -161,36 +177,92 @@ namespace hydra::xdp
         {
             return false;
         }
-        const auto *ip = reinterpret_cast<const iphdr *>(frame + offset);
-        if (ip->protocol != IPPROTO_UDP)
+        // IPv4 header: version/ihl in byte 0, tot_len at 2, frag_off at 6,
+        // protocol at 9 (all read unaligned-safe).
+        const uint8_t version_ihl = frame[offset];
+        // ING-04: reject anything that isn't IPv4 at the version-field level.
+        if ((version_ihl >> 4) != 4)
         {
             return false;
         }
-        const std::size_t ip_hdr_len = static_cast<std::size_t>(ip->ihl) * 4;
+        const std::size_t ip_hdr_len = static_cast<std::size_t>(version_ihl & 0x0F) * 4;
         if (ip_hdr_len < sizeof(iphdr) || frame_len < offset + ip_hdr_len)
         {
             return false;
         }
-        offset += ip_hdr_len;
-
-        if (frame_len < offset + sizeof(udphdr))
+        if (frame[offset + offsetof(iphdr, protocol)] != IPPROTO_UDP)
         {
             return false;
         }
-        offset += sizeof(udphdr);
-
-        if (frame_len < offset + sizeof(OrderWireFormat))
+        // ING-03: reject fragments (MF flag or non-zero fragment offset): a
+        // non-initial fragment has protocol==UDP but no UDP header at this
+        // offset. frag_off is network byte order.
+        const uint16_t frag_off = ntohs(detail::rd<uint16_t>(frame + offset + offsetof(iphdr, frag_off)));
+        if (frag_off & (0x2000 /*MF*/ | 0x1FFF /*offset*/))
         {
             return false;
         }
-        const auto *wire = reinterpret_cast<const OrderWireFormat *>(frame + offset);
+        // ING-02: the IP total length must at least span the IP+UDP+payload we
+        // are about to read, and must not claim more than the frame holds.
+        const uint16_t ip_tot_len = ntohs(detail::rd<uint16_t>(frame + offset + offsetof(iphdr, tot_len)));
+        if (ip_tot_len < ip_hdr_len + sizeof(udphdr) + sizeof(OrderWireFormat) ||
+            offset + ip_tot_len > frame_len)
+        {
+            return false;
+        }
+        const std::size_t udp_off = offset + ip_hdr_len;
 
-        out.order_id = be64toh(wire->order_id);
-        out.price = detail::ntoh64(static_cast<uint64_t>(wire->price));
-        out.qty = ntohl(wire->qty);
-        out.side = static_cast<hydra::Side>(wire->side);
-        out.tif = static_cast<hydra::TimeInForce>(wire->tif);
-        out.client_id = be64toh(wire->client_id);
+        if (frame_len < udp_off + sizeof(udphdr))
+        {
+            return false;
+        }
+        // ING-03: only the order-entry UDP destination port is accepted, so the
+        // parser agrees with the eBPF classifier's port filter even when fed
+        // from another source (e.g. a raw frame in a test or a mis-steered map).
+        const uint16_t udp_dest = ntohs(detail::rd<uint16_t>(frame + udp_off + offsetof(udphdr, dest)));
+        if (udp_dest != hydra::config::AFXDP_ORDER_ENTRY_UDP_PORT)
+        {
+            return false;
+        }
+        // ING-02: the UDP length must cover its own header plus the full order
+        // payload (it must not under-claim the bytes we are about to read).
+        const uint16_t udp_len = ntohs(detail::rd<uint16_t>(frame + udp_off + offsetof(udphdr, len)));
+        if (udp_len < sizeof(udphdr) + sizeof(OrderWireFormat))
+        {
+            return false;
+        }
+        const std::size_t wire_off = udp_off + sizeof(udphdr);
+
+        if (frame_len < wire_off + sizeof(OrderWireFormat))
+        {
+            return false;
+        }
+
+        const uint64_t order_id = be64toh(detail::rd<uint64_t>(frame + wire_off + offsetof(OrderWireFormat, order_id)));
+        const int64_t price = detail::ntoh64(detail::rd<uint64_t>(frame + wire_off + offsetof(OrderWireFormat, price)));
+        const uint32_t qty = ntohl(detail::rd<uint32_t>(frame + wire_off + offsetof(OrderWireFormat, qty)));
+        const uint64_t client_id = be64toh(detail::rd<uint64_t>(frame + wire_off + offsetof(OrderWireFormat, client_id)));
+        const uint8_t side = frame[wire_off + offsetof(OrderWireFormat, side)];
+        const uint8_t tif = frame[wire_off + offsetof(OrderWireFormat, tif)];
+
+        // ING-01 / ING-05: validate the fields the matcher will trust. side and
+        // tif must be in range (an out-of-range enum byte is UB downstream); a
+        // zero quantity on the wire would become an unauthenticated cancel of
+        // order_id in matching_thread_fn (qty==0 == cancel), so reject it -- the
+        // wire protocol has no cancel message.
+        if (side > static_cast<uint8_t>(hydra::Side::SELL) ||
+            tif > static_cast<uint8_t>(hydra::TimeInForce::FOK) ||
+            qty == 0)
+        {
+            return false;
+        }
+
+        out.order_id = order_id;
+        out.price = price;
+        out.qty = qty;
+        out.side = static_cast<hydra::Side>(side);
+        out.tif = static_cast<hydra::TimeInForce>(tif);
+        out.client_id = client_id;
 
         return true;
     }

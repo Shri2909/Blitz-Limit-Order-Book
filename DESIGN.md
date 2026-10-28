@@ -3,7 +3,7 @@
 This is the canonical design document for this codebase's performance-critical
 decisions: the reasoning behind each one, backed by whatever data actually
 exists for it today. It is not a changelog — there is no prior version of
-this system to evolve from (git history is a single scaffold commit; several
+this system to evolve from (the latency and ablation figures below are the first committed benchmark set; several
 of the files discussed below have no history at all). Four of the five
 before/after figures below come from ablation experiments run this session:
 each rejected alternative was temporarily built in place of the real

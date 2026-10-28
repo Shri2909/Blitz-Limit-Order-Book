@@ -55,6 +55,14 @@ namespace hydra
             order.qty = qty_dist(rng);
             order.side = (order.order_id % 2 == 0) ? Side::BUY : Side::SELL;
             order.tif = TimeInForce::GTC;
+            // PIPE-01: rotate client_id across a few synthetic clients (same
+            // scheme as DatasetConfig::client_id_count and send_test_orders.cpp).
+            // Previously client_id was left 0 on every order, so every resting
+            // order was a self-trade for every incoming one -- nothing ever
+            // filled and the book grew crossed and unbounded, making this live
+            // smoke test exercise none of the real matching path.
+            constexpr uint64_t kSyntheticClientCount = 8;
+            order.client_id = 1 + (order.order_id % kSyntheticClientCount);
             order.timestamp_ns = static_cast<uint64_t>(
                 static_cast<double>(rdtsc_now()) * ns_per_cycle);
 

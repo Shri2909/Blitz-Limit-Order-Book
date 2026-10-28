@@ -226,12 +226,14 @@ namespace hydra::test
             HYDRA_CHECK_EQ(lvl->head_->order_id, uint64_t{1});
             HYDRA_CHECK_EQ(lvl->head_->qty, uint32_t{10});
 
-            // Leftover 5 (25 requested - 20 eligible) rests as a new bid.
-            HYDRA_CHECK(f.book->best_bid().has_value());
-            HYDRA_CHECK_EQ(f.book->best_bid().value(), int64_t{101});
-            Level *bid_lvl = f.book->best_bid_level();
-            HYDRA_CHECK(bid_lvl != nullptr);
-            HYDRA_CHECK_EQ(bid_lvl->head_->qty, uint32_t{5});
+            // Leftover 5 (25 requested - 20 eligible) is NOT rested: resting a
+            // BUY at 101 while the skipped self-trade SELL (order1) rests at 100
+            // would leave the book crossed (best_bid 101 >= best_ask 100). Per
+            // the MATCH-01 fix, that unexecutable-and-uncrossable remainder is
+            // discarded instead, exactly like an IOC remainder -- so no bid rests
+            // and the book stays uncrossed. (remaining_qty still reports the 5.)
+            HYDRA_CHECK(!f.book->best_bid().has_value());
+            HYDRA_CHECK_EQ(n.remaining_qty, uint32_t{5});
         }
 
         void test_cancel_of_partially_filled_resting_order_updates_book_correctly()

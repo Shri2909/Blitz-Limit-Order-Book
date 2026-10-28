@@ -48,6 +48,20 @@ namespace hydra
         template <typename FillHandler>
         [[nodiscard]] MatchStats match(const Order &incoming, FillHandler &&on_fill) noexcept
         {
+            // MATCH-04: a NEW order whose order_id is already resting is a
+            // protocol error -- reject it before matching. Otherwise it would
+            // trade (possibly against its own namesake, producing a fill with
+            // maker_order_id == taker_order_id) and OrderBook::add_order()'s
+            // duplicate-id guard would only catch a non-crossing remainder,
+            // silently dropping it while MatchStats still reported it as if it
+            // had rested. remaining_qty == incoming.qty signals "nothing done".
+            if (book_.find_order(incoming.order_id) != nullptr) [[unlikely]]
+            {
+                MatchStats rejected{};
+                rejected.remaining_qty = incoming.qty;
+                return rejected;
+            }
+
             const MatchingMode mode = mode_.load(std::memory_order_relaxed);
 
             if (incoming.tif == TimeInForce::FOK)
@@ -83,14 +97,36 @@ namespace hydra
 
             if (incoming.tif == TimeInForce::GTC && remaining > 0) [[unlikely]]
             {
-                // Mutable copy constructed only here, on the minority path
-                // that actually rests a remainder -- every fully-filled,
-                // IOC, or rejected-FOK order (the common case) now avoids
-                // copying the 128-byte Order at all, since incoming is a
-                // const reference above rather than a by-value parameter.
-                Order resting_copy = incoming;
-                resting_copy.qty = remaining;
-                [[maybe_unused]] Order *rested = book_.add_order(resting_copy);
+                // MATCH-01: a GTC remainder may only rest at a price that does
+                // NOT cross the opposite best. After the sweep above, any
+                // remaining liquidity that still crosses the incoming limit must
+                // be self-trade-skipped resting orders -- anything eligible would
+                // already have filled. Resting our remainder at its own limit in
+                // that case would leave the book crossed against those same-client
+                // orders (best_bid >= best_ask at rest), an invalid market state.
+                // Such a remainder is both unexecutable (self-trade) and
+                // unrestable-without-crossing, so it is discarded, exactly like an
+                // IOC remainder. This preserves the price-time/pro-rata and
+                // self-trade-skip policies unchanged for every other order; it
+                // only refuses to create a crossed book. (Policy choice: discard
+                // vs. cancel-the-skipped-order vs. reject-the-aggressor -- discard
+                // is the least-surprising and leaves existing resting orders
+                // untouched. Flagged for owner review.)
+                const Level *const opp = (incoming.side == Side::BUY)
+                                             ? book_.best_ask_level()
+                                             : book_.best_bid_level();
+                const bool would_rest_crossed = (opp != nullptr) && crosses(opp, incoming);
+                if (!would_rest_crossed) [[likely]]
+                {
+                    // Mutable copy constructed only here, on the minority path
+                    // that actually rests a remainder -- every fully-filled,
+                    // IOC, or rejected-FOK order (the common case) now avoids
+                    // copying the 128-byte Order at all, since incoming is a
+                    // const reference above rather than a by-value parameter.
+                    Order resting_copy = incoming;
+                    resting_copy.qty = remaining;
+                    [[maybe_unused]] Order *rested = book_.add_order(resting_copy);
+                }
             }
 
             stats.remaining_qty = remaining;
@@ -117,6 +153,17 @@ namespace hydra
             const Order *const existing = book_.find_order(order_id);
             if (existing == nullptr) [[unlikely]]
             {
+                return MatchStats{};
+            }
+
+            // MATCH-03: a replace to quantity 0 is a cancel -- an order cannot
+            // rest at zero size. Without this, the in-place branch below would
+            // set the resting order's qty to 0 and leave it on the book, where a
+            // later match would emit a zero-quantity fill (and, under pro-rata, a
+            // zero-liquidity level that is never cleaned up).
+            if (new_qty == 0)
+            {
+                [[maybe_unused]] const bool cancelled = book_.cancel_order(order_id);
                 return MatchStats{};
             }
 
@@ -280,7 +327,11 @@ namespace hydra
         {
             Order *const fifo_head = level->head_;
 
-            uint32_t eligible_total = 0;
+            // uint64_t: sum of eligible resting qtys can exceed UINT32_MAX for
+            // individually-valid uint32 quantities (see Level::total_qty's WHY in
+            // types.hpp). A uint32 accumulator here wraps and corrupts the
+            // pro-rata denominator, over-filling the taker.
+            uint64_t eligible_total = 0;
             Order *largest = nullptr;
             for (Order *r = fifo_head; r != nullptr; r = r->next_)
             {
@@ -316,7 +367,10 @@ namespace hydra
                 return;
             }
 
-            const uint32_t level_fill_qty = std::min(remaining, eligible_total);
+            // level_fill_qty <= remaining (a uint32), so the result fits uint32
+            // even though eligible_total is now uint64.
+            const uint32_t level_fill_qty = static_cast<uint32_t>(
+                std::min(static_cast<uint64_t>(remaining), eligible_total));
             if constexpr (DryRun)
             {
                 remaining -= level_fill_qty;

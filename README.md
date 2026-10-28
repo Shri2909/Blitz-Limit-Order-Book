@@ -248,7 +248,7 @@ Every non-trivial performance decision in this codebase was put to the same
 test: temporarily rip it out, replace it with the textbook "obvious"
 alternative, rebuild, replay the identical dataset, measure, then revert.
 No permanent branches, no invented numbers — full methodology and file/line
-references in **[`docs/DESIGN.md`](docs/DESIGN.md)**.
+references in **[`DESIGN.md`](DESIGN.md)**.
 
 | Design decision | Current (median P99.9) | Rejected alternative | P99.9 delta | Spread delta | Verdict |
 |---|---|---|---|---|---|
@@ -286,7 +286,7 @@ identical trials. The same ablation under **pro-rata** matching is clean —
 PROVEN, ~1.60x worse (3,065.0 ns → 4,906.0 ns P99.9, full table in
 `results/98a597b/ablation_summary.md`) — so this isn't "pinning doesn't
 matter," it's "this specific measurement, on this policy, this run,
-couldn't isolate the effect from scheduler noise." See `docs/DESIGN.md`
+couldn't isolate the effect from scheduler noise." See `DESIGN.md`
 for the full caveat, including the earlier (pre-fresh-run) version of this
 table where both of these were reported as clean proofs at larger
 multipliers — that version is superseded by this one.
@@ -364,10 +364,23 @@ change both.)*
    Cross-node memory access costs ~2-3x local-node latency on multi-socket
    hosts; even one stray remote access can inflate tail latency badly.
 
-The benchmark binary enforces (1), (2), and (3) itself at startup
-(`run_preflight_checks()` in `src/benchmark.cpp`) — it refuses to measure
-and prints exactly which check failed, rather than silently reporting a
-number from an untuned host.
+The benchmark binary's preflight (`run_preflight_checks()` in
+`src/benchmark.cpp`) enforces, for **each pinned core** (`RX_CORE_ID`/
+`MATCHING_CORE_ID`): that it appears in `/sys/devices/system/cpu/isolated`
+(part of (1)), that its cpufreq governor is `performance` (2), and that its
+`thread_siblings_list` is itself alone — i.e. **no SMT sibling shares that
+specific core** (the part of (3) that actually matters for a pinned thread).
+It refuses to measure and prints exactly which check failed, rather than
+silently reporting a number from an untuned host.
+
+> **Precisely what is and isn't gated.** The SMT check is per-core, not
+> machine-wide: on this hybrid CPU the E-cores 4/5 have no SMT sibling even
+> with SMT enabled globally, which is the whole reason they were chosen (see
+> `config.hpp`), so the gate deliberately does **not** require
+> `/sys/devices/system/cpu/smt/control` to read `off`. Likewise `nohz_full`
+> and `rcu_nocbs` from (1) are recommended for low jitter but are **not**
+> preflight-gated — only `isolcpus` membership is. Set them as documented;
+> just don't read the preflight pass as confirming them.
 
 ---
 
@@ -501,7 +514,7 @@ lines report exactly this.
 
 Reproducing the ablation table above — exact patch/build/measure/revert
 steps for all four optimizations — is documented in
-**[`docs/DESIGN.md`](docs/DESIGN.md#reproducing-these-numbers)**, and is
+**[`DESIGN.md`](DESIGN.md#reproducing-these-numbers)**, and is
 now also automated:
 
 ## Ablation suite
@@ -606,7 +619,7 @@ charts/                  generate_charts.py -- reads results/<commit>/*.csv
 datasets/                Generated dataset files (gitignored) +
                          manifest.txt (reproducibility record of the
                          flags used to produce each one)
-docs/DESIGN.md           Full ablation methodology and rationale behind
+DESIGN.md           Full ablation methodology and rationale behind
                          every optimization in the Results table above
 ```
 
@@ -635,7 +648,7 @@ docs/DESIGN.md           Full ablation methodology and rationale behind
   just argued for — four ablation experiments this session, each
   patch → build → measure → revert, full numbers in
   [Results](#results-what-each-optimization-is-actually-worth) and
-  `docs/DESIGN.md`.
+  `DESIGN.md`.
 - **Ten per-phase correctness targets** mapped to explicit exit conditions
   (see the block comment above the per-phase targets in `CMakeLists.txt`),
   not one monolithic test binary.
@@ -810,7 +823,7 @@ gone rather than just flagged for removal.
   granularity, the order lifecycle state machine, the object pool
   lifecycle, and every failure mode with its exact detection/response —
   each with `file:line` references back into the real implementation.
-- **[`docs/DESIGN.md`](docs/DESIGN.md)** — the full engineering rationale
+- **[`DESIGN.md`](DESIGN.md)** — the full engineering rationale
   behind every decision in this codebase: the problem each one solves, the
   rejected alternative and why, the measured before/after (or an explicit
   "not yet measured" where no ablation exists), and file/line references
@@ -828,7 +841,7 @@ gone rather than just flagged for removal.
   it again after any fresh benchmark/ablation pass to regenerate all five
   PNGs against that run's own evidence.
 - **`datasets/manifest.txt`** — the exact `blitz_gen_dataset` flags behind
-  every dataset file referenced in this README and in `docs/DESIGN.md`.
+  every dataset file referenced in this README and in `DESIGN.md`.
 
 ---
 

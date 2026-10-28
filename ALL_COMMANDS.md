@@ -272,7 +272,7 @@ numactl --cpunodebind=0 --membind=0 -- \
 Produces, per matching policy: `optimized`, `mutex_queue`, `unpinned`,
 `malloc_pool`, `flat_layout` -- each a real, independently gated run, plus
 `ablation_summary.{csv,md}` with PROVEN/INCONCLUSIVE/NOT PROVEN/REGRESSION/
-INVALID verdicts (see `docs/BENCHMARK_METHODOLOGY.md` for exactly how each
+INVALID verdicts (see `METHODOLOGY.md` for exactly how each
 verdict is computed).
 
 ### 8.5 — Individual ablation variants by hand (if you want to re-run just one, not the whole suite)

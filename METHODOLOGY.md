@@ -231,17 +231,17 @@ flowchart TD
     BASELINE[("Baseline: 5 trials\nP99.9 values + CV")] --> DELTA
     ABLATED[("Ablated variant: 5 trials\nP99.9 values + CV")] --> DELTA
 
-    DELTA["raw_delta =\nablated_median_P99.9 /\nbaseline_median_P99.9"]
+    DELTA["delta_p99  = ablated_median_P99  - baseline_median_P99\ndelta_p999 = ablated_median_P99.9 - baseline_median_P99.9\n(absolute deltas, not ratios)"]
 
     BASELINE --> FLOOR
     ABLATED --> FLOOR
-    FLOOR["noise_floor =\nmax(baseline_cv, ablated_cv)\n* baseline_P99.9"]
+    FLOOR["noise_floor =\nmax(baseline_cv, ablated_cv)\n* baseline_P99 (NOT P99.9)"]
 
-    DELTA --> COMPARE{"does raw_delta clear\nthe noise floor?"}
+    DELTA --> COMPARE{"delta_p99 > noise_floor\nAND delta_p999 > 0 ?"}
     FLOOR --> COMPARE
 
-    COMPARE -->|"yes, comfortably"| PROVEN["PROVEN"]
-    COMPARE -->|"no -- within\nnoise-floor range"| INCONCLUSIVE["INCONCLUSIVE"]
+    COMPARE -->|"yes"| PROVEN["PROVEN"]
+    COMPARE -->|"no -- delta_p99 within\nthe noise floor"| INCONCLUSIVE["INCONCLUSIVE"]
 
     INCONCLUSIVE -.-> NOTE["Disclosed asymmetry: if the ABLATED side\nis itself unstable (e.g. unpinned threads'\nscheduling jitter), that inflates the floor\nenough to read INCONCLUSIVE even at a ~39x\nraw delta, observed live for one unpinned run.\nRead the raw median-P99.9 numbers alongside\nthe verdict, not the verdict alone."]
 
@@ -256,7 +256,11 @@ flowchart TD
 **What this shows:** the exact arithmetic behind every PROVEN/INCONCLUSIVE
 label in `README.md`'s and `ARCHITECTURE.md`'s ablation tables — not a
 judgment call made while writing up results, but a formula applied
-uniformly to every design decision tested.
+uniformly to every design decision tested. The gate is on the **P99**
+absolute delta against a noise floor scaled by the **baseline P99** (with a
+secondary requirement that the P99.9 delta also be positive), exactly as
+`hydra::stats::classify_ablation` implements it — this diagram is a direct
+transcription of that function, not a separate P99.9-ratio rule.
 
 **What it proves:** the noise floor is deliberately keyed to *whichever
 side is noisier*, baseline or ablated — a reasonable design, but one with

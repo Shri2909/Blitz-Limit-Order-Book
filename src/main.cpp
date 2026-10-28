@@ -280,6 +280,14 @@ namespace
                          "--output datasets/bench_110k.bin\n");
             std::exit(1);
         }
+        // MEAS-12: a zero-trial benchmark produces no measurement and crashes
+        // run_benchmark (empty trial_stats). Reject it at the CLI too, so the
+        // common case fails fast with a clear message rather than aborting.
+        if (opts.want_benchmark && opts.trials == 0)
+        {
+            std::fprintf(stderr, "error: --trials must be at least 1\n");
+            std::exit(1);
+        }
 
         return opts;
     }

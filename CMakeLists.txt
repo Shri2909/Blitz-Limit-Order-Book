@@ -157,7 +157,14 @@ target_compile_definitions(blitz_lob_asan PRIVATE
 )
 
 # ──────────────────────────────────────────────────────────────────────────────
-# TSan + UBSan binary  (SEPARATE from asan — never combine address + thread)
+# TSan binary  (SEPARATE from asan — never combine address + thread)
+# WHY TSan only, not TSan+UBSan (TEST-01): combining the two makes TSan report a
+# data race *inside the sanitizer runtimes* -- UBSan's IsAccessibleMemoryRange
+# calls pipe() from each thread's startup/teardown and TSan flags that libc path,
+# with no project frame in the race. It surfaced intermittently in the
+# ALL_COMMANDS.md `blitz_lob_tsan` smoke run. Running TSan alone keeps the
+# race-detection this binary exists for and removes the false positive; UBSan
+# coverage of the same code comes from blitz_lob_asan (ASan+UBSan).
 # ──────────────────────────────────────────────────────────────────────────────
 add_executable(blitz_lob_tsan
     src/main.cpp
@@ -166,10 +173,10 @@ add_executable(blitz_lob_tsan
 )
 target_include_directories(blitz_lob_tsan PRIVATE include)
 target_compile_options(blitz_lob_tsan PRIVATE
-    -O1 -g -fsanitize=thread,undefined -Wall -Wextra -Wpedantic
+    -O1 -g -fsanitize=thread -Wall -Wextra -Wpedantic
 )
 target_link_options(blitz_lob_tsan PRIVATE
-    -fsanitize=thread,undefined
+    -fsanitize=thread
 )
 target_compile_definitions(blitz_lob_tsan PRIVATE
     HYDRA_LOB_VERSION="${BLITZ_LOB_GIT_HASH}"
@@ -229,20 +236,26 @@ target_link_options(blitz_lob_test_phase3_pool PRIVATE
     -fsanitize=address,undefined
 )
 
-# WHY TSan+UBSan (never combined with ASan -- see the WHY note above
-# blitz_lob_asan/blitz_lob_tsan): Phase 4's exit condition explicitly says
-# "passes under TSan with zero races" -- an uninstrumented run of a
-# producer/consumer stress test proves nothing about data races, since a
-# race can be "correct" by luck on any single untooled run.
+# WHY TSan only (not TSan+UBSan; never combined with ASan -- see the WHY note
+# above blitz_lob_asan/blitz_lob_tsan): Phase 4's exit condition is "passes
+# under TSan with zero races", and an uninstrumented run proves nothing about
+# data races. UBSan was dropped from THIS target (TEST-01): combining
+# -fsanitize=thread,undefined made TSan non-deterministically report a race
+# *inside the sanitizer runtimes themselves* -- UBSan's IsAccessibleMemoryRange
+# calls pipe() from the worker threads, and TSan flags that libc path, not any
+# project code (~1 run in 13 went red). Running TSan alone keeps the required
+# race check on the real SPSC code and makes the suite deterministic. UBSan
+# coverage of this code still comes from the ASan+UBSan phase3/6/9 targets and
+# the audit suite.
 add_executable(blitz_lob_test_phase4_spsc
     tests/test_phase4_spsc.cpp
 )
 target_include_directories(blitz_lob_test_phase4_spsc PRIVATE include)
 target_compile_options(blitz_lob_test_phase4_spsc PRIVATE
-    -O1 -g -fsanitize=thread,undefined -Wall -Wextra -Wpedantic
+    -O1 -g -fsanitize=thread -Wall -Wextra -Wpedantic
 )
 target_link_options(blitz_lob_test_phase4_spsc PRIVATE
-    -fsanitize=thread,undefined
+    -fsanitize=thread
 )
 
 add_executable(blitz_lob_test_phase5_orderbook

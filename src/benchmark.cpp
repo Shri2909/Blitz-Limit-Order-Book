@@ -39,7 +39,7 @@ namespace hydra
 
         // ------------------------------------------------------------------
         // Preflight (unchanged from the prior harness -- already sound, see
-        // docs/BENCHMARK_METHODOLOGY.md's audit summary).
+        // METHODOLOGY.md's audit summary).
         // ------------------------------------------------------------------
 
         struct PreflightResult
@@ -65,24 +65,72 @@ namespace hydra
             std::vector<int> result;
             std::stringstream ss(list);
             std::string token;
+            // MEAS-06: parse a whole numeric token with std::from_chars-style
+            // strictness and skip anything malformed, rather than calling
+            // std::stoi (which throws std::invalid_argument on e.g. "abc"). An
+            // unparseable sysfs line otherwise threw out of run_preflight_checks,
+            // and main() only catches std::runtime_error -- so a garbage
+            // /sys .../isolated crashed the whole benchmark instead of being
+            // reported as a clean preflight failure. Skipping bad tokens leaves
+            // the required cores absent from the list, which the isolation check
+            // then reports as a normal preflight failure. Also hardens the
+            // CPU-list fuzz target.
+            const auto to_int = [](const std::string &s) -> std::optional<int>
+            {
+                if (s.empty())
+                {
+                    return std::nullopt;
+                }
+                std::size_t i = 0;
+                const bool neg = (s[0] == '-' || s[0] == '+');
+                if (neg)
+                {
+                    i = 1;
+                }
+                if (i >= s.size())
+                {
+                    return std::nullopt;
+                }
+                for (std::size_t j = i; j < s.size(); ++j)
+                {
+                    if (s[j] < '0' || s[j] > '9')
+                    {
+                        return std::nullopt;
+                    }
+                }
+                try
+                {
+                    return std::stoi(s);
+                }
+                catch (const std::exception &)
+                {
+                    return std::nullopt; // out of int range
+                }
+            };
             while (std::getline(ss, token, ','))
             {
                 if (token.empty())
                 {
                     continue;
                 }
-                const auto dash = token.find('-');
+                const auto dash = token.find('-', 1); // not a leading sign
                 if (dash == std::string::npos)
                 {
-                    result.push_back(std::stoi(token));
+                    if (const auto v = to_int(token))
+                    {
+                        result.push_back(*v);
+                    }
                 }
                 else
                 {
-                    const int lo = std::stoi(token.substr(0, dash));
-                    const int hi = std::stoi(token.substr(dash + 1));
-                    for (int c = lo; c <= hi; ++c)
+                    const auto lo = to_int(token.substr(0, dash));
+                    const auto hi = to_int(token.substr(dash + 1));
+                    if (lo && hi && *lo <= *hi)
                     {
-                        result.push_back(c);
+                        for (int c = *lo; c <= *hi; ++c)
+                        {
+                            result.push_back(c);
+                        }
                     }
                 }
             }
@@ -286,6 +334,73 @@ namespace hydra
             return out.str();
         }
 
+        // MEAS-08: RFC-4180 CSV field quoting. The dataset path, derived
+        // workload name, and invalid_reason are strings (the first two are
+        // caller/user-controlled) that can contain a comma, quote or newline;
+        // written raw they shift every later column. Quote iff needed, doubling
+        // any embedded quote.
+        [[nodiscard]] std::string csv_escape(const std::string &s)
+        {
+            if (s.find_first_of(",\"\n\r") == std::string::npos)
+            {
+                return s;
+            }
+            std::string out = "\"";
+            for (const char c : s)
+            {
+                if (c == '"')
+                {
+                    out += '"';
+                }
+                out += c;
+            }
+            out += '"';
+            return out;
+        }
+
+        // MEAS-09: JSON string escaping for the metadata file -- a quote or
+        // backslash in a path (or any control char) otherwise produces invalid
+        // JSON that a consumer can't parse.
+        [[nodiscard]] std::string json_escape(const std::string &s)
+        {
+            std::string out;
+            out.reserve(s.size() + 2);
+            for (const char ch : s)
+            {
+                const unsigned char c = static_cast<unsigned char>(ch);
+                switch (c)
+                {
+                case '"':
+                    out += "\\\"";
+                    break;
+                case '\\':
+                    out += "\\\\";
+                    break;
+                case '\n':
+                    out += "\\n";
+                    break;
+                case '\r':
+                    out += "\\r";
+                    break;
+                case '\t':
+                    out += "\\t";
+                    break;
+                default:
+                    if (c < 0x20)
+                    {
+                        char buf[8];
+                        std::snprintf(buf, sizeof(buf), "\\u%04x", c);
+                        out += buf;
+                    }
+                    else
+                    {
+                        out += static_cast<char>(c);
+                    }
+                }
+            }
+            return out;
+        }
+
         // Measures rdtsc_now()'s own fixed overhead: N back-to-back calls,
         // mean of the consecutive deltas. Reported as "Clock overhead" in
         // every report so a reader can see the instrumentation's own
@@ -343,7 +458,7 @@ namespace hydra
         {
             uint64_t dropped;
             uint64_t max_drift_ns;
-            // Aggregate-only (not per-sample, see docs/BENCHMARK_METHODOLOGY.md
+            // Aggregate-only (not per-sample, see METHODOLOGY.md
             // for why): the successful push() call's own duration cannot be
             // attributed back into the transported Order value, since its
             // duration isn't known until after the value has already been
@@ -551,6 +666,22 @@ namespace hydra
 
             // FNV-1a-style fold over logical-outcome counters + final book
             // depth. Deliberately excludes every timing field.
+            //
+            // MEAS-03 (scope of this guarantee): state_hash is a cross-trial
+            // DETERMINISM fingerprint, not a correctness oracle. It folds
+            // aggregate counts (fills, levels touched, crossing/non-crossing,
+            // examined/skip counts, final depth) -- NOT individual fill prices,
+            // quantities, or maker/taker ids. So it proves "every trial produced
+            // the identical aggregate outcome", which is what determinism means
+            // here, but it does NOT detect a systematically wrong price or
+            // counterparty (a matcher that filled every order at the wrong price
+            // would keep the same state_hash). Fill-level economic correctness is
+            // verified separately by the audit differential reference model
+            // (audit/tests/, replays each event through an independent book and
+            // compares every fill), not by this hash. Strengthening the hash to
+            // fold per-fill fields was considered and deferred: it would change
+            // every published state_hash without adding coverage the differential
+            // model doesn't already provide.
             uint64_t h = 1469598103934665603ULL;
             const uint64_t prime = 1099511628211ULL;
             const auto fold = [&](uint64_t v)
@@ -637,7 +768,7 @@ namespace hydra
                                const std::vector<uint64_t> &state_hashes,
                                bool determinism_pass, bool overall_valid,
                                const std::string &invalid_reason,
-                               std::size_t fok_order_count)
+                               std::size_t fok_order_count, bool is_smoketest)
         {
             std::ofstream out(path, std::ios::trunc);
             if (!out)
@@ -646,6 +777,11 @@ namespace hydra
             }
             out << std::fixed << std::setprecision(3);
 
+            // MEAS-11: is_smoketest column so a sub-canonical-trial-count run is
+            // marked in the CSV too (the README promised "SMOKETEST in both
+            // places"; previously only the console said so, making a 1-trial
+            // CSV byte-shaped like a citable one). Appended as the last column
+            // so existing name-keyed consumers (charts) are unaffected.
             out << "run_id,commit_hash,trial,matching_mode,workload_type,dataset,dataset_hash,"
                    "dataset_records,warmup_operations,measured_operations,producer_cpu,"
                    "consumer_cpu,numa_node,clock_source,timestamp_overhead_ns,p50_ns_per_order,"
@@ -657,19 +793,28 @@ namespace hydra
                    "max_fill_fanout,mean_levels_consumed,remainder_units_distributed,"
                    "allocation_invariant_failures,dropped_events,arena_fallback_count,"
                    "pool_exhaustion_count,unexpected_allocation_count,state_hash,"
-                   "reference_validation_status,determinism_status,valid,invalid_reason\n";
+                   "reference_validation_status,determinism_status,valid,invalid_reason,"
+                   "is_smoketest\n";
 
             const char *mode_str = (mode == MatchingMode::PRICE_TIME) ? "price_time" : "pro_rata";
-            const std::string workload_type = basename_of(dataset_path);
+            const std::string workload_type = csv_escape(basename_of(dataset_path));
+            const std::string dataset_field = csv_escape(dataset_path);
+            const std::string invalid_reason_field = csv_escape(invalid_reason);
+            // MEAS-10: report the clock source honestly -- a run that fell back
+            // to the steady_clock shim (clock.hpp) is NOT rdtscp-calibrated, and
+            // labelling it so hid that its latencies are steady_clock-based.
+            const char *clock_source = detail::g_use_fallback_clock.load(std::memory_order_relaxed)
+                                           ? "steady_clock_fallback"
+                                           : "rdtscp_calibrated";
 
             for (std::size_t t = 0; t < trial_stats.size(); ++t)
             {
                 const TrialStats &s = trial_stats[t];
                 out << run_id << ',' << HYDRA_LOB_VERSION << ',' << t << ',' << mode_str << ','
-                    << workload_type << ',' << dataset_path << ',' << hex64(dataset_hash) << ','
+                    << workload_type << ',' << dataset_field << ',' << hex64(dataset_hash) << ','
                     << dataset_records << ',' << WARMUP_ITERATIONS << ',' << MEASURED_ITERATIONS
                     << ',' << RX_CORE_ID << ',' << MATCHING_CORE_ID << ',' << 0 << ','
-                    << "rdtscp_calibrated" << ',' << clock_overhead_ns << ','
+                    << clock_source << ',' << clock_overhead_ns << ','
                     << s.order_pct.p50 << ',' << s.order_pct.p90 << ',' << s.order_pct.p99 << ','
                     << s.order_pct.p999 << ',' << s.order_pct.mean << ',' << s.order_pct.max << ','
                     << s.throughput_orders_per_sec << ',' << s.crossing_order_count << ','
@@ -684,7 +829,8 @@ namespace hydra
                     << s.arena_fallback_delta /* unexpected_allocation_count */ << ','
                     << hex64(state_hashes[t]) << ',' << "NOT_RUN" << ','
                     << (determinism_pass ? "PASS" : "FAIL") << ',' << (overall_valid ? 1 : 0)
-                    << ',' << invalid_reason << '\n';
+                    << ',' << invalid_reason_field << ',' << (is_smoketest ? "SMOKETEST" : "no")
+                    << '\n';
             }
 
             if (!out)
@@ -736,16 +882,23 @@ namespace hydra
             {
                 throw std::runtime_error("cannot open '" + path + "' for writing");
             }
+            // MEAS-09: every string value is JSON-escaped so a quote/backslash
+            // in a path or reason can't produce unparseable JSON.
             out << "{\n"
-                << "  \"run_id\": \"" << run_id << "\",\n"
-                << "  \"commit_hash\": \"" << HYDRA_LOB_VERSION << "\",\n"
+                << "  \"run_id\": \"" << json_escape(run_id) << "\",\n"
+                << "  \"commit_hash\": \"" << json_escape(HYDRA_LOB_VERSION) << "\",\n"
                 << "  \"working_tree_dirty\": " << (dirty ? "true" : "false") << ",\n"
                 << "  \"dirty_allowed\": " << (allow_dirty ? "true" : "false") << ",\n"
                 << "  \"matching_mode\": \""
                 << (mode == MatchingMode::PRICE_TIME ? "price_time" : "pro_rata") << "\",\n"
-                << "  \"dataset_path\": \"" << dataset_path << "\",\n"
+                << "  \"dataset_path\": \"" << json_escape(dataset_path) << "\",\n"
                 << "  \"dataset_hash\": \"" << hex64(dataset_hash) << "\",\n"
-                << "  \"cpu_model\": \"" << cpu_model_name() << "\",\n"
+                << "  \"cpu_model\": \"" << json_escape(cpu_model_name()) << "\",\n"
+                << "  \"clock_source\": \""
+                << (detail::g_use_fallback_clock.load(std::memory_order_relaxed)
+                        ? "steady_clock_fallback"
+                        : "rdtscp_calibrated")
+                << "\",\n"
                 << "  \"compiler\": \"" <<
 #if defined(__VERSION__)
                 __VERSION__
@@ -753,9 +906,9 @@ namespace hydra
                 "unknown"
 #endif
                 << "\",\n"
-                << "  \"env_snapshot\": \"" << env_snapshot << "\",\n"
+                << "  \"env_snapshot\": \"" << json_escape(env_snapshot) << "\",\n"
                 << "  \"result_validity\": \"" << (overall_valid ? "VALID" : "INVALID") << "\",\n"
-                << "  \"invalid_reason\": \"" << invalid_reason << "\"\n"
+                << "  \"invalid_reason\": \"" << json_escape(invalid_reason) << "\"\n"
                 << "}\n";
             if (!out)
             {
@@ -783,6 +936,18 @@ namespace hydra
                 "run_benchmark: cfg.dataset_path is required -- there is no "
                 "live-generation fallback. Generate one with blitz_gen_dataset "
                 "and pass --dataset.");
+        }
+
+        // MEAS-12: trials==0 would run the trial loop zero times, leaving
+        // trial_stats/state_hashes empty; the report then does
+        // trial_stats.front()/state_hashes.front() (and the pools' reset across
+        // an empty range), which is UB -- observed as a segfault / double-free.
+        // A run with zero trials produces no measurement, so reject it up front.
+        if (cfg.trials == 0)
+        {
+            throw std::runtime_error(
+                "run_benchmark: --trials must be at least 1 (0 produces no "
+                "measurement and is not a valid run).");
         }
 
         pin_to_core(RX_CORE_ID);
@@ -1030,7 +1195,7 @@ namespace hydra
         // Loosely-justified stability threshold: within 15% coefficient of
         // variation on both tail percentiles across trials. Not a formal
         // statistical test, disclosed as a heuristic in
-        // docs/BENCHMARK_METHODOLOGY.md.
+        // METHODOLOGY.md.
         const bool stable = (p99_cv < 15.0) && (p999_cv < 15.0);
 
         const std::size_t final_bid_levels = ctx.book.bid_level_count();
@@ -1172,7 +1337,7 @@ namespace hydra
                      "fill guards; not a live runtime check this pass)\n"
                      "State hash           : %s\n"
                      "Reference comparison : NOT_RUN (no independent reference matcher wired up "
-                     "this pass -- see docs/BENCHMARK_METHODOLOGY.md)\n"
+                     "this pass -- see METHODOLOGY.md)\n"
                      "Determinism          : %s\n"
                      "Pool exhaustion      : %s\n"
                      "Arena fallback       : %s\n"
@@ -1220,7 +1385,7 @@ namespace hydra
                          "Mean generated fills/match : %.3f\n"
                          "Maximum fill fan-out       : %llu\n"
                          "Remainder units allocated  : N/A (not separately instrumented this pass -- "
-                         "see docs/BENCHMARK_METHODOLOGY.md)\n"
+                         "see METHODOLOGY.md)\n"
                          "Allocation invariant errors: 0 (verified structurally + by unit test, not a "
                          "live per-fill runtime check)\n"
                          "Mean latency/generated fill: %.2f ns/fill\n"
@@ -1273,7 +1438,7 @@ namespace hydra
         write_summary_csv(summary_csv_path, run_id, cfg.mode, cfg.dataset_path, dataset_hash,
                           events.size(), clock_overhead_ns, trial_stats, state_hashes,
                           determinism_pass, overall_valid, invalid_reason_str,
-                          composition.fok_count);
+                          composition.fok_count, is_smoketest);
         write_raw_csv(raw_csv_path, trial_records);
         write_metadata_json(meta_json_path, run_id, cfg.mode, env_snapshot, cfg.dataset_path,
                             dataset_hash,

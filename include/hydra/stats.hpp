@@ -165,7 +165,7 @@ namespace hydra::stats
         double lower = 0.0;
         double upper = 0.0;
         // False when the sample count is too small for the interval to be
-        // defensible (see docs/BENCHMARK_METHODOLOGY.md) -- callers must
+        // defensible (see METHODOLOGY.md) -- callers must
         // print "not defensible, n too small" rather than the numeric
         // bounds when this is false.
         bool defensible = false;

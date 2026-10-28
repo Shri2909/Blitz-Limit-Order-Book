@@ -81,9 +81,15 @@ namespace hydra::test
             ip->ihl = 5; // no options -> 20-byte header
             ip->version = 4;
             ip->protocol = IPPROTO_UDP;
+            // Well-formed IP total length (hardened parser validates it).
+            ip->tot_len = htons(static_cast<uint16_t>(
+                sizeof(iphdr) + sizeof(udphdr) + sizeof(hydra::xdp::OrderWireFormat)));
             offset += sizeof(iphdr);
 
             auto *udp = reinterpret_cast<udphdr *>(buf.data() + offset);
+            // Order-entry destination port (hardened parser validates it, in
+            // agreement with net/xdp_prog.bpf.c's port filter).
+            udp->dest = htons(hydra::config::AFXDP_ORDER_ENTRY_UDP_PORT);
             udp->len = htons(static_cast<uint16_t>(
                 sizeof(udphdr) + sizeof(hydra::xdp::OrderWireFormat)));
             offset += sizeof(udphdr);

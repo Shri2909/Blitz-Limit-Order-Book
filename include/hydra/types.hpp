@@ -43,7 +43,7 @@ namespace hydra
     // from a ~1.2 baseline (flat, unseparated layout) to ~2.1 after this
     // split -- a design target and rationale, not a measured claim, until a
     // real perf-stat-capable host records an actually-measured number
-    // against a real run (see docs/BENCHMARK_METHODOLOGY.md).
+    // against a real run (see METHODOLOGY.md).
     struct alignas(64) Order
     {
         uint64_t order_id;
@@ -80,7 +80,15 @@ namespace hydra
     struct alignas(64) Level
     {
         int64_t price;
-        uint32_t total_qty;
+        // WHY uint64_t (not uint32_t): total_qty is the running sum of every
+        // resting order's qty at this price. Each order's qty is a uint32_t, but
+        // a level can hold many of them (up to ORDER_POOL_SIZE), so the sum can
+        // exceed UINT32_MAX for individually-valid quantities -- a uint32_t
+        // accumulator silently wraps, corrupting the level's advertised depth
+        // and (under pro-rata, which divides by the eligible sum) the fill
+        // allocation. Widened to uint64_t; Level stays exactly 64 bytes (see the
+        // static_assert below), so no on-wire/layout impact.
+        uint64_t total_qty;
         uint32_t order_count;
         Order *head_;
         Order *tail_;
@@ -105,7 +113,7 @@ namespace hydra
     // count, so the benchmark harness (and any other caller) can report
     // "eligible orders examined/match" and "levels consumed/order" precisely
     // instead of approximating them from externally-observable fill events
-    // alone -- see docs/BENCHMARK_METHODOLOGY.md for exactly what each field
+    // alone -- see METHODOLOGY.md for exactly what each field
     // counts and when (dry-run/FOK-availability traversals do NOT
     // contribute to these counters; only the real commit-pass sweep does).
     struct MatchStats

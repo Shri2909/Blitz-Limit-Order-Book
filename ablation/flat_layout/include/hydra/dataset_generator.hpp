@@ -293,6 +293,30 @@ namespace hydra
                     ", reader=" + std::to_string(kFormatVersion) + ")");
             }
 
+            // Mirrors the real dataset_generator.hpp (DATA-01/DATA-06 fix):
+            // bound event_count against file size before reserve(), and reject
+            // out-of-range enum bytes. This is not the variable this ablation
+            // isolates (only Order's/DatasetRecord's size is), so it tracks the
+            // real reader exactly.
+            const std::streamoff header_end = in.tellg();
+            in.seekg(0, std::ios::end);
+            const std::streamoff file_end = in.tellg();
+            in.seekg(header_end, std::ios::beg);
+            if (!in || file_end < header_end)
+            {
+                throw std::runtime_error(
+                    "DatasetGenerator::read_from_file: cannot size '" + path + "'");
+            }
+            const uint64_t available_bytes = static_cast<uint64_t>(file_end - header_end);
+            const uint64_t max_records = available_bytes / sizeof(DatasetRecord);
+            if (header.event_count > max_records)
+            {
+                throw std::runtime_error(
+                    "DatasetGenerator::read_from_file: header event_count (" +
+                    std::to_string(header.event_count) + ") exceeds what the file holds (" +
+                    std::to_string(max_records) + " records) in '" + path + "'");
+            }
+
             std::vector<DatasetEvent> events;
             events.reserve(header.event_count);
             for (uint64_t i = 0; i < header.event_count; ++i)
@@ -304,6 +328,23 @@ namespace hydra
                     throw std::runtime_error(
                         "DatasetGenerator::read_from_file: truncated record " +
                         std::to_string(i) + " in '" + path + "'");
+                }
+                if (rec.event_type > static_cast<uint8_t>(EventType::REPLACE))
+                {
+                    throw std::runtime_error(
+                        "DatasetGenerator::read_from_file: invalid event_type " +
+                        std::to_string(rec.event_type) + " in record " + std::to_string(i) +
+                        " of '" + path + "'");
+                }
+                if (rec.event_type == static_cast<uint8_t>(EventType::NEW_ORDER))
+                {
+                    if (static_cast<uint8_t>(rec.order.side) > static_cast<uint8_t>(Side::SELL) ||
+                        static_cast<uint8_t>(rec.order.tif) > static_cast<uint8_t>(TimeInForce::FOK))
+                    {
+                        throw std::runtime_error(
+                            "DatasetGenerator::read_from_file: invalid side/tif in record " +
+                            std::to_string(i) + " of '" + path + "'");
+                    }
                 }
                 DatasetEvent ev{};
                 ev.type = static_cast<EventType>(rec.event_type);

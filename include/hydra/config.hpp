@@ -87,7 +87,7 @@ namespace hydra
     // ── Dataset generation defaults ──────────────────────────────────────────────
     // These are the fallback values used by DatasetGenerator and blitz_gen_dataset
     // when a flag/field is omitted. Document any dataset referenced in
-    // docs/DESIGN.md by its full config (not just the seed) — see
+    // DESIGN.md by its full config (not just the seed) — see
     // datasets/manifest.txt.
     //
     // WHY seed=42: arbitrary but documented. The reproducibility contract is

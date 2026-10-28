@@ -320,7 +320,7 @@ namespace hydra::test
                                       "arena_fallback_count,pool_exhaustion_count,"
                                       "unexpected_allocation_count,state_hash,"
                                       "reference_validation_status,determinism_status,valid,"
-                                      "invalid_reason"));
+                                      "invalid_reason,is_smoketest"));
 
             std::size_t data_row_count = 0;
             std::string row;

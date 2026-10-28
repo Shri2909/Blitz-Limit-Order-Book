@@ -20,7 +20,7 @@ namespace hydra
 {
 
     // Explicit measurement-category breakdown (see
-    // docs/BENCHMARK_METHODOLOGY.md for the exact start/end boundary of
+    // METHODOLOGY.md for the exact start/end boundary of
     // every field below). Replaces the old single fused "queue_transit_ns"
     // (pop-done doubled as match-start) with a real, separately-timed
     // pop boundary, plus per-order MatchStats so the CSV/report layer never
@@ -34,7 +34,7 @@ namespace hydra
         // benchmark.cpp) push() call duration, since that duration cannot
         // be attributed back into the transported Order value without
         // knowing it before the value is copied into the queue. See
-        // docs/BENCHMARK_METHODOLOGY.md.
+        // METHODOLOGY.md.
         uint64_t queue_residence_ns;
         // Time inside the one successful SpscQueue::pop() call itself.
         uint64_t queue_pop_ns;

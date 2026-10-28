@@ -11,7 +11,7 @@ from memory of what the code "probably" does.
 
 **Scope note:** this document is about *structure* — what exists and how
 it's connected. For *why* each design decision was made and the measured
-cost of the rejected alternative, see [`docs/DESIGN.md`](docs/DESIGN.md).
+cost of the rejected alternative, see [`DESIGN.md`](DESIGN.md).
 For the latency numbers themselves, see [`README.md`](README.md).
 
 ---
@@ -416,7 +416,7 @@ ones that would otherwise crash.
 
 - **[`README.md`](README.md)** — measured results, reproduction commands,
   the AF_XDP investigation this document's §4 diagram summarizes.
-- **[`docs/DESIGN.md`](docs/DESIGN.md)** — why each design decision was
+- **[`DESIGN.md`](DESIGN.md)** — why each design decision was
   made, the rejected alternative, and the measured cost of rejecting it.
 - **[`charts/generate_charts.py`](charts/generate_charts.py)** — the
   benchmark evidence charts referenced throughout this document's sibling,
