@@ -10,6 +10,7 @@
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
+#include <limits>
 #include <memory>
 #include <stdexcept>
 #include <string>
@@ -144,6 +145,40 @@ namespace hydra::test
                 threw = true;
             }
             HYDRA_CHECK(threw);
+        }
+
+        void test_dataset_config_rejects_invalid_distribution_parameters()
+        {
+            const auto rejected = [](const DatasetConfig &cfg)
+            {
+                try
+                {
+                    DatasetGenerator gen(cfg);
+                    (void)gen;
+                    return false;
+                }
+                catch (const std::invalid_argument &)
+                {
+                    return true;
+                }
+            };
+
+            DatasetConfig cfg = make_small_config(1, 100);
+            cfg.price_spread_ticks = -1;
+            HYDRA_CHECK(rejected(cfg));
+
+            cfg = make_small_config(1, 100);
+            cfg.cancel_ratio = std::numeric_limits<double>::quiet_NaN();
+            HYDRA_CHECK(rejected(cfg));
+
+            cfg = make_small_config(1, 100);
+            cfg.arrival_rate_hz = std::numeric_limits<double>::infinity();
+            HYDRA_CHECK(rejected(cfg));
+
+            cfg = make_small_config(1, 100);
+            cfg.mid_price = std::numeric_limits<int64_t>::max();
+            cfg.price_spread_ticks = 1;
+            HYDRA_CHECK(rejected(cfg));
         }
 
         // Every generated cancel targets an order that is resting in a real book.
@@ -292,6 +327,7 @@ int main()
     RUN_TEST(test_dataset_different_seed_produces_different_output);
     RUN_TEST(test_dataset_write_read_round_trip_preserves_events);
     RUN_TEST(test_dataset_config_validation_rejects_bad_ratios);
+    RUN_TEST(test_dataset_config_rejects_invalid_distribution_parameters);
     RUN_TEST(test_dataset_cancels_always_resolve_against_a_real_order_book);
     RUN_TEST(test_run_benchmark_produces_valid_csv_when_environment_permits);
 

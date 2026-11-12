@@ -6,8 +6,10 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <cmath>
 #include <cstring>
 #include <fstream>
+#include <limits>
 #include <random>
 #include <stdexcept>
 #include <string>
@@ -85,18 +87,36 @@ namespace hydra
     public:
         explicit DatasetGenerator(const DatasetConfig &cfg) : cfg_(cfg), rng_(cfg.seed)
         {
+            if (!std::isfinite(cfg_.ioc_ratio) || !std::isfinite(cfg_.fok_ratio) ||
+                !std::isfinite(cfg_.cancel_ratio) || !std::isfinite(cfg_.replace_ratio) ||
+                !std::isfinite(cfg_.arrival_rate_hz))
+            {
+                throw std::invalid_argument(
+                    "DatasetConfig: ratios and arrival_rate_hz must be finite");
+            }
+            if (cfg_.price_spread_ticks < 0)
+            {
+                throw std::invalid_argument("DatasetConfig: price_spread_ticks must be >= 0");
+            }
+            const int64_t min_price = std::numeric_limits<int64_t>::min();
+            const int64_t max_price = std::numeric_limits<int64_t>::max();
+            if (cfg_.mid_price < min_price + cfg_.price_spread_ticks ||
+                cfg_.mid_price > max_price - cfg_.price_spread_ticks)
+            {
+                throw std::invalid_argument(
+                    "DatasetConfig: mid_price +/- price_spread_ticks overflows int64_t");
+            }
+            if (cfg_.ioc_ratio < 0.0 || cfg_.ioc_ratio > 1.0 || cfg_.fok_ratio < 0.0 ||
+                cfg_.fok_ratio > 1.0 || cfg_.cancel_ratio < 0.0 || cfg_.cancel_ratio > 1.0 ||
+                cfg_.replace_ratio < 0.0 || cfg_.replace_ratio > 1.0)
+            {
+                throw std::invalid_argument("DatasetConfig: event ratios must be in [0, 1]");
+            }
             if (cfg_.ioc_ratio + cfg_.fok_ratio > 1.0)
             {
                 throw std::invalid_argument(
                     "DatasetConfig: ioc_ratio + fok_ratio must be <= 1.0 (got " +
                     std::to_string(cfg_.ioc_ratio) + " + " + std::to_string(cfg_.fok_ratio) + ")");
-            }
-            if (cfg_.ioc_ratio < 0.0 || cfg_.fok_ratio < 0.0 || cfg_.cancel_ratio < 0.0 ||
-                cfg_.cancel_ratio > 1.0 || cfg_.replace_ratio < 0.0)
-            {
-                throw std::invalid_argument(
-                    "DatasetConfig: ioc_ratio/fok_ratio/cancel_ratio/replace_ratio must "
-                    "be non-negative, and cancel_ratio must additionally be <= 1.0");
             }
             if (cfg_.cancel_ratio + cfg_.replace_ratio > 1.0)
             {
@@ -135,7 +155,22 @@ namespace hydra
             for (std::size_t i = 0; i < cfg_.order_count; ++i)
             {
                 const double dt_seconds = inter_arrival_dist(rng_);
-                arrival_offset_ns += static_cast<uint64_t>(dt_seconds * 1e9);
+                const long double dt_ns = static_cast<long double>(dt_seconds) * 1.0e9L;
+                const uint64_t remaining_ns =
+                    std::numeric_limits<uint64_t>::max() - arrival_offset_ns;
+                if (!std::isfinite(dt_seconds) || dt_seconds < 0.0 || !std::isfinite(dt_ns) ||
+                    dt_ns >= std::ldexp(1.0L, 64))
+                {
+                    throw std::overflow_error(
+                        "DatasetGenerator: generated arrival offset exceeds uint64_t range");
+                }
+                const uint64_t delta_ns = static_cast<uint64_t>(dt_ns);
+                if (delta_ns > remaining_ns)
+                {
+                    throw std::overflow_error(
+                        "DatasetGenerator: generated arrival offset exceeds uint64_t range");
+                }
+                arrival_offset_ns += delta_ns;
 
                 const double dispatch_u = resting_ids_.empty() ? 1.0 : unit_dist(rng_);
                 const bool want_cancel = dispatch_u < cfg_.cancel_ratio;
