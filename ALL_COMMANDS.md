@@ -204,7 +204,7 @@ deterministic for a given flag set. Flags are recorded in
     --output datasets/bench_110k.bin
 
 # Flat-layout ablation dataset (its Order is 88 bytes, so the file layout differs;
-# run_ablations.sh also does this automatically)
+# run_ablations.sh generates its own copy in the results directory)
 cmake --build build --target blitz_gen_dataset_ablation_flat_layout -j"$(nproc)"
 ./build/blitz_gen_dataset_ablation_flat_layout --seed 42 --count 110000 \
     --output datasets/ablation4_flat.bin

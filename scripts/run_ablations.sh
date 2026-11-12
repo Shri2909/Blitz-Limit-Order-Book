@@ -12,7 +12,7 @@ BUILD_DIR="$REPO_ROOT/build"
 GIT_HASH="$(git -C "$REPO_ROOT" rev-parse --short HEAD 2>/dev/null || echo unknown)"
 OUT_DIR="${RESULTS_ROOT:-$REPO_ROOT/results}/$GIT_HASH"
 DATASET="$REPO_ROOT/datasets/bench_110k.bin"
-FLAT_DATASET="$REPO_ROOT/datasets/ablation4_flat.bin"
+FLAT_DATASET="$OUT_DIR/ablation4_flat.bin"
 
 TRIALS=5
 ALLOW_DIRTY=0
