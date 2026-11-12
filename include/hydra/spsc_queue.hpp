@@ -96,26 +96,53 @@ namespace hydra
         }
     };
 
-    // SpscQueue<Order, N> for the production Order layout (128 bytes, 64-byte aligned):
-    // the pipeline's queue. Other Order layouts (the flat-layout ablation) use the generic
-    // queue above. One 64-byte slot per order instead of
-    // a 128-byte copy of the whole Order.
+    // True when T has a layout the one-line slot below is written for: the production Order
+    // (128 bytes, two cache lines) or the flat-layout ablation's Order (88 bytes). Both carry
+    // the same field set and differ only in offsets. Any other layout fails closed, so adding a
+    // field to Order breaks the build instead of silently dropping it from the queue.
+    template <typename T> constexpr bool slot_layout_known() noexcept
+    {
+        if constexpr (sizeof(T) == 128)
+        {
+            return offsetof(T, order_id) == 0 && offsetof(T, price) == 8 &&
+                   offsetof(T, qty) == 16 && offsetof(T, side) == 20 && offsetof(T, tif) == 21 &&
+                   offsetof(T, event_tag) == 22 && offsetof(T, prev_) == 48 &&
+                   offsetof(T, next_) == 56 && offsetof(T, timestamp_ns) == 64 &&
+                   offsetof(T, client_id) == 72 && offsetof(T, client_tag) == 80 &&
+                   offsetof(T, cold_padding) == 112;
+        }
+        else if constexpr (sizeof(T) == 88)
+        {
+            return offsetof(T, order_id) == 0 && offsetof(T, price) == 8 &&
+                   offsetof(T, qty) == 16 && offsetof(T, side) == 20 && offsetof(T, tif) == 21 &&
+                   offsetof(T, event_tag) == 22 && offsetof(T, prev_) == 24 &&
+                   offsetof(T, next_) == 32 && offsetof(T, timestamp_ns) == 40 &&
+                   offsetof(T, client_id) == 48 && offsetof(T, client_tag) == 56;
+        }
+        else
+        {
+            return false;
+        }
+    }
+
+    // SpscQueue<Order, N>: the pipeline's queue, used for every Order layout (production and
+    // the flat-layout ablation) so ablations differ only in the layout. One 64-byte slot per
+    // order instead of a copy of the whole Order.
     //
-    // Why: with a separate tail_ index and a two-line payload, the consumer needs one
-    // cross-core transfer to learn that an element exists (tail_) and then more to
-    // fetch the payload (two lines). Here the slot's own sequence word is the "ready"
-    // flag and shares its cache line with every field the matching engine reads, so
-    // the consumer polls the line that will carry the data: one transfer in total.
-    // The ring also halves from 8 MiB to 4 MiB at SPSC_CAPACITY = 65536.
+    // Why: with a separate tail_ index and a multi-line payload, the consumer needs one
+    // cross-core transfer to learn that an element exists (tail_) and then more to fetch
+    // the payload. Here the slot's own sequence word is the "ready" flag and shares its
+    // cache line with every field the matching engine reads, so the consumer polls the
+    // line that will carry the data: one transfer in total. The ring also halves from
+    // 8 MiB to 4 MiB at SPSC_CAPACITY = 65536.
     //
     // Transported fields: order_id, price, qty, side, tif, event_tag, client_id,
     // timestamp_ns. Not transported (zeroed on pop): prev_/next_ (book-internal links,
     // never valid across threads), client_tag (read only by Matcher::replace(), copied
     // from a resting order; every dataset and the RX thread leave it zero) and the
-    // padding bytes. static_asserts below fail the build if Order gains a field that
-    // this slot does not carry.
+    // padding bytes.
     template <typename T, std::size_t N>
-        requires(std::is_same_v<T, Order> && sizeof(T) == 128 && alignof(T) == 64)
+        requires(std::is_same_v<T, Order>)
     class SpscQueue<T, N>
     {
         static_assert((N & (N - 1)) == 0, "N must be power of 2");
@@ -138,13 +165,7 @@ namespace hydra
         };
         static_assert(sizeof(Slot) == 64, "an order slot must be exactly one cache line");
 
-        // Offsets of the fields the slot carries, and of the ones it deliberately drops.
-        static_assert(offsetof(T, order_id) == 0 && offsetof(T, price) == 8 &&
-                          offsetof(T, qty) == 16 && offsetof(T, side) == 20 &&
-                          offsetof(T, tif) == 21 && offsetof(T, event_tag) == 22 &&
-                          offsetof(T, prev_) == 48 && offsetof(T, next_) == 56 &&
-                          offsetof(T, timestamp_ns) == 64 && offsetof(T, client_id) == 72 &&
-                          offsetof(T, client_tag) == 80 && offsetof(T, cold_padding) == 112,
+        static_assert(slot_layout_known<T>(),
                       "Order layout changed: update SpscQueue<Order, N> to carry the new field");
 
         alignas(64) std::array<Slot, N> buffer_{};
