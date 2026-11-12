@@ -403,7 +403,7 @@ The `unpinned` row needs care and must not be read as a measured effect of pinni
 
 ## Comparison with the earlier run (98a597b)
 
-> **This is not a controlled A/B.** `results/98a597b/` is an earlier engine (before the correctness fixes and the performance work listed below) measured in an earlier session, on the same host and dataset. Hash `51ce6285b274413e` is the same dataset, but the engine, the build, the day and the host condition all differ. Treat the numbers as informative; they do not isolate any single change.
+> **This is not a controlled A/B.** `results/98a597b/` is an earlier engine (before the correctness fixes and the performance work listed below) measured in an earlier session, on the same machine and dataset (hash `51ce6285b274413e`). The engine, the build, the day and the host tuning all differ: that run isolated cores 4-5 only (`isolated=4-5` in its metadata), while the final run isolated 4-7 and tuned the whole cluster. Treat the numbers as informative; they do not isolate any single change.
 
 Both sets: median over 5 trials of the per-trial percentile (ns), new orders only. P99.99 is recomputed from the raw samples with the snippet in [METHODOLOGY.md](METHODOLOGY.md#recomputing-a-percentile-from-raw-samples) and is indicative only (about 9 samples per trial). Sources: `results/98a597b/{price_time,pro_rata}.csv` and `results_new/77eb286/{price_time,pro_rata}.csv`.
 

@@ -1,6 +1,7 @@
 """Regression coverage for chart reporting: test status, verdict vocabulary, labels, determinism."""
 
 import importlib.util
+import json
 import sys
 from pathlib import Path
 import tempfile
@@ -180,6 +181,24 @@ class ChartReportingTests(unittest.TestCase):
         self.assertEqual(len(names), 5)
         for name in names:
             self.assertEqual((outputs[0] / name).read_bytes(), (outputs[1] / name).read_bytes())
+
+    def _run_dir(self, name, isolated):
+        run = self.root / name
+        run.mkdir()
+        if isolated is not None:
+            snapshot = f"isolated={isolated} rx_core=4 matching_core=5"
+            (run / "price_time.meta.json").write_text(json.dumps({"env_snapshot": snapshot}))
+        return run
+
+    def test_tuning_note_states_whether_the_hosts_were_tuned_alike(self):
+        earlier = self._run_dir("earlier", "4-5")
+        final = self._run_dir("final", "4-7")
+        same = self._run_dir("same", "4-5")
+        unknown = self._run_dir("unknown", None)
+        self.assertIn("host tuning differed", charts.tuning_note(earlier, final))
+        self.assertIn("4-5 earlier, 4-7 in the final run", charts.tuning_note(earlier, final))
+        self.assertIn("same isolated cores (4-5)", charts.tuning_note(earlier, same))
+        self.assertIn("not recorded", charts.tuning_note(earlier, unknown))
 
 
 if __name__ == "__main__":

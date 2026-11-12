@@ -16,6 +16,7 @@ that struct changes (tests/test_chart_reporting.py checks the transcription is g
 
 import argparse
 import csv
+import json
 import re
 import statistics
 import sys
@@ -70,6 +71,29 @@ plt.rcParams.update(
 
 
 # -- Evidence loading ---------------------------------------------------------
+
+
+def isolated_cores(results_dir: Path) -> str | None:
+    """Return the isolated-core list recorded in a run's metadata (for example '4-7')."""
+    try:
+        meta = json.loads((results_dir / "price_time.meta.json").read_text())
+        found = re.search(r"isolated=(\S+)", meta["env_snapshot"])
+    except (OSError, KeyError, ValueError):
+        return None
+    return found.group(1) if found else None
+
+
+def tuning_note(baseline_dir: Path, results_dir: Path) -> str:
+    """Say honestly whether the two runs had the same host tuning, from their metadata."""
+    earlier, final = isolated_cores(baseline_dir), isolated_cores(results_dir)
+    if earlier is None or final is None:
+        return "Same machine and dataset; host tuning not recorded for both runs."
+    if earlier == final:
+        return f"Same machine, dataset and isolated cores ({final})."
+    return (
+        f"Same machine and dataset, but host tuning differed: isolated cores {earlier} earlier, "
+        f"{final} in the final run (which also tuned the whole cluster)."
+    )
 
 
 def display_path(path: Path) -> str:
@@ -705,7 +729,8 @@ def chart_before_after(
         fig,
         [
             f"Earlier: {display_path(baseline_dir)} (commit {baseline_commit}). Final: {display_path(results_dir)} "
-            f"(commit {commit}). Both on the same tuned host and dataset, 5 trials per mode.",
+            f"(commit {commit}). 5 trials per mode.",
+            tuning_note(baseline_dir, results_dir),
             "Values: median over trials of the per-trial percentile, new orders only. The engines differ (correctness fixes, "
             "allocator, queue slot, harness);",
             "sessions differ too, and tail percentiles of one binary move 10-20% between sessions. Percentages are not attributable to any one change.",
