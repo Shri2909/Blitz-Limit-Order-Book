@@ -1,56 +1,52 @@
 # Measurement Methodology
 
-Latency is the time from the producer's timestamp, taken just before `push()`, to the end of matching, measured
-in-process on a synthetic stream replayed open loop between two pinned threads. A run is 5 trials, reported as the
-median of per-trial percentiles. The harness refuses to run on an untuned host and marks a run invalid on drops,
-pool exhaustion, clock fallback or non-repeatable state. Figures predate the matching fixes ([README](README.md)). Components: [ARCHITECTURE](ARCHITECTURE.md). Design evidence: [DESIGN](DESIGN.md).
+Latency is the time from the producer's timestamp, taken just before `push()`, to the end of matching, measured in-process on a synthetic stream replayed open loop between two pinned threads on isolated cores. A run is 5 trials; the headline is the median of per-trial percentiles. The harness refuses to run on an untuned host and marks a run invalid on drops, pool exhaustion, clock fallback or non-repeatable state. It is not network or market-data latency, and the harness's own timestamps sit inside the window (Threats to validity). Components: [ARCHITECTURE](ARCHITECTURE.md). Design evidence: [DESIGN](DESIGN.md).
 
 | Environment of record | |
 |---|---|
-| Commit / date | `98a597b` (clean tree), 2026-07-21 |
-| Host / toolchain | Intel i5-1235U, cores 4 (producer) and 5 (matcher) isolated, `performance` governor, no SMT sibling, one NUMA node; GCC 15.2.0, Release |
-| Dataset / trial | `datasets/bench_110k.bin` (seed 42, 100 kHz, [`manifest.txt`](datasets/manifest.txt)); per trial 10,000 warmup + 100,000 measured events on a fresh book and pools, 85,118 new-order samples |
+| Commit / date | `7c2fd2c`, clean tree, 2026-11-12. Data: `results_new/7c2fd2c/` (local, gitignored) |
+| Host | i5-1235U (hybrid), Linux 7.0.0-43-generic, GCC 15.2.0, Release; clock `rdtscp_calibrated`, ~30.4 ns per stamp |
+| Cores / boot | Producer core 4, matcher core 5 (cores 4-7: one E-core cluster, shared 2 MB L2); `isolcpus=4-7 nohz_full=4-7 rcu_nocbs=4-7`; `performance` governor, no SMT sibling, one NUMA node (`numactl`), IRQs moved by `scripts/tune_host.sh` |
+| Dataset | `datasets/bench_110k.bin` (seed 42, 100 kHz, hash `51ce6285b274413e`, [`manifest.txt`](datasets/manifest.txt)) |
+| Per trial | 10,000 warmup + 100,000 measured events, fresh book and pools: 85,118 new orders (the samples), 14,882 cancels, 0 replaces |
 
 ## What is measured
 
-Timeline: `t0` (producer stamp), `t_pop_start`, `t_pop_end`, `t_match_start`, `t_match_end` (all RDTSCP).
+```
+producer: spin to arrival -> t1 -> push() ... ring ... t_pop_start -> pop() -> t_pop_end
+matcher:  -> t_match_start -> match() [per fill: stamp, callback, stamp] -> t_match_end
+```
 
-| Field | Definition |
+| Field (raw CSV) | Definition |
 |---|---|
-| `queue_residence_ns` | `t_pop_start` minus `t0`. Includes the producer's `push()` call and any wait in the ring. |
-| `queue_pop_ns`, `fill_publish_ns` | Duration of the successful `pop()`; time in the fill callback, summed over the event's fills. |
-| `match_time_ns` | `match()` or `replace()` time minus `fill_publish_ns`; for cancels, `cancel_order()` time. |
-| `end_to_end_ns` | `t_match_end` minus `t0`. Every "ns per order" figure in these docs is this field. |
+| `queue_residence_ns` | `t_pop_start` minus `t1`: the producer's `push()` plus any wait in the ring |
+| `queue_pop_ns` | `t_pop_end` minus `t_pop_start` (the successful `pop()`) |
+| `fill_publish_ns` | Fill-callback time summed over the event's fills (one stamp pair per fill) |
+| `match_time_ns` | `t_match_end` minus `t_match_start` minus `fill_publish_ns` (cancels: `cancel_order()` time) |
+| `end_to_end_ns` | `t_match_end` minus `t1`. Every "ns per order" figure in these docs is this field |
 
-- **Clock**: serialized `RDTSCP` (`lfence` on both sides), scaled by a one-time calibration against `steady_clock`
-  (two 1 s samples). More than 0.5% disagreement or a core migration falls back to `steady_clock` and invalidates
-  the run. Timestamp overhead is about 34-35 ns per pair, recorded per trial and not subtracted.
-- **Pacing**: each event's target is `phase_start + (arrival_offset_ns - first_offset)`; the producer spins on the
-  TSC until then and never waits for earlier events to finish, so a slow match does not delay later arrivals (the
-  coordinated-omission failure mode). `t0` is read after the spin, i.e. the actual release time: if the producer
-  itself runs late, that lateness is not added to latency. The worst lag is printed as max schedule drift (not gated).
-- **Back-pressure**: a full ring is retried 1,000 times, then the event is dropped, counted and the run invalidated.
-- **Phase completion**: an in-band control marker follows each warmup and measured replay. The matcher acknowledges
-  it only after all earlier queue events finish, so warmup samples cannot leak into measurement and the book is
-  drained before a trial reset. The marker is excluded from event counts and latency samples.
-- **Population**: new orders only (cancels are in the raw file, excluded; the dataset has no replaces). 84,992
-  orders/s is the paced new-order rate (100 kHz, about 85% new), not capacity.
+- **Clock**: serialized `RDTSCP` (`lfence` both sides), scaled by a one-time calibration against `steady_clock` (two 1 s samples; more than 0.5% disagreement or a core migration falls back and invalidates the run). Stamp overhead is measured per run and not subtracted.
+- **Open-loop pacing**: each target is `phase_start + (arrival_offset - first_offset)`; the producer spins to it and never waits for earlier events, so a slow event does not delay later arrivals. `t1` is the actual spin exit, so producer lateness is not charged (max drift is printed, not gated). Queueing behind a slow event is charged: 4.7% of events arrive while the previous one is still in flight (their queue residence p50 is about 279 ns).
+- **Back-pressure**: a full ring is retried 1,000 times, then the event is dropped, counted and the run invalid.
+- **Phase barriers**: an in-band `PHASE_BARRIER` event follows the warmup and the measured replay. The matcher acknowledges it only after all earlier events finish, so the sample sink attaches after warmup completed and a trial ends only after its queue drained. It is not counted as an event or sample.
+- **Worker startup**: the matcher reports `NOT_STARTED/STARTING/READY/FAILED`; a failed affinity setup fails the run instead of hanging. Barriers plus startup states cost +1.5 to 3.5 ns at P50-P99 (development A/B, not stored).
+- **Population**: new orders only; cancels are in the raw file (`is_cancel=1`) but excluded from the headline. Offered load is 85,000 new orders/s, not capacity; saturation was not measured.
 
 ## Statistics
 
 | Item | Definition |
 |---|---|
-| Percentile | Sort the trial's samples, take index `floor(p/100 * N)` clamped to `N-1`. No interpolation. |
-| Reported figure | Median across trials of each per-trial percentile. Spread is max minus min of per-trial P99.9. |
-| STABLE label | CV of per-trial P99 and P99.9 both below 15% (descriptive, not a test). Fewer than 5 trials is flagged `[SMOKETEST]`, never citable. |
-| P99.99 | Not in the CSVs (P50, P90, P99, P99.9, max, mean only). Recomputed from raw samples; indicative only, about 9 samples per trial lie above it. |
+| Percentile | Sort the trial's samples, take index `floor(p/100 * N)` clamped to `N-1`; no interpolation |
+| Reported figure | Median across the 5 trials of each per-trial percentile (`include/hydra/stats.hpp`) |
+| STABLE | CV of per-trial P99 and P99.9 both below 15% (descriptive). Under 5 trials: `[SMOKETEST]`, not citable |
+| P99.99 | Not in the CSVs; recomputed from raw samples; indicative only (about 9 samples per trial lie above it) |
 
 ### Recomputing a percentile from raw samples
 
 ```python
 import csv, statistics
 t = {}
-for r in csv.DictReader(open("results/<hash>/price_time.raw.csv", newline="")):
+for r in csv.DictReader(open("results_new/7c2fd2c/price_time.raw.csv", newline="")):
     if r["is_cancel"] != "1" and r["is_replace"] != "1":
         t.setdefault(int(r["trial"]), []).append(int(r["end_to_end_ns"]))
 pct = lambda v, p: sorted(v)[min(int(p / 100 * len(v)), len(v) - 1)]
@@ -58,7 +54,7 @@ for p in (99.9, 99.99):
     print(p, statistics.median(pct(v, p) for v in t.values()))
 ```
 
-For the `98a597b` price-time file this gives 1,850 ns and 8,282 ns. For cancel latency keep `is_cancel == "1"`.
+This prints 1,158 (P99.9) and 1,707 (P99.99, indicative) ns for price-time. For cancel latency keep `is_cancel == "1"`. Trial P99.9 values vary (1,478 / 1,144 / 1,122 / 1,208 / 1,158; CV 12%).
 
 ## Validity gate
 
@@ -66,47 +62,48 @@ For the `98a597b` price-time file this gives 1,850 ns and 8,282 ns. For cancel l
 |---|---|---|
 | Both cores in `/sys/devices/system/cpu/isolated`, `performance` governor, no SMT sibling | Preflight | Refuse to run |
 | Dropped event, arena fallback to the heap, or order/level pool exhaustion | After trials | Invalid |
-| Clock fell back to `steady_clock`; or `state_hash` differs between trials | After trials | Invalid |
+| Clock fell back to `steady_clock`; `state_hash` differs between trials | After trials | Invalid |
 | Dirty tree at build time without `--allow-dirty` | After trials | Invalid |
 
-Preflight is per core. It does not check `nohz_full`, `rcu_nocbs`, IRQ placement, NUMA binding or background
-load; the operator does (setup in [ALL_COMMANDS](ALL_COMMANDS.md)).
-
-**Determinism fingerprint.** `state_hash` folds logical counters and each fill's maker, taker, price and quantity
-(no timing). Equal hashes across fresh-state trials show the replay is repeatable. It is not a correctness oracle:
-summary CSVs report `reference_validation_status=NOT_RUN`.
+Preflight does not check `nohz_full`, `rcu_nocbs`, IRQ placement, NUMA binding, background load, or the mask the threads actually run on ([ALL_COMMANDS](ALL_COMMANDS.md)). `state_hash` folds each fill's maker, taker, price and quantity: equal across trials means the replay is repeatable. It is a determinism fingerprint, not a correctness oracle; `reference_validation_status` is `NOT_RUN`.
 
 ## Ablation verdicts
 
-`scripts/run_ablations.sh` runs a baseline and four variants under both modes (10 runs) and compares each variant's
-median P99 and P99.9 with the baseline from the same session, mirroring `hydra::stats::classify_ablation` (the
-reference for verdict logic). With `delta = ablated - baseline`, the first rule that applies wins:
+`scripts/run_ablations.sh` runs a baseline and four variants in both policies. A verdict compares per-trial P99.9 (5 per arm) of a variant with the baseline from the same session. `scripts/ablation_verdict.py` and `hydra::stats::classify_ablation` implement one rule; both run the same 53-case fixture `tests/verdict_cases.json` (`tests/test_phase10_verdict.cpp`, `tests/test_verdict_parity.py`). First match wins:
 
 | Verdict | Condition |
 |---|---|
-| INVALID | A run is missing, invalid, nondeterministic, dropped events, or exhausted a resource |
-| REGRESSION | Both deltas negative |
-| PROVEN | `delta_P99 > max(CV_base, CV_abl) * base_P99` (CV of per-trial P99) and `delta_P99.9 > 0` |
-| NOT PROVEN | Both deltas nonpositive |
-| INCONCLUSIVE | Anything else |
+| INVALID | Failed validity gate, empty arm, or baseline median <= 0 |
+| INCONCLUSIVE | Fewer than 5 trials in either arm |
+| NO_MEASURABLE_EFFECT | Median ablated P99.9 within +-10% of baseline (integer-percent test) |
+| PROVEN | Median ablated >= 110% of baseline AND every ablated trial above every baseline trial (chance 1/252, 5 v 5) |
+| ABLATED_FASTER | Mirror of PROVEN (formerly `REGRESSION`) |
+| INCONCLUSIVE | A material median gap whose per-trial ranges overlap |
 
-Worked example (`98a597b`, price-time, unpinned): P99.9 rises 1,762 to 9,216 ns (5.23x) but P99 falls 1,222 to
-1,098 ns, so INCONCLUSIVE; pro-rata is PROVEN. Verdicts use the ablation-baseline run, never the canonical run;
-the flat-layout variant replays its own dataset. Results: [README](README.md), [DESIGN](DESIGN.md).
+Worked example (final run, price-time, baseline trials 1,126-1,224, median 1,170): the mutex queue's trials are 6,432-6,889, all above 1,224, median 5.63x: PROVEN. The unpinned build's median 1,452 is 1.24x (material) but one trial, 1,219, is below the baseline maximum: INCONCLUSIVE. Pro-rata unpinned (median 1,996 vs 2,500, every trial below 2,359) is ABLATED_FASTER.
+
+Limits: 5 trials per arm; the 10% band is a convention; NO_MEASURABLE_EFFECT means not detected, not equal; one outlier trial can hide behind an in-band median (flat layout, price-time: trials 2,598 / 1,977 / 1,233 / 1,221 / 1,236, median in band); one host, one session. The earlier rule gated on P99 and a CV noise floor, hid a 40x tail penalty and flipped on noise, so it was replaced. Verdicts use the ablation's own baseline run (P99.9 1,170), never the canonical run (1,158); the flat-layout variant replays its own dataset.
 
 ## Output files
 
-| File | Contents |
-|---|---|
-| `X.csv` | One row per trial: percentiles, throughput, workload and resource counters, `state_hash`, validity, smoketest flag |
-| `X.raw.csv` | One row per measured event: the timing fields above, fill counts, `is_cancel`, `is_replace` |
-| `X.meta.json` | Commit, dirty flags, mode, dataset path and hash, CPU, clock source, compiler, host snapshot, validity and reason |
-| `ablation_summary.{csv,md}` | Per-variant medians, ratios and verdicts (ablation suite only) |
+For `--output X`: `X.csv` (one row per trial), `X.raw.csv` (one row per measured event: timing fields, fill counts, `is_cancel`, `is_replace`), `X.meta.json` (commit, dirty flags, dataset hash, CPU, clock, validity). Contents of `results_new/7c2fd2c/` (run logs are one level up):
 
-`X` is the `--output` path. `results/` is gitignored; per-trial values: [CONSOLIDATED_BENCHMARK_RESULTS](CONSOLIDATED_BENCHMARK_RESULTS.md).
+| Files | Contents |
+|---|---|
+| `price_time.*`, `pro_rata.*` (`.csv`, `.raw.csv`, `.meta.json`, `.console.txt`) | Canonical runs and console reports |
+| `ablation_<variant>_<mode>.*` | `baseline`, `mutex_queue`, `unpinned`, `malloc_pool`, `flat_layout`, both modes |
+| `ablation_summary.{csv,md}`, `ablation_raw.jsonl` | Verdict table, medians, per-trial P99.9 inputs |
+| `ablation4_flat.bin` | The flat-layout variant's own 88-byte-`Order` dataset |
+
+Gitignored and regenerated by [ALL_COMMANDS](ALL_COMMANDS.md). The frozen `results/` holds an older run (`98a597b`).
 
 ## Threats to validity
 
-- Figures predate the matching fixes; no tuned-host re-measure of the current engine exists.
-- In-process latency on synthetic data (no network or exchange path); no independent reference matcher.
-- One x86-64 host (hybrid CPU), one session, 5 trials per run; P99.99 is indicative.
+- **Harness cost in the window**: each fill callback costs 37.4 ns (two serialized stamps plus digest fold); at about 18 fills in a P99.9 pro-rata event that is roughly 22% of the figure. Three or four stamps per event also sit inside the window. Neither is subtracted.
+- **One host, one session, 5 trials**: no tuned-host repeat on another day. Tails of the same binary move 10-20% between sessions; only same-session interleaved comparisons resolve 1-5%.
+- **Synthetic data**: about 80% of generated cancels target already-filled or cancelled IDs (only ~3% of events are real cancels), and the book grows from ~1,200 to ~14,300 resting orders without reaching steady state.
+- **No correctness oracle**: reference validation is `NOT_RUN`; there is no independent matcher in the repo.
+- **`queue_residence_ns` wrap rows**: 56 of 1,000,000 raw rows (13 price-time, 43 pro-rata) have a pop attempt that began before the producer stamp, so the unsigned subtraction wraps. `end_to_end_ns` is unaffected; clamp first.
+- **Producer lateness is not charged** (pacing above).
+- **Development A/B evidence** for the allocator and ring-slot changes (8 interleaved paired rounds) is not stored in the repo; the final run's ablations are.
+- **CI** (`.github/workflows/format.yml`) only checks formatting (clang-format, black); it does not run tests.
