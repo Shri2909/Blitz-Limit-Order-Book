@@ -1205,7 +1205,7 @@ namespace hydra
             std::printf("\nMeasurement\n%s", kRule);
             std::printf("Metric              : Matching-engine processing latency (end-to-end, "
                         "orders)\n"
-                        "Start               : replay_phase()'s intended-arrival timestamp (t1)\n"
+                        "Start               : producer timestamp after the pacing spin-wait (t1)\n"
                         "End                 : matching_thread_fn's post-match() timestamp "
                         "(t_match_end)\n"
                         "Clock               : rdtscp, calibrated ns_per_cycle (clock.hpp)\n"

@@ -1,5 +1,5 @@
 {
-  "description": "Truth table for the ablation verdict rule on per-trial P99.9 (ns). Consumed by tests/test_phase10_verdict.cpp and tests/test_verdict_parity.py. baseline/ablated are per-trial P99.9; *_fail names a validity gate that failed in that arm (valid, determinism, dropped_events, arena_fallback, pool_exhaustion). Real-data expectations are transcribed from the verdict audit, not computed by the classifiers.",
+  "description": "Truth table for the ablation verdict rule on per-trial P99.9 (ns). Consumed by tests/test_phase10_verdict.cpp and tests/test_verdict_parity.py. baseline/ablated are per-trial P99.9; *_fail names a validity gate that failed in that arm (valid, determinism, dropped_events, arena_fallback, pool_exhaustion). Real-data expectations are transcribed by hand from the stored ablation summaries, not computed by the classifiers.",
   "min_effect_percent": 10,
   "min_trials": 5,
   "cases": [
