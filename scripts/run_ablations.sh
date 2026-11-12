@@ -79,6 +79,7 @@ pool = sum(int(r["pool_exhaustion_count"]) for r in rows)
 valid = all(r["valid"] == "1" for r in rows)
 determinism_ok = all(r["determinism_status"] == "PASS" for r in rows)
 
+p999_trials = list(p999s)  # per-trial P99.9 in trial order, input of the verdict rule
 p99s.sort()
 p999s.sort()
 n = len(p99s)
@@ -94,7 +95,7 @@ print(json.dumps({
     "median_p99_ns": median_p99, "median_p999_ns": median_p999,
     "cv_p99": cv_p99, "dropped_events": dropped, "arena_fallback_count": arena,
     "pool_exhaustion_count": pool, "valid": valid, "determinism_ok": determinism_ok,
-    "trials": n,
+    "trials": n, "p999_trials": p999_trials,
 }))
 PYEOF
 }
@@ -128,10 +129,13 @@ done
 SUMMARY_CSV="$OUT_DIR/ablation_summary.csv"
 SUMMARY_MD="$OUT_DIR/ablation_summary.md"
 
-python3 - "$RAW_JSONL" "$SUMMARY_CSV" "$SUMMARY_MD" <<'PYEOF'
+python3 - "$RAW_JSONL" "$SUMMARY_CSV" "$SUMMARY_MD" "$SCRIPT_DIR" <<'PYEOF'
 import csv, json, sys
 
-raw_path, csv_path, md_path = sys.argv[1:4]
+raw_path, csv_path, md_path, script_dir = sys.argv[1:5]
+sys.path.insert(0, script_dir)
+# Verdict rule shared with tests/test_verdict_parity.py; mirrors hydra::stats::classify_ablation().
+from ablation_verdict import RULE_SUMMARY, METRIC, classify, verdict_text
 rows = {}
 with open(raw_path) as f:
     for line in f:
@@ -148,39 +152,6 @@ pairs = [
     ("flat_layout", "Cache-line hot/cold split", "Flat, unseparated Order layout"),
 ]
 
-# Mirrors hydra::stats::classify_ablation().
-def classify(baseline, ablated):
-    if baseline is None or ablated is None:
-        return "INVALID"
-    if not baseline.get("ok") or not ablated.get("ok"):
-        return "INVALID"
-    if not baseline["valid"] or not ablated["valid"]:
-        return "INVALID"
-    if not baseline["determinism_ok"] or not ablated["determinism_ok"]:
-        return "INVALID"
-    if baseline["dropped_events"] != 0 or ablated["dropped_events"] != 0:
-        return "INVALID"
-    if baseline["arena_fallback_count"] != 0 or ablated["arena_fallback_count"] != 0:
-        return "INVALID"
-    if baseline["pool_exhaustion_count"] != 0 or ablated["pool_exhaustion_count"] != 0:
-        return "INVALID"
-
-    delta_p99 = ablated["median_p99_ns"] - baseline["median_p99_ns"]
-    delta_p999 = ablated["median_p999_ns"] - baseline["median_p999_ns"]
-
-    if delta_p99 < 0 and delta_p999 < 0:
-        return "REGRESSION"
-
-    noise_floor_cv = max(baseline["cv_p99"], ablated["cv_p99"])
-    noise_floor_ns = noise_floor_cv * baseline["median_p99_ns"]
-
-    if delta_p99 > noise_floor_ns and delta_p999 > 0:
-        return "PROVEN"
-    if delta_p99 <= 0 and delta_p999 <= 0:
-        return "NOT PROVEN"
-    return "INCONCLUSIVE"
-
-
 all_csv_rows = []
 all_md_sections = []
 
@@ -188,12 +159,13 @@ for mode in ("price_time", "pro_rata"):
     baseline = rows.get(("baseline", mode))
     md_lines = [
         f"\n### Matching policy: {mode}\n",
-        "| Design decision | Baseline P99.9 (median) | Rejected alternative | P99.9 delta | Verdict |",
+        "| Design decision | Baseline P99.9 (median) | Rejected alternative | P99.9 ratio (ablated / baseline) | Verdict |",
         "|---|---|---|---|---|",
     ]
     for key, decision, alt_name in pairs:
         row = rows.get((key, mode))
-        verdict = classify(baseline, row)
+        code = classify(baseline, row)
+        verdict = verdict_text(code)
         if baseline and baseline.get("ok") and row and row.get("ok"):
             b999 = baseline["median_p999_ns"]
             a999 = row["median_p999_ns"]
@@ -201,20 +173,21 @@ for mode in ("price_time", "pro_rata"):
             all_csv_rows.append([mode, decision, f"{baseline['median_p99_ns']:.1f}",
                                   f"{b999:.1f}", alt_name, f"{row['median_p99_ns']:.1f}",
                                   f"{a999:.1f}", f"{delta_x:.2f}", baseline["dropped_events"],
-                                  row["dropped_events"], verdict])
+                                  row["dropped_events"], code, METRIC if code != "INVALID" else ""])
             md_lines.append(f"| {decision} | **{b999:.1f} ns** | {alt_name}: {a999:.1f} ns | "
-                             f"**~{delta_x:.2f}x worse** | {verdict} |")
+                             f"**{delta_x:.2f}x** | {verdict} |")
         else:
             reason = (row or {}).get("reason", "missing/failed run")
-            all_csv_rows.append([mode, decision, "", "", alt_name, "", "", "", "", "", "INVALID"])
+            all_csv_rows.append([mode, decision, "", "", alt_name, "", "", "", "", "", "INVALID", ""])
             md_lines.append(f"| {decision} | n/a | {alt_name}: FAILED ({reason}) | n/a | INVALID |")
+    md_lines.append(f"\n*Verdict rule ({METRIC} per trial): {RULE_SUMMARY}*")
     all_md_sections.append("\n".join(md_lines))
 
 with open(csv_path, "w", newline="") as f:
     w = csv.writer(f)
     w.writerow(["matching_mode", "design_decision", "baseline_p99_ns", "baseline_p99_9_ns",
                 "ablated_label", "ablated_p99_ns", "ablated_p99_9_ns", "p99_9_delta_x",
-                "dropped_events_baseline", "dropped_events_ablated", "verdict"])
+                "dropped_events_baseline", "dropped_events_ablated", "verdict", "verdict_metric"])
     w.writerows(all_csv_rows)
 
 with open(md_path, "w") as f:

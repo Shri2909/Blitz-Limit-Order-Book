@@ -105,6 +105,10 @@ blitz_add_test(phase6_matcher SANITIZE address,undefined)
 blitz_add_test(phase7_pipeline SOURCES src/pipeline.cpp)
 blitz_add_test(phase8_benchmark SOURCES src/benchmark.cpp src/pipeline.cpp)
 blitz_add_test(phase9_suite SANITIZE address,undefined)
+blitz_add_test(phase10_verdict)
+# The verdict truth table is shared with tests/test_verdict_parity.py (Python classifier).
+target_compile_definitions(blitz_lob_test_phase10_verdict PRIVATE
+    "BLITZ_VERDICT_CASES_PATH=\"${CMAKE_CURRENT_SOURCE_DIR}/tests/verdict_cases.json\"")
 
 # --- Ablation variants (EXCLUDE_FROM_ALL; built by scripts/run_ablations.sh) --
 # Each variant shadows one header via include order. flat_layout also changes
