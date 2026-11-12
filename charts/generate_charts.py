@@ -1,21 +1,25 @@
 #!/usr/bin/env python3
-"""Generate the five README charts from benchmark evidence in results/<commit>/.
+"""Generate the five README charts from benchmark evidence on disk.
 
 Usage:
-    python3 charts/generate_charts.py --commit 98a597b
-    python3 charts/generate_charts.py --results-dir results/<commit>
+    python3 charts/generate_charts.py \
+        --results-dir results_new/7c2fd2c \
+        --baseline-dir results/98a597b \
+        --ctest-log build/Testing/Temporary/LastTest.log
 
-Benchmark values come from the result CSVs. Test status comes from the latest local
-CTest log and shows as unavailable when no usable log exists. The layout chart is
-transcribed from types.hpp and must be updated when that layout changes.
+Every benchmark number comes from the result CSVs in --results-dir (the run of record);
+chart 03 also reads --baseline-dir (an earlier run, for the before/after comparison).
+Test status comes from the CTest log given with --ctest-log and shows N/A without one.
+The layout chart is transcribed from include/hydra/types.hpp and must be updated when
+that struct changes (tests/test_chart_reporting.py checks the transcription is gap-free).
 """
 
 import argparse
 import csv
 import re
 import statistics
-import subprocess
 import sys
+import textwrap
 from pathlib import Path
 
 import matplotlib
@@ -23,19 +27,31 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import matplotlib.ticker as mticker
+from matplotlib.patches import Polygon
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-CHARTS_DIR = Path(__file__).resolve().parent
+DEFAULT_RESULTS_DIR = REPO_ROOT / "results_new" / "7c2fd2c"
+DEFAULT_BASELINE_DIR = REPO_ROOT / "results" / "98a597b"
+DEFAULT_OUT_DIR = Path(__file__).resolve().parent
 
-SERIES_1 = "#2a78d6"  # baseline / price-time / pinned
-SERIES_2 = "#eb6834"  # rejected alternative / pro-rata / unpinned
-STATUS_GOOD = "#0ca30c"
+SERIES_1 = "#2a78d6"  # price-time / baseline
+SERIES_2 = "#eb6834"  # pro-rata / ablated variant
+STATUS_GOOD = "#0a7d0a"
 STATUS_WARN = "#8a6200"
 INK = "#0b0b0b"
 INK_SECONDARY = "#52514e"
-INK_MUTED = "#898781"
+INK_MUTED = "#6e6c66"
 GRID = "#e1e0d9"
 SURFACE = "#fcfcfb"
+COLOR_EARLIER = "#a3a199"  # the earlier run in the before/after chart
+
+PERCENTILE_COLUMNS = {
+    "P50": "p50_ns_per_order",
+    "P90": "p90_ns_per_order",
+    "P99": "p99_ns_per_order",
+    "P99.9": "p999_ns_per_order",
+}
+MODES = (("Price-time", "price_time", SERIES_1), ("Pro-rata", "pro_rata", SERIES_2))
 
 plt.rcParams.update(
     {
@@ -56,14 +72,13 @@ plt.rcParams.update(
 # -- Evidence loading ---------------------------------------------------------
 
 
-def git_short_hash() -> str:
-    return subprocess.run(
-        ["git", "rev-parse", "--short", "HEAD"],
-        cwd=REPO_ROOT,
-        capture_output=True,
-        text=True,
-        check=True,
-    ).stdout.strip()
+def display_path(path: Path) -> str:
+    """Repo-relative path with a trailing slash for directories, for footers."""
+    try:
+        text = str(path.resolve().relative_to(REPO_ROOT))
+    except ValueError:
+        text = str(path)
+    return text + "/" if path.is_dir() else text
 
 
 def read_csv_rows(path: Path) -> list:
@@ -71,26 +86,25 @@ def read_csv_rows(path: Path) -> list:
         return list(csv.DictReader(f))
 
 
+def run_commit(results_dir: Path) -> str:
+    """Commit hash recorded in the run's own canonical CSV (not the current git HEAD)."""
+    return read_csv_rows(results_dir / "price_time.csv")[0]["commit_hash"]
+
+
 def median_column(results_dir: Path, filename: str, column: str) -> float:
     return statistics.median(float(r[column]) for r in read_csv_rows(results_dir / filename))
 
 
 def median_percentiles(results_dir: Path, mode: str) -> dict:
-    """Median across trials of P50/P90/P99/P99.9 from <mode>.csv."""
-    columns = {
-        "P50": "p50_ns_per_order",
-        "P90": "p90_ns_per_order",
-        "P99": "p99_ns_per_order",
-        "P99.9": "p999_ns_per_order",
-    }
+    """Median across trials of the per-trial P50/P90/P99/P99.9 (new orders only)."""
     return {
         label: median_column(results_dir, f"{mode}.csv", column)
-        for label, column in columns.items()
+        for label, column in PERCENTILE_COLUMNS.items()
     }
 
 
-def median_p9999(results_dir: Path, mode: str) -> float:
-    """Median across trials of P99.99; the summary CSV stops at P99.9, so use the raw samples."""
+def median_p9999(results_dir: Path, mode: str) -> tuple:
+    """(median across trials of P99.99, samples per trial); the summary CSV stops at P99.9."""
     trials: dict[int, list[int]] = {}
     with (results_dir / f"{mode}.raw.csv").open() as f:
         for row in csv.DictReader(f):
@@ -102,11 +116,14 @@ def median_p9999(results_dir: Path, mode: str) -> float:
         ordered = sorted(values)
         return ordered[min(int(99.99 / 100.0 * len(ordered)), len(ordered) - 1)]
 
-    return statistics.median(p9999(values) for values in trials.values())
+    value = statistics.median(p9999(values) for values in trials.values())
+    return value, min(len(values) for values in trials.values())
 
 
-def trial_p999_series(results_dir: Path, filename: str) -> list:
-    return sorted(float(r["p999_ns_per_order"]) for r in read_csv_rows(results_dir / filename))
+def trial_p999_series(results_dir: Path, variant: str, mode: str = "price_time") -> list:
+    """Per-trial P99.9 of one ablation arm, in trial order."""
+    rows = read_csv_rows(results_dir / f"ablation_{variant}_{mode}.csv")
+    return [float(r["p999_ns_per_order"]) for r in rows]
 
 
 def aggregate_dropped_events(results_dir: Path) -> tuple:
@@ -114,7 +131,7 @@ def aggregate_dropped_events(results_dir: Path) -> tuple:
     total_trials = 0
     total_dropped = 0
     for csv_path in sorted(results_dir.glob("*.csv")):
-        if csv_path.name == "ablation_summary.csv":
+        if csv_path.name.endswith(".raw.csv") or csv_path.name == "ablation_summary.csv":
             continue
         with csv_path.open() as f:
             reader = csv.DictReader(f)
@@ -127,10 +144,8 @@ def aggregate_dropped_events(results_dir: Path) -> tuple:
 
 
 def parse_ctest_results(log_path: Path | None = None):
-    """Return (passed, total) from a usable local CTest log, or None."""
-    if log_path is None:
-        log_path = REPO_ROOT / "build" / "Testing" / "Temporary" / "LastTest.log"
-    if not log_path.is_file():
+    """Return (passed, total) from a usable CTest LastTest.log, or None."""
+    if log_path is None or not log_path.is_file():
         return None
     text = log_path.read_text(errors="ignore")
     if "Unable to find executable:" in text or re.search(r'^Command: ""$', text, re.M):
@@ -144,9 +159,61 @@ def parse_ctest_results(log_path: Path | None = None):
 def test_status_tile(test_result):
     """Describe recorded test results without inferring sanitizer coverage."""
     if test_result is None:
-        return "N/A", "test status unavailable", "run ctest to record local results"
+        return "N/A", "test status unavailable", "no CTest log given (--ctest-log)"
     passed, total = test_result
-    return f"{passed}/{total}", "test suites passing", "latest local CTest run"
+    return f"{passed}/{total}", "ctest targets passing", "local CTest run, Release build"
+
+
+# -- Ablation verdict vocabulary ----------------------------------------------
+
+# icon, colour, short human description of what the verdict means
+VERDICT_STYLE = {
+    "PROVEN": ("✓", STATUS_GOOD),
+    "NO_MEASURABLE_EFFECT": ("≈", INK_SECONDARY),
+    "INCONCLUSIVE": ("?", STATUS_WARN),
+    "ABLATED_FASTER": ("↓", STATUS_WARN),
+    "INVALID": ("✗", STATUS_WARN),
+}
+# Names used by earlier result sets (the earlier rule called the mirror verdict REGRESSION).
+LEGACY_VERDICTS = {"REGRESSION": "ABLATED_FASTER"}
+
+# CSV design_decision -> (ablation variant file stem, chart row title)
+DECISIONS = {
+    "Lock-free SPSC queue": ("mutex_queue", "Lock-free SPSC queue"),
+    "Core pinning + isolation": (
+        "unpinned",
+        "Core isolation + pinning vs unpinned (shared desktop)",
+    ),
+    "Fixed-slab object pooling": ("malloc_pool", "Fixed-slab object pooling"),
+    "Cache-line hot/cold split": ("flat_layout", "Cache-line hot/cold split"),
+}
+
+
+def normalize_verdict(verdict: str) -> str:
+    verdict = LEGACY_VERDICTS.get(verdict, verdict)
+    if verdict not in VERDICT_STYLE:
+        raise ValueError(f"unknown ablation verdict {verdict!r}")
+    return verdict
+
+
+def trial_range_text(trials: list) -> str:
+    return f"per-trial range {fmt(min(trials))}\u2013{fmt(max(trials))} ns"
+
+
+def ablated_label(verdict: str, ablated: float, delta_x: float, trials: list) -> tuple:
+    """Two bar-label lines for the ablated arm; 'x worse' is only claimed for PROVEN."""
+    verdict = normalize_verdict(verdict)
+    value = f"{fmt(ablated)} ns"
+    spread = trial_range_text(trials)
+    if verdict == "PROVEN":
+        return f"{value}  ({delta_x:.2f}x worse)", spread
+    if verdict == "NO_MEASURABLE_EFFECT":
+        return f"{value}  (no measurable effect)", spread
+    if verdict == "ABLATED_FASTER":
+        return f"{value}  (ablated variant was faster)", spread
+    if verdict == "INCONCLUSIVE":
+        return f"{value}  (median; inconclusive)", f"tail highly load dependent: {spread}"
+    return f"{value}  (invalid run)", spread
 
 
 # -- Shared plotting helpers --------------------------------------------------
@@ -160,19 +227,28 @@ def new_figure(width, height):
     return plt.subplots(figsize=(width, height), dpi=200)
 
 
-def finish(fig, out_path: Path, rect):
-    fig.tight_layout(rect=rect)
-    fig.savefig(out_path)
+def finish(fig, out_path: Path, rect=None):
+    if rect is not None:
+        fig.tight_layout(rect=rect)
+    fig.savefig(out_path, metadata={"Software": None})
     plt.close(fig)
 
 
-def add_headline(fig, ax, title, subtitle):
-    fig.suptitle(title, x=0.06, ha="left", fontsize=16, fontweight="bold", color=INK)
-    ax.set_title(subtitle, loc="left", fontsize=10.5, color=INK_SECONDARY, pad=14)
+def add_headline(fig, title, subtitle, x=0.06, y=0.975, sub_y=None):
+    """Left-aligned title plus a one-line (or two-line) subtitle under it, in figure space."""
+    height = fig.get_figheight()
+    fig.text(x, y, title, ha="left", va="top", fontsize=16, fontweight="bold", color=INK)
+    sub_y = sub_y if sub_y is not None else y - 0.45 / height
+    fig.text(x, sub_y, subtitle, ha="left", va="top", fontsize=10.5, color=INK_SECONDARY)
 
 
-def add_footnote(fig, text, y=0.01):
-    fig.text(0.06, y, text, fontsize=8.5, color=INK_MUTED)
+def add_footnotes(fig, lines, x=0.06, size=8.5):
+    """Stack footnote lines from the bottom edge up; return the top of the stack (fig coords)."""
+    height = fig.get_figheight()
+    step = size * 1.55 / 72 / height
+    for k, line in enumerate(reversed(lines)):
+        fig.text(x, 0.012 + k * step, line, fontsize=size, color=INK_MUTED, va="bottom")
+    return 0.012 + len(lines) * step + 0.008
 
 
 def style_axes(ax, grid_axis, hidden_spines):
@@ -192,19 +268,19 @@ def comma_format(axis):
 # -- Charts -------------------------------------------------------------------
 
 
-def chart_hero_stats(results_dir: Path, commit: str, out_path: Path):
+def chart_hero_stats(results_dir: Path, commit: str, out_path: Path, ctest_log: Path | None = None):
     p999 = median_percentiles(results_dir, "price_time")["P99.9"]
-    throughput = median_column(results_dir, "price_time.csv", "throughput_orders_per_second")
+    replay_rate = median_column(results_dir, "price_time.csv", "throughput_orders_per_second")
     total_trials, total_dropped = aggregate_dropped_events(results_dir)
-    test_result = parse_ctest_results()
+    test_result = parse_ctest_results(ctest_log)
     tests_passed = test_result is not None and test_result[0] == test_result[1]
 
     tiles = [
         (f"{fmt(p999)} ns", "P99.9 tail latency", "price-time, median of 5 trials"),
         (
-            f"{throughput / 1000:.0f}K/s",
-            "sustained throughput",
-            f"{fmt(throughput)} orders/sec, single core",
+            f"{fmt(round(replay_rate, -3))}/s",
+            "offered load (paced replay)",
+            "orders per second; capacity not measured",
         ),
         test_status_tile(test_result),
         (f"{total_dropped}", "dropped events", f"across all {total_trials} measured trials"),
@@ -242,112 +318,237 @@ def chart_hero_stats(results_dir: Path, commit: str, out_path: Path):
             ax.axvline(i, ymin=0.08, ymax=0.92, color=GRID, linewidth=1)
 
     fig.text(
-        0.01, 0.01, f"Benchmark commit {commit} · results/{commit}/", fontsize=7.5, color=INK_MUTED
+        0.01,
+        0.01,
+        f"commit {commit}  ·  {display_path(results_dir)}  ·  "
+        "one host, synthetic dataset, in-process latency",
+        fontsize=7.5,
+        color=INK_MUTED,
     )
     finish(fig, out_path, rect=(0, 0.05, 1, 1))
 
 
+def clip_cap(values: list, factor: float = 4.0) -> float:
+    """Longest bar length to draw: the maximum, unless it dwarfs the runner-up by `factor`."""
+    ordered = sorted(values)
+    if len(ordered) > 1 and ordered[-1] > factor * ordered[-2]:
+        return ordered[-2] * 1.25
+    return ordered[-1]
+
+
+def draw_break(ax, x, y, height):
+    """Slanted surface-coloured stripe across a bar marking that the bar is cut short."""
+    half = height / 2
+    width = ax.get_xlim()[1] * 0.006
+    slant = width * 2
+    ax.add_patch(
+        Polygon(
+            [
+                (x - width + slant, y + half),
+                (x + width + slant, y + half),
+                (x + width - slant, y - half),
+                (x - width - slant, y - half),
+            ],
+            closed=True,
+            facecolor=SURFACE,
+            edgecolor="none",
+            zorder=6,
+        )
+    )
+
+
 def chart_ablation_impact(results_dir: Path, commit: str, out_path: Path):
-    rows = [
-        r
+    rows_by_decision = {
+        r["design_decision"]: r
         for r in read_csv_rows(results_dir / "ablation_summary.csv")
         if r["matching_mode"] == "price_time"
+    }
+    missing = [name for name in DECISIONS if name not in rows_by_decision]
+    if missing:
+        raise RuntimeError(f"ablation_summary.csv has no price_time row for {missing}")
+    rows = [rows_by_decision[name] for name in DECISIONS]
+
+    baseline_trials = trial_p999_series(results_dir, "baseline")
+    bar_values = [float(r["baseline_p99_9_ns"]) for r in rows] + [
+        float(r["ablated_p99_9_ns"]) for r in rows
     ]
-    if not rows:
-        raise RuntimeError("no price_time rows in ablation_summary.csv")
+    cap = clip_cap(bar_values)
+    xmax = cap * 1.5
 
-    fig, ax = new_figure(10, 6)
-    bar_h = 0.32
-    max_val = max(float(r["ablated_p99_9_ns"]) for r in rows) * 1.18
+    fig = plt.figure(figsize=(12.4, 8.4), dpi=200)
+    footnotes = [
+        f"Baseline here is the ablation suite's own run (median P99.9 "
+        f"{fmt(float(rows[0]['baseline_p99_9_ns']))} ns); the run of record in chart 00 and 02 "
+        f"is a separate run of the same binary ({fmt(median_percentiles(results_dir, 'price_time')['P99.9'])} ns).",
+        "Verdicts use per-trial P99.9, 5 trials per arm. PROVEN: median >= 110% of baseline and every ablated trial "
+        "above every baseline trial.",
+        "NO_MEASURABLE_EFFECT: median within 10% of baseline (not detected, not proven equal).",
+        "Pinning row: stock unpinned threads on a busy desktop vs isolated pinned cores. It measures core isolation plus "
+        "placement luck, not pinning alone.",
+        "Pro-rata, same suite: " + pro_rata_summary(results_dir),
+        f"commit {commit}  ·  {display_path(results_dir / 'ablation_summary.csv')}  ·  "
+        "one host, one session",
+    ]
+    bottom = add_footnotes(fig, footnotes, x=0.03)
+    ax = fig.add_axes((0.29, bottom + 0.075, 0.45, 0.75 - bottom))
 
+    bar_h = 0.26
+    ax.set_xlim(0, xmax)
     for i, r in enumerate(rows):
-        current = float(r["baseline_p99_9_ns"])
-        rejected = float(r["ablated_p99_9_ns"])
-        y_current = i + bar_h / 2 + 0.02
-        y_rejected = i - bar_h / 2 - 0.02
+        _, title = DECISIONS[r["design_decision"]]
+        variant = DECISIONS[r["design_decision"]][0]
+        verdict = normalize_verdict(r["verdict"])
+        baseline = float(r["baseline_p99_9_ns"])
+        ablated = float(r["ablated_p99_9_ns"])
+        trials = trial_p999_series(results_dir, variant)
+        y_base = i - bar_h / 2 - 0.02
+        y_abl = i + bar_h / 2 + 0.02
 
-        ax.barh(y_current, current, height=bar_h, color=SERIES_1, zorder=3)
-        ax.barh(y_rejected, rejected, height=bar_h, color=SERIES_2, zorder=3)
+        for value, y, color in ((baseline, y_base, SERIES_1), (ablated, y_abl, SERIES_2)):
+            ax.barh(y, min(value, cap), height=bar_h, color=color, zorder=3)
+            if value > cap:
+                draw_break(ax, cap * 0.95, y, bar_h)
+        # direct labels right of each bar: value, then the per-trial spread
+        gap = xmax * 0.012
         ax.text(
-            current + max_val * 0.01,
-            y_current,
-            f"{fmt(current)} ns",
-            va="center",
-            ha="left",
-            fontsize=9.5,
-            fontweight="bold",
-            color=INK,
-        )
-        ax.text(
-            rejected + max_val * 0.01,
-            y_rejected,
-            f"{fmt(rejected)} ns  ({r['p99_9_delta_x']}x worse)",
+            min(baseline, cap) + gap,
+            y_base,
+            f"{fmt(baseline)} ns\n{trial_range_text(baseline_trials)}",
             va="center",
             ha="left",
             fontsize=9.5,
             color=INK_SECONDARY,
+            linespacing=1.5,
         )
-
-        verdict = r["verdict"]
-        proven = verdict == "PROVEN"
-        ax.annotate(
-            f"{'✓' if proven else '⚠'} {verdict}",
-            xy=(1.0, i),
-            xycoords=("axes fraction", "data"),
-            xytext=(8, 0),
-            textcoords="offset points",
+        line1, line2 = ablated_label(verdict, ablated, float(r["p99_9_delta_x"]), trials)
+        if ablated > cap:
+            line1 = f"{line1}  [bar cut, axis break]"
+        ax.text(
+            min(ablated, cap) + gap,
+            y_abl,
+            f"{line1}\n{line2}",
             va="center",
             ha="left",
             fontsize=9.5,
+            color=INK_SECONDARY,
+            linespacing=1.5,
+        )
+
+        icon, color = VERDICT_STYLE[verdict]
+        ax.annotate(
+            f"{icon} {verdict}",
+            xy=(1.0, i),
+            xycoords=("axes fraction", "data"),
+            xytext=(30, 0),
+            textcoords="offset points",
+            va="center",
+            ha="left",
+            fontsize=10,
             fontweight="bold",
-            color=STATUS_GOOD if proven else STATUS_WARN,
+            color=color,
+            annotation_clip=False,
+        )
+        ax.annotate(
+            textwrap.fill(title, 27),
+            xy=(0, i),
+            xycoords=("axes fraction", "data"),
+            xytext=(-12, 3),
+            textcoords="offset points",
+            va="bottom",
+            ha="right",
+            fontsize=10.5,
+            fontweight="bold",
+            color=INK,
+            annotation_clip=False,
+        )
+        ax.annotate(
+            "vs " + textwrap.fill(r["ablated_label"], 30),
+            xy=(0, i),
+            xycoords=("axes fraction", "data"),
+            xytext=(-12, -3),
+            textcoords="offset points",
+            va="top",
+            ha="right",
+            fontsize=9,
+            color=INK_SECONDARY,
             annotation_clip=False,
         )
 
-    ax.set_yticks(range(len(rows)))
-    ax.set_yticklabels(
-        [r["design_decision"] for r in rows], fontsize=11, fontweight="bold", color=INK
-    )
-    ax.set_xlim(0, max_val)
-    ax.set_xlabel("Median P99.9 tail latency, price-time matching (ns) -- lower is better")
+    ax.set_yticks([])
+    ax.set_xlim(0, xmax)
+    ax.set_ylim(len(rows) - 0.5, -0.5)
+    ax.set_xlabel("Median P99.9 latency, price-time matching (ns). Lower is better.")
     comma_format(ax.xaxis)
     style_axes(ax, "x", hidden_spines=("top", "right", "left"))
-    ax.tick_params(axis="y", length=0)
-    ax.invert_yaxis()
+    ax.annotate(
+        "Verdict",
+        xy=(1.0, 1.0),
+        xycoords=("axes fraction", "axes fraction"),
+        xytext=(30, 4),
+        textcoords="offset points",
+        ha="left",
+        va="bottom",
+        fontsize=9,
+        color=INK_MUTED,
+        annotation_clip=False,
+    )
 
     legend_handles = [
-        plt.Rectangle((0, 0), 1, 1, color=SERIES_1, label="Measured baseline"),
-        plt.Rectangle((0, 0), 1, 1, color=SERIES_2, label="Rejected alternative"),
+        plt.Rectangle((0, 0), 1, 1, color=SERIES_1, label="Baseline (all optimizations on)"),
+        plt.Rectangle((0, 0), 1, 1, color=SERIES_2, label="Ablated variant"),
     ]
-    ax.legend(handles=legend_handles, loc="lower right", frameon=False, fontsize=10)
+    ax.legend(
+        handles=legend_handles,
+        loc="lower left",
+        bbox_to_anchor=(0, 1.0),
+        ncol=2,
+        frameon=False,
+        fontsize=9.5,
+    )
 
     add_headline(
         fig,
-        ax,
-        "Measured impact of each optimization",
-        "Baseline and ablated variants, measured on the same dataset.",
+        "Measured impact of each design decision",
+        "Median P99.9 of 5 trials per arm, same dataset, price-time matching. A verdict says what was measured, not why.",
+        x=0.03,
     )
-    add_footnote(fig, f"Source: results/{commit}/ablation_summary.md  |  benchmark commit {commit}")
-    finish(fig, out_path, rect=(0, 0.03, 0.86, 0.94))
+    finish(fig, out_path)
+
+
+def pro_rata_summary(results_dir: Path) -> str:
+    short = {
+        "Lock-free SPSC queue": "queue",
+        "Core pinning + isolation": "isolation",
+        "Fixed-slab object pooling": "pooling",
+        "Cache-line hot/cold split": "layout",
+    }
+    parts = []
+    for r in read_csv_rows(results_dir / "ablation_summary.csv"):
+        if r["matching_mode"] == "pro_rata":
+            parts.append(
+                f"{short[r['design_decision']]} {float(r['p99_9_delta_x']):.2f}x "
+                f"{normalize_verdict(r['verdict'])}"
+            )
+    return "; ".join(parts)
 
 
 def chart_tail_latency(results_dir: Path, commit: str, out_path: Path):
     labels = ["P50", "P90", "P99", "P99.9", "P99.99"]
     series = []
-    for name, mode, color in (
-        ("Price-time", "price_time", SERIES_1),
-        ("Pro-rata", "pro_rata", SERIES_2),
-    ):
+    samples = 0
+    for name, mode, color in MODES:
         percentiles = median_percentiles(results_dir, mode)
-        percentiles["P99.99"] = median_p9999(results_dir, mode)
+        percentiles["P99.99"], samples = median_p9999(results_dir, mode)
         series.append((name, [percentiles[label] for label in labels], color))
+    per_trial_tail = samples // 10_000 + (samples % 10_000 > 0)
 
-    x = range(len(labels))
-    fig, ax = new_figure(10, 5.6)
-    for name, values, color in series:
+    x = list(range(len(labels)))
+    fig, ax = new_figure(10.4, 6.2)
+    for k, (name, values, color) in enumerate(series):
+        above = k == 1  # pro-rata labels above its line, price-time below
         ax.plot(
-            x,
-            values,
+            x[:-1],
+            values[:-1],
             color=color,
             linewidth=2.4,
             marker="o",
@@ -358,21 +559,37 @@ def chart_tail_latency(results_dir: Path, commit: str, out_path: Path):
             zorder=3,
             label=name,
         )
-    for _, values, _ in series:
-        ax.annotate(
-            f"{fmt(values[-1])} ns",
-            xy=(x[-1], values[-1]),
-            xytext=(0, 12),
-            textcoords="offset points",
-            ha="center",
-            fontsize=10,
-            fontweight="bold",
-            color=INK,
+        ax.plot(x[-2:], values[-2:], color=color, linewidth=1.8, linestyle=(0, (3, 2)), zorder=2)
+        ax.plot(
+            x[-1],
+            values[-1],
+            marker="o",
+            markersize=7,
+            markerfacecolor=SURFACE,
+            markeredgecolor=color,
+            markeredgewidth=1.8,
+            zorder=3,
         )
+        for j, value in enumerate(values):
+            text = f"{fmt(value)} ns" if j < len(values) - 1 else f"{fmt(value)} ns (indicative)"
+            ax.annotate(
+                text,
+                xy=(x[j], value),
+                xytext=(0, 11 if above else -17),
+                textcoords="offset points",
+                ha="center",
+                fontsize=9,
+                fontweight="bold" if j == 3 else "normal",
+                color=INK,
+            )
 
     ax.set_yscale("log")
-    ax.set_xticks(list(x))
+    ax.set_xlim(-0.4, len(labels) - 0.4)
+    ax.set_ylim(200, 8000)
+    ax.set_xticks(x)
     ax.set_xticklabels(labels, fontsize=11)
+    ax.set_yticks([200, 500, 1000, 2000, 5000])
+    ax.yaxis.set_minor_locator(mticker.NullLocator())
     comma_format(ax.yaxis)
     style_axes(ax, "y", hidden_spines=("top", "right"))
     ax.set_ylabel("Latency (ns, log scale)")
@@ -380,70 +597,104 @@ def chart_tail_latency(results_dir: Path, commit: str, out_path: Path):
 
     add_headline(
         fig,
-        ax,
-        "Where the latency actually goes",
-        "Median-of-5-trials latency at each percentile. The gap between P99 and P99.99 is the story --\n"
-        "averages and even P99 hide what the last 0.01% of orders actually experience.",
+        "Where the latency goes",
+        "Median of 5 trials of each per-trial percentile, new orders only. The tail, not the median, is the story.\n"
+        f"P99.99 is indicative only: about {per_trial_tail} samples per trial (hollow marker, dashed).",
+        y=0.975,
     )
-    add_footnote(
+    bottom = add_footnotes(
         fig,
-        f"Source: results/{commit}/price_time.csv, pro_rata.csv (P50-P99.9); P99.99 computed from the "
-        "matching .raw.csv per-sample files.",
+        [
+            f"commit {commit}  ·  {display_path(results_dir)}price_time.csv, pro_rata.csv "
+            "(P50-P99.9); P99.99 from the matching .raw.csv",
+            "End-to-end latency, producer timestamp to end of matching, in-process (no network or market-data path).",
+        ],
     )
-    finish(fig, out_path, rect=(0, 0.04, 1, 0.90))
+    fig.tight_layout(rect=(0, bottom, 1, 0.85))
+    finish(fig, out_path)
 
 
-def chart_scheduler_noise(results_dir: Path, commit: str, out_path: Path):
-    rows = [
-        ("Pinned", trial_p999_series(results_dir, "ablation_baseline_price_time.csv"), SERIES_1),
-        ("Unpinned", trial_p999_series(results_dir, "ablation_unpinned_price_time.csv"), SERIES_2),
-    ]
+def percentage_change(before: float, after: float) -> str:
+    change = round((after - before) / before * 100)
+    return f"{'+' if change > 0 else '−' if change < 0 else ''}{abs(change)}%"
 
-    fig, ax = new_figure(10, 4.6)
-    for i, (_, values, color) in enumerate(rows):
-        y = len(rows) - i
-        ax.hlines(y, min(values), max(values), color=color, alpha=0.35, linewidth=2, zorder=2)
-        ax.scatter(
-            values, [y] * len(values), s=90, color=color, edgecolor=SURFACE, linewidth=1.6, zorder=3
-        )
-        median = statistics.median(values)
-        ax.vlines(median, y - 0.14, y + 0.14, color=INK, linewidth=2, zorder=4)
-        ax.annotate(
-            f"{fmt(max(values))} ns",
-            xy=(max(values), y),
-            xytext=(0, 14),
-            textcoords="offset points",
-            ha="center",
+
+def chart_before_after(
+    results_dir: Path, baseline_dir: Path, commit: str, baseline_commit: str, out_path: Path
+):
+    labels = list(PERCENTILE_COLUMNS)
+    fig, axes = plt.subplots(1, 2, figsize=(11.6, 6.0), dpi=200, sharey=True)
+    top = 0.0
+    panels = []
+    for name, mode, color in MODES:
+        before = median_percentiles(baseline_dir, mode)
+        after = median_percentiles(results_dir, mode)
+        panels.append((name, mode, color, before, after))
+        top = max(top, max(before.values()), max(after.values()))
+
+    width = 0.38
+    for ax, (name, mode, color, before, after) in zip(axes, panels):
+        for k, label in enumerate(labels):
+            ax.bar(k - width / 2 - 0.01, before[label], width, color=COLOR_EARLIER, zorder=3)
+            ax.bar(k + width / 2 + 0.01, after[label], width, color=color, zorder=3)
+            ax.text(
+                k - width / 2 - 0.01,
+                before[label] + top * 0.015,
+                fmt(before[label]),
+                ha="center",
+                va="bottom",
+                fontsize=8.5,
+                color=INK_SECONDARY,
+            )
+            ax.text(
+                k + width / 2 + 0.01,
+                after[label] + top * 0.015,
+                f"{fmt(after[label])}\n{percentage_change(before[label], after[label])}",
+                ha="center",
+                va="bottom",
+                fontsize=8.5,
+                fontweight="bold",
+                color=INK,
+                linespacing=1.4,
+            )
+        ax.set_xticks(range(len(labels)))
+        ax.set_xticklabels(labels, fontsize=11)
+        ax.set_title(name, loc="left", fontsize=12, fontweight="bold", color=INK, pad=10)
+        style_axes(ax, "y", hidden_spines=("top", "right", "left"))
+        ax.tick_params(axis="y", length=0)
+        ax.legend(
+            handles=[
+                plt.Rectangle(
+                    (0, 0), 1, 1, color=COLOR_EARLIER, label=f"Earlier ({baseline_commit})"
+                ),
+                plt.Rectangle((0, 0), 1, 1, color=color, label=f"Final ({commit})"),
+            ],
+            loc="upper left",
+            frameon=False,
             fontsize=9.5,
-            fontweight="bold",
-            color=INK,
         )
-
-    ax.set_xscale("log")
-    ax.set_yticks([2, 1])
-    ax.set_yticklabels(["Pinned", "Unpinned"], fontsize=12, fontweight="bold", color=INK)
-    ax.set_ylim(0.5, 2.6)
-    comma_format(ax.xaxis)
-    ax.set_xlabel(
-        "P99.9 latency per 5-trial run (ns, log scale) -- each dot is one full benchmark run"
-    )
-    style_axes(ax, "x", hidden_spines=("top", "right", "left"))
-    ax.tick_params(axis="y", length=0)
+    axes[0].set_ylim(0, top * 1.22)
+    axes[0].set_ylabel("Median per-trial latency (ns)")
+    comma_format(axes[0].yaxis)
 
     add_headline(
         fig,
-        ax,
-        "Core pinning and trial-to-trial variation",
-        "Pinned threads land in a tight band trial to trial; unpinned threads -- same binary, same dataset --\n"
-        "land wherever the OS scheduler happens to put them that run. Black tick = median.",
+        "Before / after: earlier run vs final run",
+        "Earlier engine, earlier session vs current engine: not a controlled A/B.",
+        y=0.975,
     )
-    add_footnote(
+    bottom = add_footnotes(
         fig,
-        f"Source: results/{commit}/ablation_baseline_price_time.csv vs ablation_unpinned_price_time.csv (per-trial P99.9).",
-        y=0.035,
+        [
+            f"Earlier: {display_path(baseline_dir)} (commit {baseline_commit}). Final: {display_path(results_dir)} "
+            f"(commit {commit}). Both on the same tuned host and dataset, 5 trials per mode.",
+            "Values: median over trials of the per-trial percentile, new orders only. The engines differ (correctness fixes, "
+            "allocator, queue slot, harness);",
+            "sessions differ too, and tail percentiles of one binary move 10-20% between sessions. Percentages are not attributable to any one change.",
+        ],
     )
-    add_footnote(fig, "Classification details are in the benchmark ablation summary.", y=0.005)
-    finish(fig, out_path, rect=(0, 0.09, 1, 0.88))
+    fig.tight_layout(rect=(0, bottom, 1, 0.85))
+    finish(fig, out_path)
 
 
 # Transcribed from include/hydra/types.hpp (static_assert(sizeof(Order) == 128));
@@ -461,13 +712,13 @@ HOT_LINE_RECTS = [
     ("next_", 56, 8, "data"),
 ]
 HOT_LINE_LABELS = [
-    ("order_id\nuint64_t · 8B", 4, 0),
-    ("price\nint64_t · 8B", 12, 0),
-    ("qty\nuint32_t · 4B", 18, 0),
-    ("side/tif/event_tag\n1B each", 21.5, 1),
+    ("order_id\nuint64_t · 8B\n@0", 4, 0),
+    ("price\nint64_t · 8B\n@8", 12, 0),
+    ("qty\nuint32_t · 4B\n@16", 18, 0),
+    ("side@20, tif@21, event_tag@22\n1B each", 21.5, 1),
     ("hot_padding\nuint8_t[25] · 25B", 35.5, 0),
-    ("prev_\nOrder* · 8B", 52, 0),
-    ("next_\nOrder* · 8B", 60, 0),
+    ("prev_\nOrder* · 8B\n@48", 52, 0),
+    ("next_\nOrder* · 8B\n@56", 60, 0),
 ]
 COLD_LINE_RECTS = [
     ("timestamp_ns", 64, 8, "cold"),
@@ -476,10 +727,10 @@ COLD_LINE_RECTS = [
     ("cold_padding", 112, 16, "padding"),
 ]
 COLD_LINE_LABELS = [
-    ("timestamp_ns\nuint64_t · 8B", 68, 0),
-    ("client_id\nuint64_t · 8B", 76, 0),
-    ("client_tag\nchar[32] · 32B", 96, 0),
-    ("cold_padding\nuint8_t[16] · 16B", 120, 0),
+    ("timestamp_ns\nuint64_t · 8B\n@64", 68, 0),
+    ("client_id\nuint64_t · 8B\n@72", 76, 0),
+    ("client_tag\nchar[32] · 32B\n@80", 96, 0),
+    ("cold_padding\nuint8_t[16] · 16B\n@112", 120, 0),
 ]
 
 COLOR_HOT = SERIES_1
@@ -519,7 +770,7 @@ def draw_cache_line(ax, rects, labels, title, y0, row_h, offset_base):
 
     for text, byte_pos, row in labels:
         cx = byte_pos - offset_base
-        depth = row_h * 0.4 if row == 0 else row_h * 1.25
+        depth = row_h * 0.4 if row == 0 else row_h * 1.55
         ax.annotate(
             text,
             xy=(cx, y0),
@@ -545,10 +796,10 @@ def draw_cache_line(ax, rects, labels, title, y0, row_h, offset_base):
         )
 
 
-def chart_cache_line_layout(out_path: Path):
+def chart_cache_line_layout(commit: str, out_path: Path):
     fig, ax = new_figure(11.6, 8.4)
     row_h = 1.0
-    y_hot, y_cold = 5.6, 1.55
+    y_hot, y_cold = 6.1, 1.65
 
     draw_cache_line(
         ax,
@@ -569,7 +820,7 @@ def chart_cache_line_layout(out_path: Path):
         offset_base=64,
     )
 
-    boundary_y = (y_hot - row_h * 1.25) - 0.85
+    boundary_y = (y_hot - row_h * 1.55) - 0.95
     ax.plot([0, 64], [boundary_y, boundary_y], color=INK, linewidth=1.4, linestyle=(0, (1, 1.6)))
     ax.text(
         64.8,
@@ -581,7 +832,7 @@ def chart_cache_line_layout(out_path: Path):
         ha="left",
     )
 
-    legend_y = y_cold - row_h * 1.35 - 0.9
+    legend_y = y_cold - row_h * 1.45 - 0.9
     legend_items = [
         (COLOR_HOT, "Order and FIFO fields"),
         (COLOR_COLD, "Identity, timing, and client tag"),
@@ -592,8 +843,19 @@ def chart_cache_line_layout(out_path: Path):
         ax.add_patch(plt.Rectangle((lx, legend_y), 1.6, 0.55, facecolor=color, edgecolor="none"))
         ax.text(lx + 2.1, legend_y + 0.28, label, fontsize=9, color=INK_SECONDARY, va="center")
 
+    caption_y = legend_y - 1.0
+    ax.text(
+        0,
+        caption_y,
+        "measured effect of the split: none on the canonical workload (see DESIGN.md)",
+        fontsize=11,
+        fontweight="bold",
+        color=INK,
+        va="center",
+    )
+
     ax.set_xlim(-1, 84)
-    ax.set_ylim(legend_y - 0.6, y_hot + row_h + 0.75)
+    ax.set_ylim(caption_y - 0.7, y_hot + row_h + 0.75)
     ax.axis("off")
 
     fig.suptitle(
@@ -608,9 +870,9 @@ def chart_cache_line_layout(out_path: Path):
     )
     fig.text(
         0.05,
-        0.925,
-        "Layout transcribed from types.hpp; update this diagram when the struct changes.\n"
-        "Matching reads client_id on the metadata line for self-trade prevention.",
+        0.93,
+        "Offsets in bytes, transcribed from types.hpp. Sweeps read client_id on the metadata line for\n"
+        "self-trade prevention, so a sweep touches both lines of every resting order it examines.",
         fontsize=10.5,
         color=INK_SECONDARY,
         va="top",
@@ -618,47 +880,72 @@ def chart_cache_line_layout(out_path: Path):
     fig.text(
         0.05,
         0.012,
-        "Source: include/hydra/types.hpp (struct Order, static_assert(sizeof(Order) == 128, ...)).",
+        "Source: include/hydra/types.hpp (struct Order, static_assert(sizeof(Order) == 128, ...))  ·  "
+        f"commit {commit}",
         fontsize=8.5,
         color=INK_MUTED,
     )
-    finish(fig, out_path, rect=(0, 0.03, 1, 0.885))
+    finish(fig, out_path, rect=(0, 0.03, 1, 0.89))
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
-        "--commit",
-        default=None,
-        help="results/<commit>/ to read (default: current HEAD short hash)",
+        "--results-dir",
+        type=Path,
+        default=DEFAULT_RESULTS_DIR,
+        help="results directory of the run of record (default: results_new/7c2fd2c)",
     )
     parser.add_argument(
-        "--results-dir", default=None, help="explicit results directory, overrides --commit"
+        "--baseline-dir",
+        type=Path,
+        default=DEFAULT_BASELINE_DIR,
+        help="earlier results directory for the before/after chart (default: results/98a597b)",
+    )
+    parser.add_argument(
+        "--out-dir", type=Path, default=DEFAULT_OUT_DIR, help="where the PNGs go (default: charts/)"
+    )
+    parser.add_argument(
+        "--ctest-log",
+        type=Path,
+        default=None,
+        help="CTest LastTest.log for the tests tile (without one the tile shows N/A)",
     )
     args = parser.parse_args()
 
-    commit = args.commit or git_short_hash()
-    results_dir = Path(args.results_dir) if args.results_dir else REPO_ROOT / "results" / commit
+    for label, directory in (("results", args.results_dir), ("baseline", args.baseline_dir)):
+        if not directory.is_dir():
+            sys.exit(f"error: {label} directory {directory} does not exist (see --help)")
 
-    if not results_dir.is_dir():
-        sys.exit(
-            f"error: {results_dir} does not exist -- run --benchmark and scripts/run_ablations.sh first, "
-            "or pass --commit/--results-dir to point at an existing results directory."
-        )
+    commit = run_commit(args.results_dir)
+    baseline_commit = run_commit(args.baseline_dir)
+    args.out_dir.mkdir(parents=True, exist_ok=True)
 
-    CHARTS_DIR.mkdir(exist_ok=True)
-
-    print(f"Reading evidence from {results_dir}")
+    print(f"Reading evidence from {args.results_dir} (and {args.baseline_dir} for chart 03)")
     charts = [
-        ("00_hero_stats.png", lambda path: chart_hero_stats(results_dir, commit, path)),
-        ("01_ablation_impact.png", lambda path: chart_ablation_impact(results_dir, commit, path)),
-        ("02_tail_latency_profile.png", lambda path: chart_tail_latency(results_dir, commit, path)),
-        ("03_scheduler_noise.png", lambda path: chart_scheduler_noise(results_dir, commit, path)),
-        ("04_cache_line_layout.png", chart_cache_line_layout),
+        (
+            "00_hero_stats.png",
+            lambda path: chart_hero_stats(args.results_dir, commit, path, args.ctest_log),
+        ),
+        (
+            "01_ablation_impact.png",
+            lambda path: chart_ablation_impact(args.results_dir, commit, path),
+        ),
+        (
+            "02_tail_latency_profile.png",
+            lambda path: chart_tail_latency(args.results_dir, commit, path),
+        ),
+        (
+            "03_scheduler_noise.png",
+            lambda path: chart_before_after(
+                args.results_dir, args.baseline_dir, commit, baseline_commit, path
+            ),
+        ),
+        ("04_cache_line_layout.png", lambda path: chart_cache_line_layout(commit, path)),
     ]
     for name, render in charts:
-        render(CHARTS_DIR / name)
-        print(f"  wrote charts/{name}")
+        render(args.out_dir / name)
+        print(f"  wrote {args.out_dir / name}")
 
 
 if __name__ == "__main__":
