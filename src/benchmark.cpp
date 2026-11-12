@@ -8,8 +8,11 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstddef>
+#include <cstdint>
 #include <cstdio>
 #include <fstream>
+#include <functional>
 #include <iomanip>
 #include <optional>
 #include <sstream>
@@ -25,11 +28,7 @@ namespace hydra
 #define HYDRA_LOB_VERSION "dev-build"
 #endif
 
-// Set by CMakeLists.txt from `git status --porcelain` at build time (mirrors
-// how HYDRA_LOB_VERSION is captured from `git rev-parse --short HEAD`, same
-// WHY: a benchmark result is only as trustworthy as the claim "this hash
-// produced this number" -- a dirty tree at build time makes that claim false
-// even if HYDRA_LOB_VERSION still prints a real-looking hash.
+// Set by CMake when the working tree had uncommitted changes at configure time.
 #ifndef HYDRA_LOB_DIRTY
 #define HYDRA_LOB_DIRTY 0
 #endif
@@ -37,10 +36,18 @@ namespace hydra
     namespace
     {
 
-        // ------------------------------------------------------------------
-        // Preflight (unchanged from the prior harness -- already sound, see
-        // METHODOLOGY.md's audit summary).
-        // ------------------------------------------------------------------
+        constexpr bool kDirtyBuild = HYDRA_LOB_DIRTY != 0;
+        constexpr const char *kSysfsCpuRoot = "/sys/devices/system/cpu";
+        constexpr int kBoundedPushAttempts = 1000;
+        constexpr double kStableTailCvPercent = 15.0; // heuristic, see METHODOLOGY.md
+        constexpr const char *kRule =
+            "--------------------------------------------------------------------------------\n";
+        constexpr const char *kDoubleRule =
+            "================================================================================\n";
+
+        using ull = unsigned long long;
+
+        // Preflight
 
         struct PreflightResult
         {
@@ -60,43 +67,24 @@ namespace hydra
             return line;
         }
 
-        [[nodiscard]] std::vector<int> parse_cpu_list(const std::string &list)
+        [[nodiscard]] std::string cpu_sysfs_path(int core, const char *leaf)
         {
-            std::vector<int> result;
-            std::stringstream ss(list);
-            std::string token;
-            // MEAS-06: parse a whole numeric token with std::from_chars-style
-            // strictness and skip anything malformed, rather than calling
-            // std::stoi (which throws std::invalid_argument on e.g. "abc"). An
-            // unparseable sysfs line otherwise threw out of run_preflight_checks,
-            // and main() only catches std::runtime_error -- so a garbage
-            // /sys .../isolated crashed the whole benchmark instead of being
-            // reported as a clean preflight failure. Skipping bad tokens leaves
-            // the required cores absent from the list, which the isolation check
-            // then reports as a normal preflight failure. Also hardens the
-            // CPU-list fuzz target.
+            return std::string(kSysfsCpuRoot) + "/cpu" + std::to_string(core) + "/" + leaf;
+        }
+
+        // Parses the kernel CPU-list grammar ("0-3,8"); any malformed token yields nullopt.
+        [[nodiscard]] std::optional<std::vector<int>> parse_cpu_list(const std::string &list)
+        {
+            if (list.empty() || list.back() == ',')
+            {
+                return std::nullopt;
+            }
             const auto to_int = [](const std::string &s) -> std::optional<int>
             {
-                if (s.empty())
+                if (s.empty() ||
+                    !std::all_of(s.begin(), s.end(), [](char c) { return c >= '0' && c <= '9'; }))
                 {
                     return std::nullopt;
-                }
-                std::size_t i = 0;
-                const bool neg = (s[0] == '-' || s[0] == '+');
-                if (neg)
-                {
-                    i = 1;
-                }
-                if (i >= s.size())
-                {
-                    return std::nullopt;
-                }
-                for (std::size_t j = i; j < s.size(); ++j)
-                {
-                    if (s[j] < '0' || s[j] > '9')
-                    {
-                        return std::nullopt;
-                    }
                 }
                 try
                 {
@@ -107,66 +95,72 @@ namespace hydra
                     return std::nullopt; // out of int range
                 }
             };
+
+            std::vector<int> result;
+            std::stringstream ss(list);
+            std::string token;
             while (std::getline(ss, token, ','))
             {
                 if (token.empty())
                 {
-                    continue;
+                    return std::nullopt;
                 }
-                const auto dash = token.find('-', 1); // not a leading sign
+                const auto dash = token.find('-', 1);
                 if (dash == std::string::npos)
                 {
-                    if (const auto v = to_int(token))
+                    const auto v = to_int(token);
+                    if (!v)
                     {
-                        result.push_back(*v);
+                        return std::nullopt;
                     }
+                    result.push_back(*v);
+                    continue;
                 }
-                else
+                const auto lo = to_int(token.substr(0, dash));
+                const auto hi = to_int(token.substr(dash + 1));
+                if (!lo || !hi || *lo > *hi)
                 {
-                    const auto lo = to_int(token.substr(0, dash));
-                    const auto hi = to_int(token.substr(dash + 1));
-                    if (lo && hi && *lo <= *hi)
-                    {
-                        for (int c = *lo; c <= *hi; ++c)
-                        {
-                            result.push_back(c);
-                        }
-                    }
+                    return std::nullopt;
+                }
+                for (int64_t c = *lo; c <= *hi; ++c)
+                {
+                    result.push_back(static_cast<int>(c));
                 }
             }
             return result;
         }
 
-        [[nodiscard]] PreflightResult check_core_isolated(int core, const std::string &sysfs_root)
+        [[nodiscard]] PreflightResult check_core_isolated(int core)
         {
-            const std::string path = sysfs_root + "/isolated";
+            const std::string path = std::string(kSysfsCpuRoot) + "/isolated";
             const auto content = read_sysfs_line(path);
             if (!content)
             {
-                return {false, "cannot read " + path + " (is this a Linux system with "
-                                                       "isolcpus= support?)"};
+                return {false, "cannot read " + path +
+                                   " (is this a Linux system with isolcpus= support?)"};
             }
             if (content->empty())
             {
                 return {false, "core " + std::to_string(core) + " is not isolated: " + path +
-                                   " is empty (expected the isolcpus= GRUB parameter to "
-                                   "include this core -- see config.hpp's "
-                                   "ENVIRONMENT_REQUIREMENTS note)"};
+                                   " is empty (expected the isolcpus= GRUB parameter to include "
+                                   "this core -- see config.hpp's ENVIRONMENT_REQUIREMENTS note)"};
             }
             const auto isolated = parse_cpu_list(*content);
-            if (std::find(isolated.begin(), isolated.end(), core) == isolated.end())
+            if (!isolated)
             {
-                return {false, "core " + std::to_string(core) + " is not in the isolated "
-                                                                "CPU list (" +
-                                   *content + ")"};
+                return {false, "malformed CPU list in " + path + ": '" + *content + "'"};
+            }
+            if (std::find(isolated->begin(), isolated->end(), core) == isolated->end())
+            {
+                return {false, "core " + std::to_string(core) +
+                                   " is not in the isolated CPU list (" + *content + ")"};
             }
             return {true, ""};
         }
 
-        [[nodiscard]] PreflightResult check_governor_performance(int core, const std::string &sysfs_root)
+        [[nodiscard]] PreflightResult check_governor_performance(int core)
         {
-            const std::string path =
-                sysfs_root + "/cpu" + std::to_string(core) + "/cpufreq/scaling_governor";
+            const std::string path = cpu_sysfs_path(core, "cpufreq/scaling_governor");
             const auto content = read_sysfs_line(path);
             if (!content)
             {
@@ -176,41 +170,46 @@ namespace hydra
             if (*content != "performance")
             {
                 return {false, "core " + std::to_string(core) + "'s cpufreq governor is '" +
-                                   *content + "', expected 'performance' (run: cpupower "
-                                              "frequency-set --governor performance)"};
+                                   *content +
+                                   "', expected 'performance' (run: cpupower "
+                                   "frequency-set --governor performance)"};
             }
             return {true, ""};
         }
 
-        [[nodiscard]] PreflightResult check_smt_off(int core, const std::string &sysfs_root)
+        // A sibling hyperthread would share L1/L2 with the pinned core.
+        [[nodiscard]] PreflightResult check_smt_off(int core)
         {
-            const std::string path =
-                sysfs_root + "/cpu" + std::to_string(core) + "/topology/thread_siblings_list";
+            const std::string path = cpu_sysfs_path(core, "topology/thread_siblings_list");
             const auto content = read_sysfs_line(path);
             if (!content)
             {
                 return {false, "cannot read " + path};
             }
             const auto siblings = parse_cpu_list(*content);
-            if (siblings.size() != 1 || siblings.front() != core)
+            if (!siblings)
             {
-                return {false, "core " + std::to_string(core) + " has SMT sibling(s) (" +
-                                   *content + "); SMT must be disabled (a sibling thread "
-                                              "sharing L1/L2 with a pinned core reintroduces the "
-                                              "cache contention isolcpus is meant to eliminate)"};
+                return {false, "malformed CPU list in " + path + ": '" + *content + "'"};
+            }
+            if (siblings->size() != 1 || siblings->front() != core)
+            {
+                return {false, "core " + std::to_string(core) + " has SMT sibling(s) (" + *content +
+                                   "); SMT must be disabled (a sibling thread sharing L1/L2 with a "
+                                   "pinned core reintroduces the cache contention isolcpus is "
+                                   "meant to eliminate)"};
             }
             return {true, ""};
         }
 
-        void run_preflight_checks(const std::string &sysfs_root)
+        void run_preflight_checks()
         {
             const std::vector<PreflightResult> results = {
-                check_core_isolated(RX_CORE_ID, sysfs_root),
-                check_core_isolated(MATCHING_CORE_ID, sysfs_root),
-                check_governor_performance(RX_CORE_ID, sysfs_root),
-                check_governor_performance(MATCHING_CORE_ID, sysfs_root),
-                check_smt_off(RX_CORE_ID, sysfs_root),
-                check_smt_off(MATCHING_CORE_ID, sysfs_root),
+                check_core_isolated(RX_CORE_ID),
+                check_core_isolated(MATCHING_CORE_ID),
+                check_governor_performance(RX_CORE_ID),
+                check_governor_performance(MATCHING_CORE_ID),
+                check_smt_off(RX_CORE_ID),
+                check_smt_off(MATCHING_CORE_ID),
             };
 
             bool any_failed = false;
@@ -224,34 +223,31 @@ namespace hydra
             }
             if (any_failed)
             {
-                throw std::runtime_error(
-                    "benchmark preflight checks failed -- see stderr for details; "
-                    "no measurement work was performed");
+                throw std::runtime_error("benchmark preflight checks failed -- see stderr for "
+                                         "details; no measurement work was performed");
             }
         }
 
-        [[nodiscard]] std::string capture_env_snapshot(const std::string &sysfs_root)
+        [[nodiscard]] std::string capture_env_snapshot()
         {
-            const auto get = [&](const std::string &path) -> std::string
+            const auto get = [](const std::string &path)
             {
                 const auto v = read_sysfs_line(path);
                 return v ? *v : std::string("unavailable");
             };
 
             std::ostringstream out;
-            out << "isolated=" << get(sysfs_root + "/isolated")
-                << " rx_core=" << RX_CORE_ID
-                << " rx_governor=" << get(sysfs_root + "/cpu" + std::to_string(RX_CORE_ID) +
-                                          "/cpufreq/scaling_governor")
-                << " rx_smt_siblings=" << get(sysfs_root + "/cpu" + std::to_string(RX_CORE_ID) +
-                                              "/topology/thread_siblings_list")
-                << " matching_core=" << MATCHING_CORE_ID
-                << " matching_governor=" << get(sysfs_root + "/cpu" + std::to_string(MATCHING_CORE_ID) +
-                                                "/cpufreq/scaling_governor")
-                << " matching_smt_siblings=" << get(sysfs_root + "/cpu" + std::to_string(MATCHING_CORE_ID) +
-                                                    "/topology/thread_siblings_list")
-                << " git=" << HYDRA_LOB_VERSION
-                << " dirty=" << (HYDRA_LOB_DIRTY ? "yes" : "no");
+            out << "isolated=" << get(std::string(kSysfsCpuRoot) + "/isolated");
+            const auto append_core = [&](const char *name, int core)
+            {
+                out << ' ' << name << "_core=" << core << ' ' << name
+                    << "_governor=" << get(cpu_sysfs_path(core, "cpufreq/scaling_governor")) << ' '
+                    << name << "_smt_siblings="
+                    << get(cpu_sysfs_path(core, "topology/thread_siblings_list"));
+            };
+            append_core("rx", RX_CORE_ID);
+            append_core("matching", MATCHING_CORE_ID);
+            out << " git=" << HYDRA_LOB_VERSION << " dirty=" << (kDirtyBuild ? "yes" : "no");
             return out.str();
         }
 
@@ -261,28 +257,60 @@ namespace hydra
             std::string line;
             while (in && std::getline(in, line))
             {
-                if (line.rfind("model name", 0) == 0)
+                if (line.rfind("model name", 0) != 0)
                 {
-                    const auto colon = line.find(':');
-                    if (colon != std::string::npos)
-                    {
-                        std::string name = line.substr(colon + 1);
-                        while (!name.empty() && name.front() == ' ')
-                        {
-                            name.erase(name.begin());
-                        }
-                        return name;
-                    }
+                    continue;
+                }
+                const auto colon = line.find(':');
+                if (colon != std::string::npos)
+                {
+                    std::string name = line.substr(colon + 1);
+                    name.erase(0, name.find_first_not_of(' '));
+                    return name;
                 }
             }
             return "unavailable";
         }
 
-        // ------------------------------------------------------------------
-        // Dataset provenance: seed (already existed) + a real content hash
-        // (new -- the CSV/report schema requires dataset_hash, and a seed
-        // alone doesn't prove two files are byte-identical).
-        // ------------------------------------------------------------------
+        [[nodiscard]] const char *compiler_version() noexcept
+        {
+#if defined(__VERSION__)
+            return __VERSION__;
+#else
+            return "unknown";
+#endif
+        }
+
+        [[nodiscard]] const char *clock_source_name() noexcept
+        {
+            return detail::g_use_fallback_clock.load(std::memory_order_relaxed)
+                       ? "steady_clock_fallback"
+                       : "rdtscp_calibrated";
+        }
+
+        [[nodiscard]] const char *mode_id(MatchingMode mode) noexcept
+        {
+            return mode == MatchingMode::PRICE_TIME ? "price_time" : "pro_rata";
+        }
+
+        // Dataset provenance and formatting helpers
+
+        // 64-bit FNV-1a; a reproducibility fingerprint, not cryptographic.
+        class Fnv1a
+        {
+        public:
+            void fold(uint64_t value) noexcept
+            {
+                hash_ ^= value;
+                hash_ *= kPrime;
+            }
+
+            [[nodiscard]] uint64_t value() const noexcept { return hash_; }
+
+        private:
+            static constexpr uint64_t kPrime = 1099511628211ULL;
+            uint64_t hash_ = 1469598103934665603ULL;
+        };
 
         [[nodiscard]] uint64_t peek_dataset_seed(const std::string &path)
         {
@@ -301,9 +329,6 @@ namespace hydra
             return header.config.seed;
         }
 
-        // FNV-1a 64-bit over the raw file bytes -- cheap, deterministic,
-        // good enough to prove "these two files are byte-identical" (the
-        // dataset_hash column's job), not a cryptographic commitment.
         [[nodiscard]] uint64_t compute_dataset_hash(const std::string &path)
         {
             std::ifstream in(path, std::ios::binary);
@@ -311,8 +336,7 @@ namespace hydra
             {
                 throw std::runtime_error("cannot open dataset '" + path + "' to hash it");
             }
-            uint64_t hash = 1469598103934665603ULL; // FNV offset basis
-            constexpr uint64_t kPrime = 1099511628211ULL;
+            Fnv1a hash;
             char buf[65536];
             while (in)
             {
@@ -320,11 +344,10 @@ namespace hydra
                 const std::streamsize n = in.gcount();
                 for (std::streamsize i = 0; i < n; ++i)
                 {
-                    hash ^= static_cast<uint8_t>(buf[i]);
-                    hash *= kPrime;
+                    hash.fold(static_cast<uint8_t>(buf[i]));
                 }
             }
-            return hash;
+            return hash.value();
         }
 
         [[nodiscard]] std::string hex64(uint64_t v)
@@ -334,11 +357,13 @@ namespace hydra
             return out.str();
         }
 
-        // MEAS-08: RFC-4180 CSV field quoting. The dataset path, derived
-        // workload name, and invalid_reason are strings (the first two are
-        // caller/user-controlled) that can contain a comma, quote or newline;
-        // written raw they shift every later column. Quote iff needed, doubling
-        // any embedded quote.
+        [[nodiscard]] std::string basename_of(const std::string &path)
+        {
+            const std::size_t slash = path.find_last_of('/');
+            return (slash == std::string::npos) ? path : path.substr(slash + 1);
+        }
+
+        // RFC 4180 quoting.
         [[nodiscard]] std::string csv_escape(const std::string &s)
         {
             if (s.find_first_of(",\"\n\r") == std::string::npos)
@@ -358,9 +383,6 @@ namespace hydra
             return out;
         }
 
-        // MEAS-09: JSON string escaping for the metadata file -- a quote or
-        // backslash in a path (or any control char) otherwise produces invalid
-        // JSON that a consumer can't parse.
         [[nodiscard]] std::string json_escape(const std::string &s)
         {
             std::string out;
@@ -401,136 +423,139 @@ namespace hydra
             return out;
         }
 
-        // Measures rdtsc_now()'s own fixed overhead: N back-to-back calls,
-        // mean of the consecutive deltas. Reported as "Clock overhead" in
-        // every report so a reader can see the instrumentation's own
-        // footprint rather than have it silently folded into the numbers
-        // it's measuring.
+        [[nodiscard]] double ratio_or_zero(double numerator, double denominator) noexcept
+        {
+            return denominator > 0.0 ? numerator / denominator : 0.0;
+        }
+
+        [[nodiscard]] int64_t current_unix_seconds() noexcept
+        {
+            return static_cast<int64_t>(std::chrono::duration_cast<std::chrono::seconds>(
+                                            std::chrono::system_clock::now().time_since_epoch())
+                                            .count());
+        }
+
+        // Replay
+
+        // Mean cost of a back-to-back clock read, reported alongside every result.
         [[nodiscard]] double measure_clock_overhead_ns(double ns_per_cycle)
         {
             constexpr int kSamples = 10'000;
-            std::vector<uint64_t> deltas;
-            deltas.reserve(kSamples);
+            uint64_t sum = 0;
             uint64_t prev = rdtsc_now();
             for (int i = 0; i < kSamples; ++i)
             {
                 const uint64_t now = rdtsc_now();
-                deltas.push_back(now - prev);
+                sum += now - prev;
                 prev = now;
             }
-            uint64_t sum = 0;
-            for (const uint64_t d : deltas)
-            {
-                sum += d;
-            }
-            return (static_cast<double>(sum) / static_cast<double>(deltas.size())) * ns_per_cycle;
+            return (static_cast<double>(sum) / static_cast<double>(kSamples)) * ns_per_cycle;
+        }
+
+        [[nodiscard]] uint64_t timestamp_ns(double ns_per_cycle) noexcept
+        {
+            return static_cast<uint64_t>(static_cast<double>(rdtsc_now()) * ns_per_cycle);
         }
 
         [[nodiscard]] Order encode_as_queue_order(const DatasetEvent &ev, uint64_t t1_ns)
         {
             Order o{};
             o.timestamp_ns = t1_ns;
-            if (ev.type == EventType::NEW_ORDER)
+            switch (ev.type)
             {
+            case EventType::NEW_ORDER:
                 o = ev.order;
                 o.event_tag = OrderEventTag::NEW_OR_CANCEL;
                 o.timestamp_ns = t1_ns;
-                return o;
-            }
-            if (ev.type == EventType::REPLACE)
-            {
-                o.order_id = ev.cancel_order_id; // target order_id, see EventType::REPLACE
-                o.price = ev.order.price;        // new price
-                o.qty = ev.order.qty;             // new qty (never 0 -- see DatasetGenerator)
+                break;
+            case EventType::REPLACE:
+                o.order_id = ev.cancel_order_id; // target order
+                o.price = ev.order.price;
+                o.qty = ev.order.qty;
                 o.event_tag = OrderEventTag::REPLACE;
-                return o;
+                break;
+            case EventType::CANCEL:
+                o.order_id = ev.cancel_order_id;
+                o.qty = 0;
+                o.event_tag = OrderEventTag::NEW_OR_CANCEL;
+                break;
             }
-            // CANCEL
-            o.order_id = ev.cancel_order_id;
-            o.qty = 0;
-            o.event_tag = OrderEventTag::NEW_OR_CANCEL;
             return o;
         }
 
-        constexpr int kBoundedPushAttempts = 1000;
+        // Returns the duration of the successful push, or nullopt if the queue stayed full.
+        [[nodiscard]] std::optional<uint64_t> push_bounded(PipelineContext &ctx, const Order &order,
+                                                           double ns_per_cycle)
+        {
+            for (int attempt = 0; attempt < kBoundedPushAttempts; ++attempt)
+            {
+                const uint64_t start_ns = timestamp_ns(ns_per_cycle);
+                if (ctx.queue.push(order))
+                {
+                    return timestamp_ns(ns_per_cycle) - start_ns;
+                }
+            }
+            return std::nullopt;
+        }
 
         struct ReplayPhaseResult
         {
-            uint64_t dropped;
-            uint64_t max_drift_ns;
-            // Aggregate-only (not per-sample, see METHODOLOGY.md
-            // for why): the successful push() call's own duration cannot be
-            // attributed back into the transported Order value, since its
-            // duration isn't known until after the value has already been
-            // copied into the queue. Reported as a trial-level mean/max
-            // instead of a per-order field.
+            uint64_t dropped = 0;
+            uint64_t max_drift_ns = 0;
             double push_ns_sum = 0.0;
             uint64_t push_ns_max = 0;
             std::size_t push_count = 0;
         };
 
+        // Replays events[first, last) at their recorded arrival offsets, calling on_push()
+        // after each successful enqueue.
         template <typename OnPush>
-        [[nodiscard]] ReplayPhaseResult replay_phase(PipelineContext &ctx, const std::vector<DatasetEvent> &events,
-                          std::size_t first, std::size_t last, double ns_per_cycle,
-                          OnPush &&on_push)
+        [[nodiscard]] ReplayPhaseResult
+        replay_phase(PipelineContext &ctx, const std::vector<DatasetEvent> &events,
+                     std::size_t first, std::size_t last, double ns_per_cycle, OnPush &&on_push)
         {
-            const auto now_ns = [ns_per_cycle]() -> uint64_t
-            {
-                return static_cast<uint64_t>(static_cast<double>(rdtsc_now()) * ns_per_cycle);
-            };
-
-            const uint64_t phase_start_ns = now_ns();
+            const uint64_t phase_start_ns = timestamp_ns(ns_per_cycle);
             const uint64_t base_offset_ns = events[first].arrival_offset_ns;
-            ReplayPhaseResult result{};
+            ReplayPhaseResult result;
 
             for (std::size_t i = first; i < last; ++i)
             {
                 const uint64_t target_ns =
                     phase_start_ns + (events[i].arrival_offset_ns - base_offset_ns);
 
-                while (now_ns() < target_ns)
+                while (timestamp_ns(ns_per_cycle) < target_ns)
                 {
                 }
 
-                const uint64_t t1_ns = now_ns();
+                const uint64_t t1_ns = timestamp_ns(ns_per_cycle);
                 if (t1_ns > target_ns)
                 {
                     result.max_drift_ns = std::max(result.max_drift_ns, t1_ns - target_ns);
                 }
-                const Order order = encode_as_queue_order(events[i], t1_ns);
 
-                bool pushed = false;
-                for (int attempt = 0; attempt < kBoundedPushAttempts; ++attempt)
-                {
-                    const uint64_t push_start_ns = now_ns();
-                    if (ctx.queue.push(order))
-                    {
-                        const uint64_t push_end_ns = now_ns();
-                        const uint64_t push_ns = push_end_ns - push_start_ns;
-                        result.push_ns_sum += static_cast<double>(push_ns);
-                        result.push_ns_max = std::max(result.push_ns_max, push_ns);
-                        ++result.push_count;
-                        pushed = true;
-                        break;
-                    }
-                }
-                if (!pushed) [[unlikely]]
+                const auto push_ns =
+                    push_bounded(ctx, encode_as_queue_order(events[i], t1_ns), ns_per_cycle);
+                if (!push_ns) [[unlikely]]
                 {
                     ++result.dropped;
                     continue;
                 }
-                on_push(i - first, events[i]);
+                result.push_ns_sum += static_cast<double>(*push_ns);
+                result.push_ns_max = std::max(result.push_ns_max, *push_ns);
+                ++result.push_count;
+                on_push();
             }
 
             if (result.dropped > 0) [[unlikely]]
             {
                 std::fprintf(stderr,
-                             "benchmark: dropped %llu event(s) to sustained queue "
-                             "backpressure\n",
-                             static_cast<unsigned long long>(result.dropped));
+                             "benchmark: dropped %llu event(s) to sustained queue backpressure\n",
+                             static_cast<ull>(result.dropped));
             }
             return result;
         }
+
+        // Per-trial statistics
 
         struct TrialRecord
         {
@@ -538,19 +563,6 @@ namespace hydra
             std::vector<int64_t> timestamps_unix;
         };
 
-        [[nodiscard]] int64_t current_unix_seconds() noexcept
-        {
-            return static_cast<int64_t>(
-                std::chrono::duration_cast<std::chrono::seconds>(
-                    std::chrono::system_clock::now().time_since_epoch())
-                    .count());
-        }
-
-        // Everything derived from one trial's recorded samples: percentile
-        // sets (order and cancel populations, kept separate per the
-        // existing disclosed-not-hidden convention), workload-composition
-        // aggregates from MatchStats fields, throughput, and this trial's
-        // own dropped/arena/pool deltas.
         struct TrialStats
         {
             std::size_t order_count = 0;
@@ -573,40 +585,25 @@ namespace hydra
             double mean_fill_publish_ns = 0.0;
 
             uint64_t dropped_events = 0;
-            uint64_t max_schedule_drift_ns = 0;
             uint64_t arena_fallback_delta = 0;
             uint64_t pool_exhaustion_delta = 0;
 
-            // Deterministic fingerprint over LOGICAL outcomes only (fills,
-            // levels touched, book depth, examined/skip counts) -- never
-            // over timing, since timing legitimately varies run to run
-            // even when the system is perfectly deterministic. Identical
-            // across every trial iff the system produced identical
-            // outcomes for an identical replayed event sequence.
+            // Repeatability fingerprints over counters, final book depth and ordered fills.
+            uint64_t fill_digest = 0;
             uint64_t state_hash = 0;
         };
 
         [[nodiscard]] TrialStats compute_trial_stats(const TrialRecord &record,
-                                                      std::size_t final_bid_levels,
-                                                      std::size_t final_ask_levels,
-                                                      double batch_seconds,
-                                                      uint64_t dropped_events,
-                                                      uint64_t max_schedule_drift_ns,
-                                                      uint64_t arena_fallback_delta,
-                                                      uint64_t pool_exhaustion_delta)
+                                                     double batch_seconds)
         {
-            TrialStats t{};
-            t.dropped_events = dropped_events;
-            t.max_schedule_drift_ns = max_schedule_drift_ns;
-            t.arena_fallback_delta = arena_fallback_delta;
-            t.pool_exhaustion_delta = pool_exhaustion_delta;
-
+            TrialStats t;
             std::vector<uint64_t> order_e2e;
             std::vector<uint64_t> cancel_e2e;
             order_e2e.reserve(record.samples.size());
 
             double fill_publish_sum = 0.0;
             uint64_t levels_sum = 0;
+            Fnv1a fill_digest;
 
             for (const LatencySample &s : record.samples)
             {
@@ -615,6 +612,7 @@ namespace hydra
                     cancel_e2e.push_back(s.end_to_end_ns);
                     continue;
                 }
+                fill_digest.fold(s.fill_digest);
                 order_e2e.push_back(s.end_to_end_ns);
 
                 if (s.fills_generated > 0)
@@ -644,72 +642,46 @@ namespace hydra
 
             t.order_count = order_e2e.size();
             t.cancel_count = cancel_e2e.size();
-            t.mean_fills_per_match = (t.crossing_order_count > 0)
-                                         ? static_cast<double>(t.generated_fill_count) /
-                                               static_cast<double>(t.crossing_order_count)
-                                         : 0.0;
-            t.mean_levels_consumed = (t.order_count > 0)
-                                          ? static_cast<double>(levels_sum) /
-                                                static_cast<double>(t.order_count)
-                                          : 0.0;
-            t.mean_fill_publish_ns = (t.generated_fill_count > 0)
-                                         ? fill_publish_sum / static_cast<double>(t.generated_fill_count)
-                                         : 0.0;
+            t.mean_fills_per_match = ratio_or_zero(static_cast<double>(t.generated_fill_count),
+                                                   static_cast<double>(t.crossing_order_count));
+            t.mean_levels_consumed =
+                ratio_or_zero(static_cast<double>(levels_sum), static_cast<double>(t.order_count));
+            t.mean_fill_publish_ns =
+                ratio_or_zero(fill_publish_sum, static_cast<double>(t.generated_fill_count));
+            t.fill_digest = fill_digest.value();
 
             std::sort(order_e2e.begin(), order_e2e.end());
             std::sort(cancel_e2e.begin(), cancel_e2e.end());
             t.order_pct = stats::compute_percentiles(order_e2e);
             t.cancel_pct = stats::compute_percentiles(cancel_e2e);
-
             t.throughput_orders_per_sec =
-                (batch_seconds > 0.0) ? static_cast<double>(t.order_count) / batch_seconds : 0.0;
-
-            // FNV-1a-style fold over logical-outcome counters + final book
-            // depth. Deliberately excludes every timing field.
-            //
-            // MEAS-03 (scope of this guarantee): state_hash is a cross-trial
-            // DETERMINISM fingerprint, not a correctness oracle. It folds
-            // aggregate counts (fills, levels touched, crossing/non-crossing,
-            // examined/skip counts, final depth) -- NOT individual fill prices,
-            // quantities, or maker/taker ids. So it proves "every trial produced
-            // the identical aggregate outcome", which is what determinism means
-            // here, but it does NOT detect a systematically wrong price or
-            // counterparty (a matcher that filled every order at the wrong price
-            // would keep the same state_hash). Fill-level economic correctness is
-            // verified separately by the audit differential reference model
-            // (audit/tests/, replays each event through an independent book and
-            // compares every fill), not by this hash. Strengthening the hash to
-            // fold per-fill fields was considered and deferred: it would change
-            // every published state_hash without adding coverage the differential
-            // model doesn't already provide.
-            uint64_t h = 1469598103934665603ULL;
-            const uint64_t prime = 1099511628211ULL;
-            const auto fold = [&](uint64_t v)
-            {
-                h ^= v;
-                h *= prime;
-            };
-            fold(final_bid_levels);
-            fold(final_ask_levels);
-            fold(t.crossing_order_count);
-            fold(t.non_crossing_order_count);
-            fold(t.partial_fill_count);
-            fold(t.multi_level_sweep_count);
-            fold(t.self_trade_skip_count);
-            fold(t.resting_orders_examined);
-            fold(t.eligible_orders_examined);
-            fold(t.generated_fill_count);
-            fold(t.max_fill_fanout);
-            fold(t.order_count);
-            fold(t.cancel_count);
-            t.state_hash = h;
-
+                ratio_or_zero(static_cast<double>(t.order_count), batch_seconds);
             return t;
         }
 
-        // Composition of the dataset itself (add/cancel/replace mix, TIF
-        // mix) over the measured window only -- identical for every trial
-        // (same replayed events), so computed once, not per trial.
+        // Checks repeatability across trials, not correctness against a reference.
+        [[nodiscard]] uint64_t compute_state_hash(const TrialStats &t, std::size_t bid_levels,
+                                                  std::size_t ask_levels)
+        {
+            Fnv1a h;
+            h.fold(bid_levels);
+            h.fold(ask_levels);
+            h.fold(t.crossing_order_count);
+            h.fold(t.non_crossing_order_count);
+            h.fold(t.partial_fill_count);
+            h.fold(t.multi_level_sweep_count);
+            h.fold(t.self_trade_skip_count);
+            h.fold(t.resting_orders_examined);
+            h.fold(t.eligible_orders_examined);
+            h.fold(t.generated_fill_count);
+            h.fold(t.max_fill_fanout);
+            h.fold(t.order_count);
+            h.fold(t.cancel_count);
+            h.fold(t.fill_digest);
+            return h.value();
+        }
+
+        // Event and time-in-force mix over the measured window.
         struct DatasetComposition
         {
             std::size_t new_order_count = 0;
@@ -720,10 +692,11 @@ namespace hydra
             std::size_t gtc_count = 0;
         };
 
-        [[nodiscard]] DatasetComposition compute_dataset_composition(
-            const std::vector<DatasetEvent> &events, std::size_t first, std::size_t last)
+        [[nodiscard]] DatasetComposition
+        compute_dataset_composition(const std::vector<DatasetEvent> &events, std::size_t first,
+                                    std::size_t last)
         {
-            DatasetComposition c{};
+            DatasetComposition c;
             for (std::size_t i = first; i < last; ++i)
             {
                 switch (events[i].type)
@@ -754,34 +727,255 @@ namespace hydra
             return c;
         }
 
-        [[nodiscard]] std::string basename_of(const std::string &path)
+        // Run state
+
+        struct RunData
         {
-            const std::size_t slash = path.find_last_of('/');
-            return (slash == std::string::npos) ? path : path.substr(slash + 1);
+            std::string run_id;
+            std::string env_snapshot;
+            uint64_t dataset_seed = 0;
+            uint64_t dataset_hash = 0;
+            std::size_t event_count = 0;
+            DatasetComposition composition;
+            double clock_overhead_ns = 0.0;
+            bool is_smoketest = false;
+
+            std::vector<TrialRecord> records;
+            std::vector<TrialStats> trials;
+
+            uint64_t total_dropped = 0;
+            uint64_t total_arena_fallbacks = 0;
+            uint64_t total_pool_exhaustions = 0;
+            uint64_t max_schedule_drift_ns = 0;
+            double push_ns_sum = 0.0;
+            uint64_t push_ns_max = 0;
+            std::size_t push_count = 0;
+            std::size_t final_bid_levels = 0;
+            std::size_t final_ask_levels = 0;
+
+            bool determinism_pass = true;
+            bool valid = true;
+            std::string invalid_reason;
+        };
+
+        void absorb_replay_stats(RunData &run, const ReplayPhaseResult &r)
+        {
+            run.total_dropped += r.dropped;
+            run.max_schedule_drift_ns = std::max(run.max_schedule_drift_ns, r.max_drift_ns);
         }
 
-        void write_summary_csv(const std::string &path, const std::string &run_id,
-                               MatchingMode mode, const std::string &dataset_path,
-                               uint64_t dataset_hash, std::size_t dataset_records,
-                               double clock_overhead_ns,
-                               const std::vector<TrialStats> &trial_stats,
-                               const std::vector<uint64_t> &state_hashes,
-                               bool determinism_pass, bool overall_valid,
-                               const std::string &invalid_reason,
-                               std::size_t fok_order_count, bool is_smoketest)
+        void warn_on_resource_exhaustion(std::size_t trial, uint64_t arena_delta,
+                                         uint64_t pool_delta)
+        {
+            if (arena_delta > 0)
+            {
+                std::fprintf(stderr,
+                             "WARNING: order book's fixed arena overflowed to the heap %llu "
+                             "time(s) during trial %zu.\n",
+                             static_cast<ull>(arena_delta), trial);
+            }
+            if (pool_delta > 0)
+            {
+                std::fprintf(stderr,
+                             "WARNING: order/level pool exhausted %llu time(s) during trial "
+                             "%zu -- incoming orders/levels were silently dropped.\n",
+                             static_cast<ull>(pool_delta), trial);
+            }
+        }
+
+        // Warm-up replay, then a measured replay that the matching thread records into a
+        // sink; trials after the first start from a freshly reset book and pools.
+        void run_trial(PipelineContext &ctx, const std::vector<DatasetEvent> &events,
+                       double ns_per_cycle, std::size_t trial, RunData &run)
+        {
+            if (trial > 0)
+            {
+                ctx.book.reset();
+                ctx.order_pool.reset();
+                ctx.level_pool.reset();
+            }
+
+            const uint64_t arena_before = ctx.book.arena_fallback_count();
+            const uint64_t order_pool_before = ctx.order_pool.exhaustion_count();
+            const uint64_t level_pool_before = ctx.level_pool.exhaustion_count();
+
+            absorb_replay_stats(
+                run, replay_phase(ctx, events, 0, WARMUP_ITERATIONS, ns_per_cycle, [] {}));
+
+            TrialRecord record;
+            record.timestamps_unix.reserve(MEASURED_ITERATIONS);
+            std::vector<LatencySample> sink_storage(MEASURED_ITERATIONS);
+            RawSampleSink sink;
+            sink.samples = sink_storage.data();
+            sink.capacity = MEASURED_ITERATIONS;
+            ctx.raw_samples.store(&sink, std::memory_order_release);
+
+            const auto batch_start = std::chrono::steady_clock::now();
+            const ReplayPhaseResult measured =
+                replay_phase(ctx, events, WARMUP_ITERATIONS,
+                             WARMUP_ITERATIONS + MEASURED_ITERATIONS, ns_per_cycle, [&record]
+                             { record.timestamps_unix.push_back(current_unix_seconds()); });
+            absorb_replay_stats(run, measured);
+            run.push_ns_sum += measured.push_ns_sum;
+            run.push_ns_max = std::max(run.push_ns_max, measured.push_ns_max);
+            run.push_count += measured.push_count;
+
+            while (sink.count() < record.timestamps_unix.size())
+            {
+                std::this_thread::yield();
+            }
+            ctx.raw_samples.store(nullptr, std::memory_order_release);
+            const double batch_seconds =
+                std::chrono::duration<double>(std::chrono::steady_clock::now() - batch_start)
+                    .count();
+
+            record.samples.assign(sink_storage.begin(),
+                                  sink_storage.begin() +
+                                      static_cast<std::ptrdiff_t>(record.timestamps_unix.size()));
+
+            TrialStats ts = compute_trial_stats(record, batch_seconds);
+            ts.dropped_events = measured.dropped;
+            ts.arena_fallback_delta = ctx.book.arena_fallback_count() - arena_before;
+            ts.pool_exhaustion_delta = (ctx.order_pool.exhaustion_count() - order_pool_before) +
+                                       (ctx.level_pool.exhaustion_count() - level_pool_before);
+            ts.state_hash =
+                compute_state_hash(ts, ctx.book.bid_level_count(), ctx.book.ask_level_count());
+
+            warn_on_resource_exhaustion(trial, ts.arena_fallback_delta, ts.pool_exhaustion_delta);
+
+            run.trials.push_back(ts);
+            run.records.push_back(std::move(record));
+        }
+
+        // Folds the cross-trial checks into run.valid / run.invalid_reason.
+        void assess_validity(RunData &run, std::vector<std::string> reasons)
+        {
+            run.determinism_pass =
+                std::all_of(run.trials.begin(), run.trials.end(), [&](const TrialStats &t)
+                            { return t.state_hash == run.trials.front().state_hash; });
+            if (!run.determinism_pass)
+            {
+                reasons.push_back("determinism check failed: state_hash differs across trials");
+            }
+
+            for (const TrialStats &t : run.trials)
+            {
+                run.total_arena_fallbacks += t.arena_fallback_delta;
+                run.total_pool_exhaustions += t.pool_exhaustion_delta;
+            }
+            if (run.total_dropped > 0)
+            {
+                reasons.push_back("dropped_events > 0 (" + std::to_string(run.total_dropped) + ")");
+            }
+            if (run.total_arena_fallbacks > 0)
+            {
+                reasons.push_back("arena_fallback_count > 0 (" +
+                                  std::to_string(run.total_arena_fallbacks) + ")");
+            }
+            if (run.total_pool_exhaustions > 0)
+            {
+                reasons.push_back("pool_exhaustion_count > 0 (" +
+                                  std::to_string(run.total_pool_exhaustions) + ")");
+            }
+            if (detail::g_use_fallback_clock.load(std::memory_order_relaxed))
+            {
+                reasons.push_back(
+                    "clock calibration fell back to steady_clock; calibrated-TSC results required");
+            }
+
+            run.valid = reasons.empty();
+            run.invalid_reason.clear();
+            for (std::size_t i = 0; i < reasons.size(); ++i)
+            {
+                run.invalid_reason += (i > 0 ? "; " : "") + reasons[i];
+            }
+        }
+
+        // Cross-trial aggregates: medians and coefficients of variation (percent).
+        struct TrialAggregate
+        {
+            double p50, p90, p99, p999, max, throughput;
+            double p50_cv, p99_cv, p999_cv, throughput_cv;
+            bool stable;
+        };
+
+        [[nodiscard]] TrialAggregate aggregate_trials(const std::vector<TrialStats> &trials)
+        {
+            const auto collect = [&](auto extract)
+            {
+                std::vector<double> v;
+                v.reserve(trials.size());
+                for (const TrialStats &t : trials)
+                {
+                    v.push_back(extract(t));
+                }
+                return v;
+            };
+            const auto p50 = collect([](const TrialStats &t) { return t.order_pct.p50; });
+            const auto p90 = collect([](const TrialStats &t) { return t.order_pct.p90; });
+            const auto p99 = collect([](const TrialStats &t) { return t.order_pct.p99; });
+            const auto p999 = collect([](const TrialStats &t) { return t.order_pct.p999; });
+            const auto max = collect([](const TrialStats &t) { return t.order_pct.max; });
+            const auto tput =
+                collect([](const TrialStats &t) { return t.throughput_orders_per_sec; });
+
+            TrialAggregate a{};
+            a.p50 = stats::median_across_trials(p50);
+            a.p90 = stats::median_across_trials(p90);
+            a.p99 = stats::median_across_trials(p99);
+            a.p999 = stats::median_across_trials(p999);
+            a.max = stats::median_across_trials(max);
+            a.throughput = stats::median_across_trials(tput);
+            a.p50_cv = stats::coefficient_of_variation(p50) * 100.0;
+            a.p99_cv = stats::coefficient_of_variation(p99) * 100.0;
+            a.p999_cv = stats::coefficient_of_variation(p999) * 100.0;
+            a.throughput_cv = stats::coefficient_of_variation(tput) * 100.0;
+            a.stable = (a.p99_cv < kStableTailCvPercent) && (a.p999_cv < kStableTailCvPercent);
+            return a;
+        }
+
+        // Output paths
+
+        struct ArtifactPaths
+        {
+            std::string summary_csv;
+            std::string raw_csv;
+            std::string meta_json;
+        };
+
+        // bench.csv -> bench.csv, bench.raw.csv, bench.meta.json
+        [[nodiscard]] ArtifactPaths derive_artifact_paths(const std::string &base)
+        {
+            const std::size_t dot = base.find_last_of('.');
+            const std::string stem = (dot == std::string::npos) ? base : base.substr(0, dot);
+            const std::string ext = (dot == std::string::npos) ? "" : base.substr(dot);
+            return {base, stem + ".raw" + ext, stem + ".meta.json"};
+        }
+
+        [[nodiscard]] std::ofstream open_for_write(const std::string &path)
         {
             std::ofstream out(path, std::ios::trunc);
             if (!out)
             {
                 throw std::runtime_error("cannot open '" + path + "' for writing");
             }
+            return out;
+        }
+
+        void check_write(const std::ofstream &out, const std::string &path)
+        {
+            if (!out)
+            {
+                throw std::runtime_error("write failed for '" + path + "'");
+            }
+        }
+
+        void write_summary_csv(const std::string &path, const BenchmarkConfig &cfg,
+                               const RunData &run)
+        {
+            std::ofstream out = open_for_write(path);
             out << std::fixed << std::setprecision(3);
 
-            // MEAS-11: is_smoketest column so a sub-canonical-trial-count run is
-            // marked in the CSV too (the README promised "SMOKETEST in both
-            // places"; previously only the console said so, making a 1-trial
-            // CSV byte-shaped like a citable one). Appended as the last column
-            // so existing name-keyed consumers (charts) are unaffected.
             out << "run_id,commit_hash,trial,matching_mode,workload_type,dataset,dataset_hash,"
                    "dataset_records,warmup_operations,measured_operations,producer_cpu,"
                    "consumer_cpu,numa_node,clock_source,timestamp_overhead_ns,p50_ns_per_order,"
@@ -796,56 +990,44 @@ namespace hydra
                    "reference_validation_status,determinism_status,valid,invalid_reason,"
                    "is_smoketest\n";
 
-            const char *mode_str = (mode == MatchingMode::PRICE_TIME) ? "price_time" : "pro_rata";
-            const std::string workload_type = csv_escape(basename_of(dataset_path));
-            const std::string dataset_field = csv_escape(dataset_path);
-            const std::string invalid_reason_field = csv_escape(invalid_reason);
-            // MEAS-10: report the clock source honestly -- a run that fell back
-            // to the steady_clock shim (clock.hpp) is NOT rdtscp-calibrated, and
-            // labelling it so hid that its latencies are steady_clock-based.
-            const char *clock_source = detail::g_use_fallback_clock.load(std::memory_order_relaxed)
-                                           ? "steady_clock_fallback"
-                                           : "rdtscp_calibrated";
+            const std::string workload_type = csv_escape(basename_of(cfg.dataset_path));
+            const std::string dataset_field = csv_escape(cfg.dataset_path);
+            const std::string invalid_reason_field = csv_escape(run.invalid_reason);
+            constexpr int kNumaNode = 0;
 
-            for (std::size_t t = 0; t < trial_stats.size(); ++t)
+            for (std::size_t t = 0; t < run.trials.size(); ++t)
             {
-                const TrialStats &s = trial_stats[t];
-                out << run_id << ',' << HYDRA_LOB_VERSION << ',' << t << ',' << mode_str << ','
-                    << workload_type << ',' << dataset_field << ',' << hex64(dataset_hash) << ','
-                    << dataset_records << ',' << WARMUP_ITERATIONS << ',' << MEASURED_ITERATIONS
-                    << ',' << RX_CORE_ID << ',' << MATCHING_CORE_ID << ',' << 0 << ','
-                    << clock_source << ',' << clock_overhead_ns << ','
-                    << s.order_pct.p50 << ',' << s.order_pct.p90 << ',' << s.order_pct.p99 << ','
-                    << s.order_pct.p999 << ',' << s.order_pct.mean << ',' << s.order_pct.max << ','
-                    << s.throughput_orders_per_sec << ',' << s.crossing_order_count << ','
-                    << s.non_crossing_order_count << ',' << s.partial_fill_count << ','
-                    << s.multi_level_sweep_count << ',' << fok_order_count
-                    << ',' << s.self_trade_skip_count << ',' << s.resting_orders_examined << ','
-                    << s.eligible_orders_examined << ',' << s.generated_fill_count << ','
-                    << s.mean_fills_per_match << ',' << s.max_fill_fanout << ','
-                    << s.mean_levels_consumed << ',' << 0 /* remainder_units_distributed */ << ','
-                    << 0 /* allocation_invariant_failures */ << ',' << s.dropped_events << ','
-                    << s.arena_fallback_delta << ',' << s.pool_exhaustion_delta << ','
-                    << s.arena_fallback_delta /* unexpected_allocation_count */ << ','
-                    << hex64(state_hashes[t]) << ',' << "NOT_RUN" << ','
-                    << (determinism_pass ? "PASS" : "FAIL") << ',' << (overall_valid ? 1 : 0)
-                    << ',' << invalid_reason_field << ',' << (is_smoketest ? "SMOKETEST" : "no")
+                const TrialStats &s = run.trials[t];
+                out << run.run_id << ',' << HYDRA_LOB_VERSION << ',' << t << ','
+                    << mode_id(cfg.mode) << ',' << workload_type << ',' << dataset_field << ','
+                    << hex64(run.dataset_hash) << ',' << run.event_count << ',' << WARMUP_ITERATIONS
+                    << ',' << MEASURED_ITERATIONS << ',' << RX_CORE_ID << ',' << MATCHING_CORE_ID
+                    << ',' << kNumaNode << ',' << clock_source_name() << ','
+                    << run.clock_overhead_ns << ',' << s.order_pct.p50 << ',' << s.order_pct.p90
+                    << ',' << s.order_pct.p99 << ',' << s.order_pct.p999 << ',' << s.order_pct.mean
+                    << ',' << s.order_pct.max << ',' << s.throughput_orders_per_sec << ','
+                    << s.crossing_order_count << ',' << s.non_crossing_order_count << ','
+                    << s.partial_fill_count << ',' << s.multi_level_sweep_count << ','
+                    << run.composition.fok_count << ',' << s.self_trade_skip_count << ','
+                    << s.resting_orders_examined << ',' << s.eligible_orders_examined << ','
+                    << s.generated_fill_count << ',' << s.mean_fills_per_match << ','
+                    << s.max_fill_fanout << ',' << s.mean_levels_consumed << ','
+                    << ',' // remainder_units_distributed: not measured
+                    << ',' // allocation_invariant_failures: not instrumented
+                    << s.dropped_events << ',' << s.arena_fallback_delta << ','
+                    << s.pool_exhaustion_delta << ','
+                    << s.arena_fallback_delta // unexpected_allocation_count
+                    << ',' << hex64(s.state_hash) << ',' << "NOT_RUN" << ','
+                    << (run.determinism_pass ? "PASS" : "FAIL") << ',' << (run.valid ? 1 : 0) << ','
+                    << invalid_reason_field << ',' << (run.is_smoketest ? "SMOKETEST" : "no")
                     << '\n';
             }
-
-            if (!out)
-            {
-                throw std::runtime_error("write failed for '" + path + "'");
-            }
+            check_write(out, path);
         }
 
         void write_raw_csv(const std::string &path, const std::vector<TrialRecord> &trials)
         {
-            std::ofstream out(path, std::ios::trunc);
-            if (!out)
-            {
-                throw std::runtime_error("cannot open '" + path + "' for writing");
-            }
+            std::ofstream out = open_for_write(path);
             out << "trial,iteration,queue_residence_ns,queue_pop_ns,match_time_ns,"
                    "fill_publish_ns,end_to_end_ns,fills_generated,levels_consumed,"
                    "resting_orders_examined,eligible_orders_examined,self_trade_skips,"
@@ -865,65 +1047,226 @@ namespace hydra
                         << (s.is_replace ? 1 : 0) << '\n';
                 }
             }
-            if (!out)
-            {
-                throw std::runtime_error("write failed for '" + path + "'");
-            }
+            check_write(out, path);
         }
 
-        void write_metadata_json(const std::string &path, const std::string &run_id,
-                                 MatchingMode mode, const std::string &env_snapshot,
-                                 const std::string &dataset_path, uint64_t dataset_hash,
-                                 bool dirty, bool allow_dirty, bool overall_valid,
-                                 const std::string &invalid_reason)
+        void write_metadata_json(const std::string &path, const BenchmarkConfig &cfg,
+                                 const RunData &run)
         {
-            std::ofstream out(path, std::ios::trunc);
-            if (!out)
-            {
-                throw std::runtime_error("cannot open '" + path + "' for writing");
-            }
-            // MEAS-09: every string value is JSON-escaped so a quote/backslash
-            // in a path or reason can't produce unparseable JSON.
+            std::ofstream out = open_for_write(path);
             out << "{\n"
-                << "  \"run_id\": \"" << json_escape(run_id) << "\",\n"
+                << "  \"run_id\": \"" << json_escape(run.run_id) << "\",\n"
                 << "  \"commit_hash\": \"" << json_escape(HYDRA_LOB_VERSION) << "\",\n"
-                << "  \"working_tree_dirty\": " << (dirty ? "true" : "false") << ",\n"
-                << "  \"dirty_allowed\": " << (allow_dirty ? "true" : "false") << ",\n"
-                << "  \"matching_mode\": \""
-                << (mode == MatchingMode::PRICE_TIME ? "price_time" : "pro_rata") << "\",\n"
-                << "  \"dataset_path\": \"" << json_escape(dataset_path) << "\",\n"
-                << "  \"dataset_hash\": \"" << hex64(dataset_hash) << "\",\n"
+                << "  \"working_tree_dirty\": " << (kDirtyBuild ? "true" : "false") << ",\n"
+                << "  \"dirty_allowed\": " << (cfg.allow_dirty ? "true" : "false") << ",\n"
+                << "  \"is_smoketest\": " << (run.is_smoketest ? "true" : "false") << ",\n"
+                << "  \"matching_mode\": \"" << mode_id(cfg.mode) << "\",\n"
+                << "  \"dataset_path\": \"" << json_escape(cfg.dataset_path) << "\",\n"
+                << "  \"dataset_hash\": \"" << hex64(run.dataset_hash) << "\",\n"
                 << "  \"cpu_model\": \"" << json_escape(cpu_model_name()) << "\",\n"
-                << "  \"clock_source\": \""
-                << (detail::g_use_fallback_clock.load(std::memory_order_relaxed)
-                        ? "steady_clock_fallback"
-                        : "rdtscp_calibrated")
-                << "\",\n"
-                << "  \"compiler\": \"" <<
-#if defined(__VERSION__)
-                __VERSION__
-#else
-                "unknown"
-#endif
-                << "\",\n"
-                << "  \"env_snapshot\": \"" << json_escape(env_snapshot) << "\",\n"
-                << "  \"result_validity\": \"" << (overall_valid ? "VALID" : "INVALID") << "\",\n"
-                << "  \"invalid_reason\": \"" << json_escape(invalid_reason) << "\"\n"
+                << "  \"clock_source\": \"" << clock_source_name() << "\",\n"
+                << "  \"compiler\": \"" << compiler_version() << "\",\n"
+                << "  \"env_snapshot\": \"" << json_escape(run.env_snapshot) << "\",\n"
+                << "  \"result_validity\": \"" << (run.valid ? "VALID" : "INVALID") << "\",\n"
+                << "  \"invalid_reason\": \"" << json_escape(run.invalid_reason) << "\"\n"
                 << "}\n";
-            if (!out)
+            check_write(out, path);
+        }
+
+        // Console report
+
+        void print_run_and_workload(const BenchmarkConfig &cfg, const RunData &run)
+        {
+            const TrialStats &first = run.trials.front();
+            const std::string validity_suffix = run.valid ? "" : " (" + run.invalid_reason + ")";
+            const char *working_tree =
+                !kDirtyBuild ? "Clean"
+                             : (cfg.allow_dirty ? "Dirty (allowed via --allow-dirty)" : "Dirty");
+            const char *policy = (cfg.mode == MatchingMode::PRICE_TIME)
+                                     ? "Price-Time Priority (FIFO)"
+                                     : "Pro-Rata Allocation";
+
+            std::printf("%s", kDoubleRule);
+            std::printf("BLITZ LOB -- CANONICAL MATCHING BENCHMARK\n");
+            std::printf("%s", kDoubleRule);
+            std::printf("\nRun\n%s", kRule);
+            std::printf("Policy              : %s\n"
+                        "Commit              : %s\n"
+                        "Working tree        : %s\n"
+                        "Run ID              : %s\n"
+                        "Validity            : %s%s\n",
+                        policy, HYDRA_LOB_VERSION, working_tree, run.run_id.c_str(),
+                        run.valid ? "VALID" : "INVALID", validity_suffix.c_str());
+
+            std::printf("\nWorkload\n%s", kRule);
+            std::printf("Dataset             : %s\n"
+                        "Dataset hash        : %s\n"
+                        "Input messages      : %zu\n"
+                        "Warm-up messages    : %zu\n"
+                        "Measured messages   : %zu\n"
+                        "  New orders        : %zu\n"
+                        "  Cancels           : %zu\n"
+                        "  Replaces          : %zu\n"
+                        "  FOK orders        : %zu\n"
+                        "  IOC orders        : %zu\n"
+                        "  GTC orders        : %zu\n"
+                        "Crossing orders     : %llu (%.2f%%)\n"
+                        "Generated fills     : %llu\n"
+                        "Fills/crossing order: %.3f\n"
+                        "Maximum fill fan-out: %llu\n",
+                        cfg.dataset_path.c_str(), hex64(run.dataset_hash).c_str(), run.event_count,
+                        WARMUP_ITERATIONS, MEASURED_ITERATIONS, run.composition.new_order_count,
+                        run.composition.cancel_count, run.composition.replace_count,
+                        run.composition.fok_count, run.composition.ioc_count,
+                        run.composition.gtc_count, static_cast<ull>(first.crossing_order_count),
+                        ratio_or_zero(100.0 * static_cast<double>(first.crossing_order_count),
+                                      static_cast<double>(first.order_count)),
+                        static_cast<ull>(first.generated_fill_count), first.mean_fills_per_match,
+                        static_cast<ull>(first.max_fill_fanout));
+
+            std::printf("\nEnvironment\n%s", kRule);
+            std::printf("CPU model           : %s\n"
+                        "Build               : Release\n"
+                        "Compiler            : %s\n"
+                        "NUMA node           : 0 (operator-bound via numactl, not self-verified)\n"
+                        "Producer CPU        : %d\n"
+                        "Consumer CPU        : %d\n"
+                        "Preflight           : PASS (core isolation, governor, SMT -- see env "
+                        "below)\n"
+                        "Env                 : %s\n",
+                        cpu_model_name().c_str(), compiler_version(), RX_CORE_ID, MATCHING_CORE_ID,
+                        run.env_snapshot.c_str());
+
+            std::printf("\nMeasurement\n%s", kRule);
+            std::printf("Metric              : Matching-engine processing latency (end-to-end, "
+                        "orders)\n"
+                        "Start               : replay_phase()'s intended-arrival timestamp (t1)\n"
+                        "End                 : matching_thread_fn's post-match() timestamp "
+                        "(t_match_end)\n"
+                        "Clock               : rdtscp, calibrated ns_per_cycle (clock.hpp)\n"
+                        "Clock overhead      : %.2f ns/sample\n"
+                        "Sample              : One processed input message\n"
+                        "Trials              : %zu independent trials%s\n",
+                        run.clock_overhead_ns, cfg.trials,
+                        run.is_smoketest ? " [SMOKETEST -- not a citable result]" : "");
+        }
+
+        void print_trial_table(const std::vector<TrialStats> &trials)
+        {
+            std::printf("\nTrial Results\n%s", kRule);
+            std::printf("Trial   P50       P90       P99       P99.9     Max       Throughput\n"
+                        "        ns/order  ns/order  ns/order  ns/order  ns/order  M orders/s\n");
+            std::printf("%s", kRule);
+            for (std::size_t t = 0; t < trials.size(); ++t)
             {
-                throw std::runtime_error("write failed for '" + path + "'");
+                const TrialStats &s = trials[t];
+                std::printf("%-8zu%-10.1f%-10.1f%-10.1f%-10.1f%-10.1f%-.4f\n", t, s.order_pct.p50,
+                            s.order_pct.p90, s.order_pct.p99, s.order_pct.p999, s.order_pct.max,
+                            s.throughput_orders_per_sec / 1'000'000.0);
             }
         }
 
-        [[nodiscard]] std::string derive_path(const std::string &base, const std::string &suffix)
+        void print_canonical_result(const BenchmarkConfig &cfg, const RunData &run,
+                                    const TrialAggregate &agg)
         {
-            const std::size_t dot = base.find_last_of('.');
-            if (dot == std::string::npos)
+            std::printf("\nCanonical Result -- Median Across Independent Trials\n%s", kRule);
+            std::printf("P50 processing latency   : %.1f ns/order\n"
+                        "P90 processing latency   : %.1f ns/order\n"
+                        "P99 processing latency   : %.1f ns/order\n"
+                        "P99.9 processing latency : %.1f ns/order\n"
+                        "Maximum observed latency : %.1f ns/order\n"
+                        "Median throughput        : %.4f million orders/second\n",
+                        agg.p50, agg.p90, agg.p99, agg.p999, agg.max, agg.throughput / 1'000'000.0);
+
+            std::printf("\nStability\n%s", kRule);
+            std::printf("P50 variation (CV)       : %.2f %%\n"
+                        "P99 variation (CV)       : %.2f %%\n"
+                        "P99.9 variation (CV)     : %.2f %%\n"
+                        "Throughput variation (CV): %.2f %%\n"
+                        "Stability verdict        : %s\n",
+                        agg.p50_cv, agg.p99_cv, agg.p999_cv, agg.throughput_cv,
+                        agg.stable ? "STABLE" : "UNSTABLE");
+
+            std::printf("\nCorrectness and Resources\n%s", kRule);
+            std::printf(
+                "Processed messages   : %zu\n"
+                "Dropped messages     : %llu\n"
+                "Invalid fills        : 0 (structural guarantee, see matcher.hpp's zero-qty "
+                "fill guards; not a live runtime check this pass)\n"
+                "State hash           : %s\n"
+                "Reference comparison : NOT_RUN (no independent reference matcher wired up "
+                "this pass -- see METHODOLOGY.md)\n"
+                "Determinism          : %s\n"
+                "Pool exhaustion      : %s\n"
+                "Arena fallback       : %s\n"
+                "Unexpected allocation: %llu\n"
+                "Correctness verdict  : %s\n",
+                MEASURED_ITERATIONS * cfg.trials, static_cast<ull>(run.total_dropped),
+                hex64(run.trials.front().state_hash).c_str(),
+                run.determinism_pass ? "PASS" : "FAIL",
+                run.total_pool_exhaustions == 0 ? "NO" : "YES",
+                run.total_arena_fallbacks == 0 ? "NO" : "YES",
+                static_cast<ull>(run.total_arena_fallbacks), run.valid ? "PASS" : "FAIL");
+        }
+
+        void print_artifacts(const ArtifactPaths &paths)
+        {
+            std::printf("\nArtifacts\n%s", kRule);
+            std::printf("Summary CSV          : %s\n"
+                        "Raw trial CSV        : %s\n"
+                        "Metadata JSON        : %s\n",
+                        paths.summary_csv.c_str(), paths.raw_csv.c_str(), paths.meta_json.c_str());
+            std::printf("%s", kDoubleRule);
+        }
+
+        void print_pro_rata_detail(const RunData &run)
+        {
+            const TrialStats &s0 = run.trials.front();
+            std::printf("\nPro-Rata Detail\n%s", kRule);
+            std::printf(
+                "Eligible orders examined   : %llu\n"
+                "Mean eligible orders/match : %.3f\n"
+                "Mean generated fills/match : %.3f\n"
+                "Maximum fill fan-out       : %llu\n"
+                "Remainder units allocated  : N/A (not separately instrumented this pass -- "
+                "see METHODOLOGY.md)\n"
+                "Allocation invariant errors: 0 (verified structurally + by unit test, not a "
+                "live per-fill runtime check)\n"
+                "Mean latency/generated fill: %.2f ns/fill\n"
+                "Determinism validation     : %s\n",
+                static_cast<ull>(s0.eligible_orders_examined),
+                ratio_or_zero(static_cast<double>(s0.eligible_orders_examined),
+                              static_cast<double>(s0.crossing_order_count)),
+                s0.mean_fills_per_match, static_cast<ull>(s0.max_fill_fanout),
+                s0.mean_fill_publish_ns, run.determinism_pass ? "PASS" : "FAIL");
+            std::printf("%s", kDoubleRule);
+        }
+
+        void print_verbose_diagnostics(const RunData &run)
+        {
+            const TrialStats &first = run.trials.front();
+            std::printf("\nVerbose Diagnostics\n%s", kRule);
+            std::printf("Dataset seed             : %llu\n"
+                        "Final book depth         : %zu bid level(s), %zu ask level(s)\n"
+                        "Max pacing schedule drift: %llu ns\n"
+                        "Queue push latency (mean): %.2f ns\n"
+                        "Queue push latency (max) : %llu ns\n"
+                        "Cancel samples/trial     : %zu\n"
+                        "Cancel P50/P99/P99.9     : %.1f / %.1f / %.1f ns\n",
+                        static_cast<ull>(run.dataset_seed), run.final_bid_levels,
+                        run.final_ask_levels, static_cast<ull>(run.max_schedule_drift_ns),
+                        ratio_or_zero(run.push_ns_sum, static_cast<double>(run.push_count)),
+                        static_cast<ull>(run.push_ns_max), first.cancel_count, first.cancel_pct.p50,
+                        first.cancel_pct.p99, first.cancel_pct.p999);
+            for (std::size_t t = 0; t < run.trials.size(); ++t)
             {
-                return base + suffix;
+                const TrialStats &s = run.trials[t];
+                std::printf("Trial %zu: dropped=%llu arena_fallback_delta=%llu "
+                            "pool_exhaustion_delta=%llu state_hash=%s\n",
+                            t, static_cast<ull>(s.dropped_events),
+                            static_cast<ull>(s.arena_fallback_delta),
+                            static_cast<ull>(s.pool_exhaustion_delta), hex64(s.state_hash).c_str());
             }
-            return base.substr(0, dot) + suffix + base.substr(dot);
         }
 
     } // namespace
@@ -937,44 +1280,38 @@ namespace hydra
                 "live-generation fallback. Generate one with blitz_gen_dataset "
                 "and pass --dataset.");
         }
-
-        // MEAS-12: trials==0 would run the trial loop zero times, leaving
-        // trial_stats/state_hashes empty; the report then does
-        // trial_stats.front()/state_hashes.front() (and the pools' reset across
-        // an empty range), which is UB -- observed as a segfault / double-free.
-        // A run with zero trials produces no measurement, so reject it up front.
         if (cfg.trials == 0)
         {
-            throw std::runtime_error(
-                "run_benchmark: --trials must be at least 1 (0 produces no "
-                "measurement and is not a valid run).");
+            throw std::runtime_error("run_benchmark: --trials must be at least 1 (0 produces no "
+                                     "measurement and is not a valid run).");
         }
 
         pin_to_core(RX_CORE_ID);
         verify_affinity(RX_CORE_ID);
+        run_preflight_checks();
 
-        run_preflight_checks("/sys/devices/system/cpu");
-        const std::string env_snapshot = capture_env_snapshot("/sys/devices/system/cpu");
+        RunData run;
+        run.env_snapshot = capture_env_snapshot();
 
         std::vector<std::string> invalid_reasons;
-
-#if HYDRA_LOB_DIRTY
-        if (!cfg.allow_dirty)
+        if constexpr (kDirtyBuild)
         {
-            invalid_reasons.push_back("working tree dirty at build time (pass --allow-dirty "
-                                       "to intentionally run against a dirty tree)");
+            if (!cfg.allow_dirty)
+            {
+                invalid_reasons.push_back("working tree dirty at build time (pass --allow-dirty "
+                                          "to intentionally run against a dirty tree)");
+            }
+            std::fprintf(stderr,
+                         "%s: working tree was dirty at build time -- this binary's "
+                         "HYDRA_LOB_VERSION (%s) does not fully identify the code that "
+                         "produced this run.%s\n",
+                         cfg.allow_dirty ? "WARNING" : "ERROR", HYDRA_LOB_VERSION,
+                         cfg.allow_dirty ? " Proceeding because --allow-dirty was passed."
+                                         : " Commit, or pass --allow-dirty to proceed anyway.");
         }
-        std::fprintf(stderr,
-                     "%s: working tree was dirty at build time -- this binary's "
-                     "HYDRA_LOB_VERSION (%s) does not fully identify the code that "
-                     "produced this run.%s\n",
-                     cfg.allow_dirty ? "WARNING" : "ERROR", HYDRA_LOB_VERSION,
-                     cfg.allow_dirty ? " Proceeding because --allow-dirty was passed."
-                                     : " Commit, or pass --allow-dirty to proceed anyway.");
-#endif
 
-        const bool is_smoketest = cfg.trials < DEFAULT_TRIAL_COUNT;
-        if (is_smoketest)
+        run.is_smoketest = cfg.trials < DEFAULT_TRIAL_COUNT;
+        if (run.is_smoketest)
         {
             std::fprintf(stderr,
                          "NOTE: --trials %zu is below the canonical trial count (%zu) -- "
@@ -985,471 +1322,58 @@ namespace hydra
 
         ctx.matcher.set_mode(cfg.mode);
 
-        const uint64_t dataset_seed = peek_dataset_seed(cfg.dataset_path);
-        const uint64_t dataset_hash = compute_dataset_hash(cfg.dataset_path);
-        std::vector<DatasetEvent> events = DatasetGenerator::read_from_file(cfg.dataset_path);
-        if (events.size() < WARMUP_ITERATIONS + MEASURED_ITERATIONS)
+        run.dataset_seed = peek_dataset_seed(cfg.dataset_path);
+        run.dataset_hash = compute_dataset_hash(cfg.dataset_path);
+        const std::vector<DatasetEvent> events = DatasetGenerator::read_from_file(cfg.dataset_path);
+        constexpr std::size_t kRequiredEvents = WARMUP_ITERATIONS + MEASURED_ITERATIONS;
+        if (events.size() < kRequiredEvents)
         {
-            throw std::runtime_error(
-                "dataset '" + cfg.dataset_path + "' has only " +
-                std::to_string(events.size()) + " events, need at least " +
-                std::to_string(WARMUP_ITERATIONS + MEASURED_ITERATIONS) +
-                " (WARMUP_ITERATIONS + MEASURED_ITERATIONS)");
+            throw std::runtime_error("dataset '" + cfg.dataset_path + "' has only " +
+                                     std::to_string(events.size()) + " events, need at least " +
+                                     std::to_string(kRequiredEvents) +
+                                     " (WARMUP_ITERATIONS + MEASURED_ITERATIONS)");
         }
-        const DatasetComposition composition = compute_dataset_composition(
-            events, WARMUP_ITERATIONS, WARMUP_ITERATIONS + MEASURED_ITERATIONS);
+        run.event_count = events.size();
+        run.composition = compute_dataset_composition(events, WARMUP_ITERATIONS, kRequiredEvents);
 
         const double ns_per_cycle = calibrate_ns_per_cycle();
         ctx.ns_per_cycle = ns_per_cycle;
-        const double clock_overhead_ns = measure_clock_overhead_ns(ns_per_cycle);
+        run.clock_overhead_ns = measure_clock_overhead_ns(ns_per_cycle);
 
         std::jthread matching_thread(matching_thread_fn, std::ref(ctx));
 
-        std::vector<TrialRecord> trial_records;
-        std::vector<TrialStats> trial_stats;
-        std::vector<uint64_t> state_hashes;
-        trial_records.reserve(cfg.trials);
-        trial_stats.reserve(cfg.trials);
-        state_hashes.reserve(cfg.trials);
-
-        uint64_t total_dropped_events = 0;
-        uint64_t max_schedule_drift_ns = 0;
-        double push_ns_sum_all = 0.0;
-        uint64_t push_ns_max_all = 0;
-        std::size_t push_count_all = 0;
-
+        run.records.reserve(cfg.trials);
+        run.trials.reserve(cfg.trials);
         for (std::size_t trial = 0; trial < cfg.trials; ++trial)
         {
-            if (trial > 0)
-            {
-                ctx.book.reset();
-                ctx.order_pool.reset();
-                ctx.level_pool.reset();
-            }
-
-            const uint64_t arena_before = ctx.book.arena_fallback_count();
-            const uint64_t order_pool_before = ctx.order_pool.exhaustion_count();
-            const uint64_t level_pool_before = ctx.level_pool.exhaustion_count();
-
-            {
-                const ReplayPhaseResult warmup_result = replay_phase(
-                    ctx, events, 0, WARMUP_ITERATIONS, ns_per_cycle,
-                    [](std::size_t, const DatasetEvent &) {});
-                total_dropped_events += warmup_result.dropped;
-                max_schedule_drift_ns = std::max(max_schedule_drift_ns, warmup_result.max_drift_ns);
-            }
-
-            TrialRecord record;
-            record.timestamps_unix.reserve(MEASURED_ITERATIONS);
-            std::vector<LatencySample> sink_storage(MEASURED_ITERATIONS);
-            RawSampleSink sink;
-            sink.samples = sink_storage.data();
-            sink.capacity = MEASURED_ITERATIONS;
-
-            ctx.raw_samples.store(&sink, std::memory_order_release);
-
-            const auto batch_start = std::chrono::steady_clock::now();
-            ReplayPhaseResult measured_result{};
-            {
-                measured_result = replay_phase(
-                    ctx, events, WARMUP_ITERATIONS, WARMUP_ITERATIONS + MEASURED_ITERATIONS,
-                    ns_per_cycle, [&record](std::size_t, const DatasetEvent &)
-                    { record.timestamps_unix.push_back(current_unix_seconds()); });
-                total_dropped_events += measured_result.dropped;
-                max_schedule_drift_ns = std::max(max_schedule_drift_ns, measured_result.max_drift_ns);
-                push_ns_sum_all += measured_result.push_ns_sum;
-                push_ns_max_all = std::max(push_ns_max_all, measured_result.push_ns_max);
-                push_count_all += measured_result.push_count;
-            }
-
-            while (sink.count() < record.timestamps_unix.size())
-            {
-                std::this_thread::yield();
-            }
-            ctx.raw_samples.store(nullptr, std::memory_order_release);
-            const auto batch_end = std::chrono::steady_clock::now();
-            const double batch_seconds =
-                std::chrono::duration<double>(batch_end - batch_start).count();
-
-            record.samples.assign(sink_storage.begin(),
-                                  sink_storage.begin() +
-                                      static_cast<std::ptrdiff_t>(record.timestamps_unix.size()));
-
-            const uint64_t arena_delta = ctx.book.arena_fallback_count() - arena_before;
-            const uint64_t pool_delta = (ctx.order_pool.exhaustion_count() - order_pool_before) +
-                                        (ctx.level_pool.exhaustion_count() - level_pool_before);
-
-            const TrialStats ts = compute_trial_stats(
-                record, ctx.book.bid_level_count(), ctx.book.ask_level_count(), batch_seconds,
-                measured_result.dropped, measured_result.max_drift_ns, arena_delta, pool_delta);
-
-            if (arena_delta > 0)
-            {
-                std::fprintf(stderr,
-                             "WARNING: order book's fixed arena overflowed to the heap %llu "
-                             "time(s) during trial %zu.\n",
-                             static_cast<unsigned long long>(arena_delta), trial);
-            }
-            if (pool_delta > 0)
-            {
-                std::fprintf(stderr,
-                             "WARNING: order/level pool exhausted %llu time(s) during trial "
-                             "%zu -- incoming orders/levels were silently dropped.\n",
-                             static_cast<unsigned long long>(pool_delta), trial);
-            }
-
-            state_hashes.push_back(ts.state_hash);
-            trial_stats.push_back(ts);
-            trial_records.push_back(std::move(record));
+            run_trial(ctx, events, ns_per_cycle, trial, run);
         }
 
-        // Determinism: every trial replayed the identical seeded event
-        // sequence against a freshly reset book -- a deterministic system
-        // must therefore produce an identical logical-outcome fingerprint
-        // every time.
-        bool determinism_pass = true;
-        for (std::size_t i = 1; i < state_hashes.size(); ++i)
-        {
-            if (state_hashes[i] != state_hashes[0])
-            {
-                determinism_pass = false;
-                break;
-            }
-        }
-        if (!determinism_pass)
-        {
-            invalid_reasons.push_back("determinism check failed: state_hash differs across trials");
-        }
+        run.final_bid_levels = ctx.book.bid_level_count();
+        run.final_ask_levels = ctx.book.ask_level_count();
+        assess_validity(run, std::move(invalid_reasons));
+        run.run_id = std::string(HYDRA_LOB_VERSION) + "-" + mode_id(cfg.mode) + "-" +
+                     std::to_string(current_unix_seconds());
 
-        if (total_dropped_events > 0)
-        {
-            invalid_reasons.push_back("dropped_events > 0 (" +
-                                      std::to_string(total_dropped_events) + ")");
-        }
-        uint64_t total_arena_fallbacks = 0;
-        uint64_t total_pool_exhaustions = 0;
-        for (const auto &ts : trial_stats)
-        {
-            total_arena_fallbacks += ts.arena_fallback_delta;
-            total_pool_exhaustions += ts.pool_exhaustion_delta;
-        }
-        if (total_arena_fallbacks > 0)
-        {
-            invalid_reasons.push_back("arena_fallback_count > 0 (" +
-                                      std::to_string(total_arena_fallbacks) + ")");
-        }
-        if (total_pool_exhaustions > 0)
-        {
-            invalid_reasons.push_back("pool_exhaustion_count > 0 (" +
-                                      std::to_string(total_pool_exhaustions) + ")");
-        }
+        const TrialAggregate agg = aggregate_trials(run.trials);
+        const ArtifactPaths paths = derive_artifact_paths(cfg.output_path);
 
-        const bool overall_valid = invalid_reasons.empty();
-        std::string invalid_reason_str;
-        for (std::size_t i = 0; i < invalid_reasons.size(); ++i)
-        {
-            if (i > 0)
-            {
-                invalid_reason_str += "; ";
-            }
-            invalid_reason_str += invalid_reasons[i];
-        }
-
-        // Median-across-trials for every headline figure.
-        const auto collect = [&](auto extractor) -> std::vector<double>
-        {
-            std::vector<double> v;
-            v.reserve(trial_stats.size());
-            for (const auto &ts : trial_stats)
-            {
-                v.push_back(extractor(ts));
-            }
-            return v;
-        };
-        const double median_p50 = stats::median_across_trials(collect([](const TrialStats &t)
-                                                                       { return t.order_pct.p50; }));
-        const double median_p90 = stats::median_across_trials(collect([](const TrialStats &t)
-                                                                       { return t.order_pct.p90; }));
-        const double median_p99 = stats::median_across_trials(collect([](const TrialStats &t)
-                                                                       { return t.order_pct.p99; }));
-        const double median_p999 = stats::median_across_trials(
-            collect([](const TrialStats &t) { return t.order_pct.p999; }));
-        const double median_max = stats::median_across_trials(collect([](const TrialStats &t)
-                                                                       { return t.order_pct.max; }));
-        const double median_throughput = stats::median_across_trials(
-            collect([](const TrialStats &t) { return t.throughput_orders_per_sec; }));
-
-        const std::vector<double> p50_series = collect([](const TrialStats &t)
-                                                        { return t.order_pct.p50; });
-        const std::vector<double> p99_series = collect([](const TrialStats &t)
-                                                        { return t.order_pct.p99; });
-        const std::vector<double> p999_series = collect([](const TrialStats &t)
-                                                         { return t.order_pct.p999; });
-        const std::vector<double> throughput_series =
-            collect([](const TrialStats &t) { return t.throughput_orders_per_sec; });
-
-        const double p50_cv = stats::coefficient_of_variation(p50_series) * 100.0;
-        const double p99_cv = stats::coefficient_of_variation(p99_series) * 100.0;
-        const double p999_cv = stats::coefficient_of_variation(p999_series) * 100.0;
-        const double throughput_cv = stats::coefficient_of_variation(throughput_series) * 100.0;
-        // Loosely-justified stability threshold: within 15% coefficient of
-        // variation on both tail percentiles across trials. Not a formal
-        // statistical test, disclosed as a heuristic in
-        // METHODOLOGY.md.
-        const bool stable = (p99_cv < 15.0) && (p999_cv < 15.0);
-
-        const std::size_t final_bid_levels = ctx.book.bid_level_count();
-        const std::size_t final_ask_levels = ctx.book.ask_level_count();
-
-        const std::string run_id = std::string(HYDRA_LOB_VERSION) + "-" +
-                                   (cfg.mode == MatchingMode::PRICE_TIME ? "price_time"
-                                                                          : "pro_rata") +
-                                   "-" + std::to_string(current_unix_seconds());
-
-        // --------------------------------------------------------------
-        // Console report
-        // --------------------------------------------------------------
-        const char *mode_str_full =
-            (cfg.mode == MatchingMode::PRICE_TIME) ? "Price-Time Priority (FIFO)" : "Pro-Rata Allocation";
-        const char *mode_str_short =
-            (cfg.mode == MatchingMode::PRICE_TIME) ? "price_time" : "pro_rata";
-
-        std::fprintf(stdout,
-                     "================================================================================\n"
-                     "BLITZ LOB -- CANONICAL MATCHING BENCHMARK\n"
-                     "================================================================================\n"
-                     "\n"
-                     "Run\n"
-                     "--------------------------------------------------------------------------------\n"
-                     "Policy              : %s\n"
-                     "Commit              : %s\n"
-                     "Working tree        : %s\n"
-                     "Run ID              : %s\n"
-                     "Validity            : %s%s\n"
-                     "\n"
-                     "Workload\n"
-                     "--------------------------------------------------------------------------------\n"
-                     "Dataset             : %s\n"
-                     "Dataset hash        : %s\n"
-                     "Input messages      : %zu\n"
-                     "Warm-up messages    : %zu\n"
-                     "Measured messages   : %zu\n"
-                     "  New orders        : %zu\n"
-                     "  Cancels           : %zu\n"
-                     "  Replaces          : %zu\n"
-                     "  FOK orders        : %zu\n"
-                     "  IOC orders        : %zu\n"
-                     "  GTC orders        : %zu\n"
-                     "Crossing orders     : %llu (%.2f%%)\n"
-                     "Generated fills     : %llu\n"
-                     "Fills/crossing order: %.3f\n"
-                     "Maximum fill fan-out: %llu\n"
-                     "\n"
-                     "Environment\n"
-                     "--------------------------------------------------------------------------------\n"
-                     "CPU model           : %s\n"
-                     "Build               : Release\n"
-                     "Compiler            : %s\n"
-                     "NUMA node           : 0 (operator-bound via numactl, not self-verified)\n"
-                     "Producer CPU        : %d\n"
-                     "Consumer CPU        : %d\n"
-                     "Preflight           : PASS (core isolation, governor, SMT -- see env below)\n"
-                     "Env                 : %s\n"
-                     "\n"
-                     "Measurement\n"
-                     "--------------------------------------------------------------------------------\n"
-                     "Metric              : Matching-engine processing latency (end-to-end, orders)\n"
-                     "Start               : replay_phase()'s intended-arrival timestamp (t1)\n"
-                     "End                 : matching_thread_fn's post-match() timestamp (t_match_end)\n"
-                     "Clock               : rdtscp, calibrated ns_per_cycle (clock.hpp)\n"
-                     "Clock overhead      : %.2f ns/sample\n"
-                     "Sample              : One processed input message\n"
-                     "Trials              : %zu independent trials%s\n",
-                     mode_str_full,
-                     HYDRA_LOB_VERSION,
-#if HYDRA_LOB_DIRTY
-                     cfg.allow_dirty ? "Dirty (allowed via --allow-dirty)" : "Dirty",
-#else
-                     "Clean",
-#endif
-                     run_id.c_str(), overall_valid ? "VALID" : "INVALID",
-                     overall_valid ? "" : (" (" + invalid_reason_str + ")").c_str(),
-                     cfg.dataset_path.c_str(), hex64(dataset_hash).c_str(), events.size(),
-                     WARMUP_ITERATIONS, MEASURED_ITERATIONS, composition.new_order_count,
-                     composition.cancel_count, composition.replace_count, composition.fok_count,
-                     composition.ioc_count, composition.gtc_count,
-                     static_cast<unsigned long long>(trial_stats.front().crossing_order_count),
-                     trial_stats.front().order_count > 0
-                         ? 100.0 * static_cast<double>(trial_stats.front().crossing_order_count) /
-                               static_cast<double>(trial_stats.front().order_count)
-                         : 0.0,
-                     static_cast<unsigned long long>(trial_stats.front().generated_fill_count),
-                     trial_stats.front().mean_fills_per_match,
-                     static_cast<unsigned long long>(trial_stats.front().max_fill_fanout),
-                     cpu_model_name().c_str(),
-#if defined(__VERSION__)
-                     __VERSION__,
-#else
-                     "unknown",
-#endif
-                     RX_CORE_ID, MATCHING_CORE_ID, env_snapshot.c_str(), clock_overhead_ns,
-                     cfg.trials, is_smoketest ? " [SMOKETEST -- not a citable result]" : "");
-
-        std::fprintf(stdout,
-                     "\n"
-                     "Trial Results\n"
-                     "--------------------------------------------------------------------------------\n"
-                     "Trial   P50       P90       P99       P99.9     Max       Throughput\n"
-                     "        ns/order  ns/order  ns/order  ns/order  ns/order  M orders/s\n"
-                     "--------------------------------------------------------------------------------\n");
-        for (std::size_t t = 0; t < trial_stats.size(); ++t)
-        {
-            const TrialStats &s = trial_stats[t];
-            std::fprintf(stdout, "%-8zu%-10.1f%-10.1f%-10.1f%-10.1f%-10.1f%-.4f\n", t,
-                         s.order_pct.p50, s.order_pct.p90, s.order_pct.p99, s.order_pct.p999,
-                         s.order_pct.max, s.throughput_orders_per_sec / 1'000'000.0);
-        }
-
-        std::fprintf(stdout,
-                     "\n"
-                     "Canonical Result -- Median Across Independent Trials\n"
-                     "--------------------------------------------------------------------------------\n"
-                     "P50 processing latency   : %.1f ns/order\n"
-                     "P90 processing latency   : %.1f ns/order\n"
-                     "P99 processing latency   : %.1f ns/order\n"
-                     "P99.9 processing latency : %.1f ns/order\n"
-                     "Maximum observed latency : %.1f ns/order\n"
-                     "Median throughput        : %.4f million orders/second\n"
-                     "\n"
-                     "Stability\n"
-                     "--------------------------------------------------------------------------------\n"
-                     "P50 variation (CV)       : %.2f %%\n"
-                     "P99 variation (CV)       : %.2f %%\n"
-                     "P99.9 variation (CV)     : %.2f %%\n"
-                     "Throughput variation (CV): %.2f %%\n"
-                     "Stability verdict        : %s\n"
-                     "\n"
-                     "Correctness and Resources\n"
-                     "--------------------------------------------------------------------------------\n"
-                     "Processed messages   : %zu\n"
-                     "Dropped messages     : %llu\n"
-                     "Invalid fills        : 0 (structural guarantee, see matcher.hpp's zero-qty "
-                     "fill guards; not a live runtime check this pass)\n"
-                     "State hash           : %s\n"
-                     "Reference comparison : NOT_RUN (no independent reference matcher wired up "
-                     "this pass -- see METHODOLOGY.md)\n"
-                     "Determinism          : %s\n"
-                     "Pool exhaustion      : %s\n"
-                     "Arena fallback       : %s\n"
-                     "Unexpected allocation: %llu\n"
-                     "Correctness verdict  : %s\n",
-                     median_p50, median_p90, median_p99, median_p999, median_max,
-                     median_throughput / 1'000'000.0, p50_cv, p99_cv, p999_cv, throughput_cv,
-                     stable ? "STABLE" : "UNSTABLE", MEASURED_ITERATIONS * cfg.trials,
-                     static_cast<unsigned long long>(total_dropped_events),
-                     hex64(state_hashes.front()).c_str(), determinism_pass ? "PASS" : "FAIL",
-                     total_pool_exhaustions == 0 ? "NO" : "YES",
-                     total_arena_fallbacks == 0 ? "NO" : "YES",
-                     static_cast<unsigned long long>(total_arena_fallbacks),
-                     overall_valid ? "PASS" : "FAIL");
-
-        const std::string summary_csv_path = cfg.output_path;
-        const std::string raw_csv_path = derive_path(cfg.output_path, ".raw");
-        // Extension replaced (not preserved-with-insertion, unlike
-        // derive_path() above) -- "bench.csv" -> "bench.meta.json", not
-        // "bench.meta.csv.json".
-        const std::size_t out_dot = cfg.output_path.find_last_of('.');
-        const std::string meta_json_path =
-            (out_dot == std::string::npos ? cfg.output_path : cfg.output_path.substr(0, out_dot)) +
-            ".meta.json";
-
-        std::fprintf(stdout,
-                     "\n"
-                     "Artifacts\n"
-                     "--------------------------------------------------------------------------------\n"
-                     "Summary CSV          : %s\n"
-                     "Raw trial CSV        : %s\n"
-                     "Metadata JSON        : %s\n"
-                     "================================================================================\n",
-                     summary_csv_path.c_str(), raw_csv_path.c_str(), meta_json_path.c_str());
-
+        print_run_and_workload(cfg, run);
+        print_trial_table(run.trials);
+        print_canonical_result(cfg, run, agg);
+        print_artifacts(paths);
         if (cfg.mode == MatchingMode::PRO_RATA)
         {
-            const TrialStats &s0 = trial_stats.front();
-            std::fprintf(stdout,
-                         "\n"
-                         "Pro-Rata Detail\n"
-                         "--------------------------------------------------------------------------------\n"
-                         "Eligible orders examined   : %llu\n"
-                         "Mean eligible orders/match : %.3f\n"
-                         "Mean generated fills/match : %.3f\n"
-                         "Maximum fill fan-out       : %llu\n"
-                         "Remainder units allocated  : N/A (not separately instrumented this pass -- "
-                         "see METHODOLOGY.md)\n"
-                         "Allocation invariant errors: 0 (verified structurally + by unit test, not a "
-                         "live per-fill runtime check)\n"
-                         "Mean latency/generated fill: %.2f ns/fill\n"
-                         "Determinism validation     : %s\n"
-                         "================================================================================\n",
-                         static_cast<unsigned long long>(s0.eligible_orders_examined),
-                         s0.crossing_order_count > 0
-                             ? static_cast<double>(s0.eligible_orders_examined) /
-                                   static_cast<double>(s0.crossing_order_count)
-                             : 0.0,
-                         s0.mean_fills_per_match,
-                         static_cast<unsigned long long>(s0.max_fill_fanout),
-                         s0.mean_fill_publish_ns, determinism_pass ? "PASS" : "FAIL");
+            print_pro_rata_detail(run);
         }
-
         if (cfg.verbose)
         {
-            std::fprintf(stdout,
-                         "\n"
-                         "Verbose Diagnostics\n"
-                         "--------------------------------------------------------------------------------\n"
-                         "Dataset seed             : %llu\n"
-                         "Final book depth         : %zu bid level(s), %zu ask level(s)\n"
-                         "Max pacing schedule drift: %llu ns\n"
-                         "Queue push latency (mean): %.2f ns\n"
-                         "Queue push latency (max) : %llu ns\n"
-                         "Cancel samples/trial     : %zu\n"
-                         "Cancel P50/P99/P99.9     : %.1f / %.1f / %.1f ns\n",
-                         static_cast<unsigned long long>(dataset_seed), final_bid_levels,
-                         final_ask_levels,
-                         static_cast<unsigned long long>(max_schedule_drift_ns),
-                         push_count_all > 0 ? push_ns_sum_all / static_cast<double>(push_count_all)
-                                             : 0.0,
-                         static_cast<unsigned long long>(push_ns_max_all),
-                         trial_stats.front().cancel_count, trial_stats.front().cancel_pct.p50,
-                         trial_stats.front().cancel_pct.p99, trial_stats.front().cancel_pct.p999);
-            for (std::size_t t = 0; t < trial_stats.size(); ++t)
-            {
-                const TrialStats &s = trial_stats[t];
-                std::fprintf(stdout,
-                             "Trial %zu: dropped=%llu arena_fallback_delta=%llu "
-                             "pool_exhaustion_delta=%llu state_hash=%s\n",
-                             t, static_cast<unsigned long long>(s.dropped_events),
-                             static_cast<unsigned long long>(s.arena_fallback_delta),
-                             static_cast<unsigned long long>(s.pool_exhaustion_delta),
-                             hex64(s.state_hash).c_str());
-            }
+            print_verbose_diagnostics(run);
         }
 
-        write_summary_csv(summary_csv_path, run_id, cfg.mode, cfg.dataset_path, dataset_hash,
-                          events.size(), clock_overhead_ns, trial_stats, state_hashes,
-                          determinism_pass, overall_valid, invalid_reason_str,
-                          composition.fok_count, is_smoketest);
-        write_raw_csv(raw_csv_path, trial_records);
-        write_metadata_json(meta_json_path, run_id, cfg.mode, env_snapshot, cfg.dataset_path,
-                            dataset_hash,
-#if HYDRA_LOB_DIRTY
-                            true,
-#else
-                            false,
-#endif
-                            cfg.allow_dirty, overall_valid, invalid_reason_str);
-
-        (void)mode_str_short;
+        write_summary_csv(paths.summary_csv, cfg, run);
+        write_raw_csv(paths.raw_csv, run.records);
+        write_metadata_json(paths.meta_json, cfg, run);
     }
 
 } // namespace hydra

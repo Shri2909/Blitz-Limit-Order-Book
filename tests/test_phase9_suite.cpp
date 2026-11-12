@@ -1,83 +1,17 @@
-//===----------------------------------------------------------------------===
-// tests/test_phase9_suite.cpp
-//
-// Phase 9's canonical 15-case suite lived in test_hydra_lob.cpp per its own
-// exit condition ("exactly these 15 named tests") -- that file was the
-// retired monolithic suite (see test_phase6_matcher.cpp's own reference to
-// it) and no longer exists; its 15 cases were absorbed into the per-phase
-// split this suite is now part of. This file is the CMake comment block's
-// "extended edge cases beyond the 15 core" -- scenarios the canonical suite
-// deliberately doesn't cover (it was fixed at 15 by design), but that this
-// codebase's actual behavior should still be pinned down:
-// order/level pool exhaustion during the GTC-rest step (not just a direct
-// add), multi-level IOC/FOK sweeps, self-trade skipping across a level
-// boundary, cross-call partial-fill sequences, and a large-scale
-// internal-consistency invariant check.
-//===----------------------------------------------------------------------===
+// Matcher edge cases: pool exhaustion, multi-level sweeps, self-trades,
+// partial fills and book consistency.
 
-#include "hydra/matcher.hpp"
-
+#include "test_fixtures.hpp"
 #include "test_harness.hpp"
 
 #include <cstdio>
-#include <memory>
-#include <vector>
 
 namespace hydra::test
 {
     namespace
     {
 
-        Order make_order(uint64_t id, int64_t price, uint32_t qty, Side side,
-                         TimeInForce tif = TimeInForce::GTC, uint64_t client_id = 0)
-        {
-            Order o{};
-            o.order_id = id;
-            o.price = price;
-            o.qty = qty;
-            o.side = side;
-            o.tif = tif;
-            o.client_id = (client_id == 0) ? id : client_id;
-            return o;
-        }
-
-        struct FillRecord
-        {
-            uint64_t maker_order_id;
-            int64_t price;
-            uint32_t qty;
-        };
-
-        struct Fixture
-        {
-            std::unique_ptr<ObjectPool<Order, ORDER_POOL_SIZE>> order_pool =
-                std::make_unique<ObjectPool<Order, ORDER_POOL_SIZE>>();
-            std::unique_ptr<ObjectPool<Level, LEVEL_POOL_SIZE>> level_pool =
-                std::make_unique<ObjectPool<Level, LEVEL_POOL_SIZE>>();
-            std::unique_ptr<OrderBook> book =
-                std::make_unique<OrderBook>(*order_pool, *level_pool);
-            std::unique_ptr<Matcher> matcher = std::make_unique<Matcher>(
-                *book, MatchingMode::PRICE_TIME);
-        };
-
-        [[nodiscard]] uint32_t find_fill_qty(const std::vector<FillRecord> &fills, uint64_t maker_id)
-        {
-            for (const auto &f : fills)
-            {
-                if (f.maker_order_id == maker_id)
-                {
-                    return f.qty;
-                }
-            }
-            return 0;
-        }
-
-        // Order pool exhaustion specifically during the GTC "rest the
-        // leftover" step (not add_order() called directly, as Phase 5
-        // already covers). An empty, non-crossing book means nothing gets
-        // filled/cancelled during the match itself, so no slot is freed up
-        // before the rest attempt -- the pool stays genuinely exhausted
-        // when book_.add_order(incoming) tries to acquire one.
+        // With the order pool exhausted, a GTC order cannot rest.
         void test_order_pool_exhaustion_during_rest_after_no_liquidity()
         {
             Fixture f;
@@ -91,19 +25,14 @@ namespace hydra::test
                 held.push_back(o);
             }
 
-            const MatchStats n = f.matcher->match(
-                make_order(10, 100, 10, Side::BUY), [](const FillEvent &) {});
+            const MatchStats n =
+                f.matcher->match(make_order(10, 100, 10, Side::BUY), [](const FillEvent &) {});
 
             HYDRA_CHECK_EQ(n.fills_generated, uint32_t{0});
             HYDRA_CHECK(!f.book->best_bid().has_value());
         }
 
-        // Same idea, but for the Level pool: order_pool has normal capacity
-        // (so the Order itself acquires fine), but no price level exists
-        // yet at the incoming's price and level_pool is fully drained, so
-        // find_or_create_level() fails. Confirms OrderBook::add_order()'s
-        // own cleanup path (releasing the just-acquired Order back to
-        // order_pool_ when level creation fails) doesn't leak.
+        // With the level pool exhausted, resting at a new price fails cleanly.
         void test_level_pool_exhaustion_during_rest_at_new_price()
         {
             Fixture f;
@@ -117,13 +46,12 @@ namespace hydra::test
                 held.push_back(lvl);
             }
 
-            const MatchStats n = f.matcher->match(
-                make_order(10, 100, 10, Side::BUY), [](const FillEvent &) {});
+            const MatchStats n =
+                f.matcher->match(make_order(10, 100, 10, Side::BUY), [](const FillEvent &) {});
 
             HYDRA_CHECK_EQ(n.fills_generated, uint32_t{0});
             HYDRA_CHECK(!f.book->best_bid().has_value());
-            // The Order acquired for the failed rest attempt must have been
-            // released back, not leaked.
+            // The order acquired for the failed rest is released, not leaked.
             HYDRA_CHECK_EQ(f.order_pool->exhaustion_count(), uint64_t{0});
         }
 
@@ -135,14 +63,12 @@ namespace hydra::test
 
             std::vector<FillRecord> fills;
             const MatchStats n = f.matcher->match(
-                make_order(10, 101, 25, Side::BUY, TimeInForce::IOC), [&](const FillEvent &ev)
-                { fills.push_back({ev.maker_order_id, ev.price, ev.qty}); });
+                make_order(10, 101, 25, Side::BUY, TimeInForce::IOC), record_fills(fills));
 
             HYDRA_CHECK_EQ(n.fills_generated, uint32_t{2});
             HYDRA_CHECK_EQ(find_fill_qty(fills, 1), uint32_t{10});
             HYDRA_CHECK_EQ(find_fill_qty(fills, 2), uint32_t{10});
-            // Both levels fully drained; 5 units of unfillable IOC quantity
-            // discarded, not rested.
+            // Both levels drain; the unfilled 5 units are discarded, not rested.
             HYDRA_CHECK(!f.book->best_ask().has_value());
             HYDRA_CHECK(!f.book->best_bid().has_value());
         }
@@ -157,8 +83,7 @@ namespace hydra::test
 
                 std::vector<FillRecord> fills;
                 const MatchStats n = f.matcher->match(
-                    make_order(10, 101, 20, Side::BUY, TimeInForce::FOK), [&](const FillEvent &ev)
-                    { fills.push_back({ev.maker_order_id, ev.price, ev.qty}); });
+                    make_order(10, 101, 20, Side::BUY, TimeInForce::FOK), record_fills(fills));
 
                 HYDRA_CHECK_EQ(n.fills_generated, uint32_t{2});
                 HYDRA_CHECK_EQ(find_fill_qty(fills, 1), uint32_t{10});
@@ -170,18 +95,16 @@ namespace hydra::test
                 HYDRA_CHECK_EQ(lvl->head_->qty, uint32_t{5});
             }
 
-            // Failure case: 30 requested, only 25 available -- must mutate
-            // nothing at all, even though the first level alone had some
-            // (insufficient) liquidity.
+            // Failure case: 30 requested, 25 available; nothing may change.
             {
                 Fixture f;
                 (void)f.book->add_order(make_order(1, 100, 10, Side::SELL));
                 (void)f.book->add_order(make_order(2, 101, 15, Side::SELL));
 
                 bool handler_called = false;
-                const MatchStats n = f.matcher->match(
-                    make_order(10, 101, 30, Side::BUY, TimeInForce::FOK),
-                    [&](const FillEvent &) { handler_called = true; });
+                const MatchStats n =
+                    f.matcher->match(make_order(10, 101, 30, Side::BUY, TimeInForce::FOK),
+                                     [&](const FillEvent &) { handler_called = true; });
 
                 HYDRA_CHECK_EQ(n.fills_generated, uint32_t{0});
                 HYDRA_CHECK(!handler_called);
@@ -195,10 +118,7 @@ namespace hydra::test
             }
         }
 
-        // Self-trade skip within a level (order1) followed by a sweep that
-        // continues into a second order at the SAME level (order2) and then
-        // a second level entirely (order3) -- confirms self-trade skipping
-        // doesn't stop or corrupt the rest of the sweep.
+        // Skipping a self-trade still allows matching within and across levels.
         void test_self_trade_prevention_across_multiple_levels_in_sweep()
         {
             Fixture f;
@@ -208,16 +128,14 @@ namespace hydra::test
 
             std::vector<FillRecord> fills;
             const MatchStats n = f.matcher->match(
-                make_order(10, 101, 25, Side::BUY, TimeInForce::GTC, 7),
-                [&](const FillEvent &ev)
-                { fills.push_back({ev.maker_order_id, ev.price, ev.qty}); });
+                make_order(10, 101, 25, Side::BUY, TimeInForce::GTC, 7), record_fills(fills));
 
             HYDRA_CHECK_EQ(n.fills_generated, uint32_t{2});
             HYDRA_CHECK_EQ(find_fill_qty(fills, 2), uint32_t{10});
             HYDRA_CHECK_EQ(find_fill_qty(fills, 3), uint32_t{10});
-            HYDRA_CHECK_EQ(find_fill_qty(fills, 1), uint32_t{0}); // never touched
+            HYDRA_CHECK_EQ(find_fill_qty(fills, 1), uint32_t{0});
 
-            // order1 (self-trade) is still resting, untouched, at price 100.
+            // The self-trade order still rests untouched at 100.
             HYDRA_CHECK(f.book->best_ask().has_value());
             HYDRA_CHECK_EQ(f.book->best_ask().value(), int64_t{100});
             Level *lvl = f.book->best_ask_level();
@@ -226,12 +144,7 @@ namespace hydra::test
             HYDRA_CHECK_EQ(lvl->head_->order_id, uint64_t{1});
             HYDRA_CHECK_EQ(lvl->head_->qty, uint32_t{10});
 
-            // Leftover 5 (25 requested - 20 eligible) is NOT rested: resting a
-            // BUY at 101 while the skipped self-trade SELL (order1) rests at 100
-            // would leave the book crossed (best_bid 101 >= best_ask 100). Per
-            // the MATCH-01 fix, that unexecutable-and-uncrossable remainder is
-            // discarded instead, exactly like an IOC remainder -- so no bid rests
-            // and the book stays uncrossed. (remaining_qty still reports the 5.)
+            // The remainder is discarded rather than resting against the skipped ask.
             HYDRA_CHECK(!f.book->best_bid().has_value());
             HYDRA_CHECK_EQ(n.remaining_qty, uint32_t{5});
         }
@@ -241,8 +154,8 @@ namespace hydra::test
             Fixture f;
             (void)f.book->add_order(make_order(1, 100, 10, Side::SELL));
 
-            const MatchStats n = f.matcher->match(make_order(10, 100, 4, Side::BUY),
-                                                [](const FillEvent &) {});
+            const MatchStats n =
+                f.matcher->match(make_order(10, 100, 4, Side::BUY), [](const FillEvent &) {});
             HYDRA_CHECK_EQ(n.fills_generated, uint32_t{1});
 
             Level *lvl = f.book->best_ask_level();
@@ -255,38 +168,31 @@ namespace hydra::test
             HYDRA_CHECK_EQ(f.book->ask_level_count(), std::size_t{0});
         }
 
-        // Sequential partial fills of the SAME resting order across THREE
-        // independent match() calls (not one sweep) -- realistic order
-        // flow the canonical 15-case suite's single-match scenarios don't
-        // exercise.
+        // One resting order is partially filled across three match calls.
         void test_repeated_partial_fills_across_multiple_match_calls()
         {
             Fixture f;
             (void)f.book->add_order(make_order(1, 100, 30, Side::SELL));
 
-            const MatchStats n1 = f.matcher->match(make_order(10, 100, 10, Side::BUY),
-                                                 [](const FillEvent &) {});
+            const MatchStats n1 =
+                f.matcher->match(make_order(10, 100, 10, Side::BUY), [](const FillEvent &) {});
             HYDRA_CHECK_EQ(n1.fills_generated, uint32_t{1});
             HYDRA_CHECK(f.book->best_ask().has_value());
             HYDRA_CHECK_EQ(f.book->best_ask_level()->head_->qty, uint32_t{20});
 
-            const MatchStats n2 = f.matcher->match(make_order(11, 100, 15, Side::BUY),
-                                                 [](const FillEvent &) {});
+            const MatchStats n2 =
+                f.matcher->match(make_order(11, 100, 15, Side::BUY), [](const FillEvent &) {});
             HYDRA_CHECK_EQ(n2.fills_generated, uint32_t{1});
             HYDRA_CHECK(f.book->best_ask().has_value());
             HYDRA_CHECK_EQ(f.book->best_ask_level()->head_->qty, uint32_t{5});
 
-            const MatchStats n3 = f.matcher->match(make_order(12, 100, 5, Side::BUY),
-                                                 [](const FillEvent &) {});
+            const MatchStats n3 =
+                f.matcher->match(make_order(12, 100, 5, Side::BUY), [](const FillEvent &) {});
             HYDRA_CHECK_EQ(n3.fills_generated, uint32_t{1});
             HYDRA_CHECK(!f.book->best_ask().has_value());
         }
 
-        // Large-scale internal-consistency invariant: after a sweep that
-        // partially drains many price levels, every remaining level's
-        // total_qty must equal the sum of its FIFO chain's individual
-        // order quantities -- catches any accounting drift a small
-        // hand-crafted scenario could miss.
+        // Each surviving level's total_qty equals the sum of its orders' quantities.
         void test_large_scale_multi_level_consistency_invariant()
         {
             Fixture f;
@@ -302,26 +208,23 @@ namespace hydra::test
                 for (int i = 0; i < kOrdersPerLevel; ++i)
                 {
                     const uint32_t qty = static_cast<uint32_t>((next_id % 20) + 1);
-                    HYDRA_CHECK(f.book->add_order(
-                                    make_order(next_id, price, qty, Side::SELL)) != nullptr);
+                    HYDRA_CHECK(f.book->add_order(make_order(next_id, price, qty, Side::SELL)) !=
+                                nullptr);
                     total_liquidity += qty;
                     ++next_id;
                 }
             }
             HYDRA_CHECK_EQ(f.book->ask_level_count(), static_cast<std::size_t>(kLevels));
 
-            // Consume roughly the first third of total liquidity, leaving
-            // plenty of untouched levels to check the invariant against.
+            // Consume about a third of the liquidity.
             const uint32_t sweep_qty = static_cast<uint32_t>(total_liquidity / 3);
             uint64_t total_filled = 0;
-            const MatchStats n = f.matcher->match(
-                make_order(999'999, 100 + kLevels, sweep_qty, Side::BUY),
-                [&](const FillEvent &ev) { total_filled += ev.qty; });
+            const MatchStats n =
+                f.matcher->match(make_order(999'999, 100 + kLevels, sweep_qty, Side::BUY),
+                                 [&](const FillEvent &ev) { total_filled += ev.qty; });
             HYDRA_CHECK(n.fills_generated > 0);
             HYDRA_CHECK_EQ(total_filled, static_cast<uint64_t>(sweep_qty));
 
-            // Walk every remaining level and verify total_qty matches the
-            // sum of its resting orders' individual quantities.
             std::size_t levels_checked = 0;
             Level *lvl = f.book->best_ask_level();
             while (lvl != nullptr)

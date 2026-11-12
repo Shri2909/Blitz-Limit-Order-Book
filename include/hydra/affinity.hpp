@@ -37,13 +37,8 @@ namespace hydra
 
     } // namespace detail
 
-    // Signals a pthread_setaffinity_np() failure only via errno (this
-    // function itself never throws/returns status) -- callers MUST follow
-    // this with verify_affinity(core_id), which independently re-derives
-    // the actual affinity mask from the kernel and throws on any mismatch,
-    // including a silently-failed pin_to_core(). Every call site in this
-    // codebase already follows this pairing; a lone pin_to_core() call
-    // with no verify_affinity() after it can fail silently.
+    // Reports pinning failure through errno. Call verify_affinity(core_id)
+    // afterward to check the effective mask and throw on failure.
     inline void pin_to_core(int core_id)
     {
         cpu_set_t cpuset;
@@ -65,9 +60,8 @@ namespace hydra
 
         if (sched_getaffinity(0, sizeof(cpu_set_t), &actual) != 0)
         {
-            throw std::runtime_error(
-                std::string("verify_affinity: sched_getaffinity() failed: ") +
-                std::strerror(errno));
+            throw std::runtime_error(std::string("verify_affinity: sched_getaffinity() failed: ") +
+                                     std::strerror(errno));
         }
 
         const int actual_count = CPU_COUNT(&actual);
@@ -79,10 +73,8 @@ namespace hydra
             std::ostringstream msg;
             msg << "verify_affinity: expected thread to be pinned to exactly "
                    "core "
-                << expected_core_id
-                << ", but its actual affinity mask is "
-                << detail::describe_mask(actual)
-                << " (" << actual_count << " core(s) set). "
+                << expected_core_id << ", but its actual affinity mask is "
+                << detail::describe_mask(actual) << " (" << actual_count << " core(s) set). "
                 << "Check that pin_to_core(" << expected_core_id
                 << ") was called on this thread before verify_affinity(), and "
                    "that core "

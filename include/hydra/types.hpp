@@ -1,7 +1,6 @@
 #pragma once
 
 #include <cstdint>
-#include <cstddef>
 #include <type_traits>
 
 namespace hydra
@@ -20,30 +19,17 @@ namespace hydra
         FOK
     };
 
-    // Disambiguates what a wire-transported Order means when it reaches
-    // matching_thread_fn, since the SPSC queue only ever carries Order
-    // values (never a richer tagged-union event type). NEW_OR_CANCEL
-    // preserves the original convention (qty == 0 means "cancel the order
-    // named by order_id", anything else is a real new order); REPLACE means
-    // "modify the resting order named by order_id to (price, qty)" -- see
-    // Matcher::replace() for the priority-preserving vs. priority-losing
-    // split this drives.
+    // Queue event semantics: NEW_OR_CANCEL with qty == 0 cancels order_id;
+    // positive quantity submits an order. REPLACE modifies that live ID.
     enum class OrderEventTag : uint8_t
     {
         NEW_OR_CANCEL = 0,
         REPLACE = 1,
     };
 
-    // WHY the hot/cold split below: fields touched on every match-path
-    // access (order_id, price, qty, side, tif, event_tag, prev_/next_) are
-    // separated from fields only touched for audit/reporting (timestamp_ns,
-    // client_id, client_tag) into two distinct 64-byte lines, so the
-    // matching hot path never drags cold/reporting-only bytes into cache
-    // alongside the fields it actually needs. Target: perf stat IPC shift
-    // from a ~1.2 baseline (flat, unseparated layout) to ~2.1 after this
-    // split -- a design target and rationale, not a measured claim, until a
-    // real perf-stat-capable host records an actually-measured number
-    // against a real run (see METHODOLOGY.md).
+    // Two cache lines separate core order fields and FIFO links from metadata.
+    // client_id is on the second line and is read for self-trade checks.
+    // See DESIGN.md for layout measurements.
     struct alignas(64) Order
     {
         uint64_t order_id;
@@ -62,17 +48,9 @@ namespace hydra
         uint8_t cold_padding[16];
     };
 
-    static_assert(sizeof(Order) == 128,
-                  "Order must be exactly two 64-byte cache lines (hot + cold); "
-                  "if this fails, the hand-computed padding above no longer "
-                  "matches the actual field layout (hot_padding is 25 bytes -- "
-                  "23 data bytes [order_id/price/qty/side/tif/event_tag] + 25 "
-                  "padding + 16 pointer bytes = 64 -- to leave room for the "
-                  "prev_/next_ intrusive-list pointers used by "
-                  "order_book.hpp's per-level FIFO) and must be recomputed, "
-                  "not papered over with a bigger padding array.");
-    static_assert(sizeof(Order) % 64 == 0,
-                  "Order must be cache-line aligned/sized");
+    static_assert(sizeof(Order) == 128, "Order must be two 64-byte cache lines (hot + cold); "
+                                        "recompute hot_padding/cold_padding if fields change");
+    static_assert(sizeof(Order) % 64 == 0, "Order must be cache-line aligned/sized");
     static_assert(std::is_trivially_copyable_v<Order>,
                   "Order must be POD for by-value SPSC transport");
     static_assert(alignof(Order) == 64, "Order must be 64-byte aligned");
@@ -80,24 +58,15 @@ namespace hydra
     struct alignas(64) Level
     {
         int64_t price;
-        // WHY uint64_t (not uint32_t): total_qty is the running sum of every
-        // resting order's qty at this price. Each order's qty is a uint32_t, but
-        // a level can hold many of them (up to ORDER_POOL_SIZE), so the sum can
-        // exceed UINT32_MAX for individually-valid quantities -- a uint32_t
-        // accumulator silently wraps, corrupting the level's advertised depth
-        // and (under pro-rata, which divides by the eligible sum) the fill
-        // allocation. Widened to uint64_t; Level stays exactly 64 bytes (see the
-        // static_assert below), so no on-wire/layout impact.
+        // A level can hold many uint32_t order quantities, requiring a 64-bit sum.
         uint64_t total_qty;
         uint32_t order_count;
         Order *head_;
         Order *tail_;
     };
 
-    static_assert(sizeof(Level) == 64,
-                  "Level must be cache-line aligned/sized");
-    static_assert(sizeof(Level) % 64 == 0,
-                  "Level must be cache-line aligned/sized");
+    static_assert(sizeof(Level) == 64, "Level must be cache-line aligned/sized");
+    static_assert(sizeof(Level) % 64 == 0, "Level must be cache-line aligned/sized");
     static_assert(alignof(Level) == 64, "Level must be 64-byte aligned");
 
     struct FillEvent
@@ -109,42 +78,24 @@ namespace hydra
         uint32_t qty;
     };
 
-    // Returned by Matcher::match()/Matcher::replace() in place of a raw fill
-    // count, so the benchmark harness (and any other caller) can report
-    // "eligible orders examined/match" and "levels consumed/order" precisely
-    // instead of approximating them from externally-observable fill events
-    // alone -- see METHODOLOGY.md for exactly what each field
-    // counts and when (dry-run/FOK-availability traversals do NOT
-    // contribute to these counters; only the real commit-pass sweep does).
+    // Counters from the matching commit pass; FOK availability scans are excluded.
     struct MatchStats
     {
         uint32_t fills_generated = 0;
         uint32_t levels_consumed = 0;
-        // Every resting order visited during the sweep, whether eligible or
-        // skipped as a self-trade. resting_orders_examined ==
-        // eligible_orders_examined + self_trade_skips, always.
+        // Visited orders = eligible_orders_examined + self_trade_skips.
         uint32_t resting_orders_examined = 0;
-        // Subset of resting_orders_examined that were NOT self-trade-skipped
-        // (i.e. actually counted into eligible_total / could receive a fill).
+        // Visited orders that are eligible for a fill after self-trade checks.
         uint32_t eligible_orders_examined = 0;
         uint32_t self_trade_skips = 0;
-        // Incoming quantity still unfilled when the sweep stopped (0 for a
-        // fully-filled taker). Lets a caller classify partial vs. full
-        // fills (fills_generated > 0 && remaining_qty > 0 == partial;
-        // fills_generated > 0 && remaining_qty == 0 == full) without
-        // needing to separately track the order's original quantity.
+        // Incoming quantity still unfilled when the sweep stops.
         uint32_t remaining_qty = 0;
     };
-    static_assert(std::is_trivially_copyable_v<MatchStats>,
-                  "MatchStats is a plain counters struct, no reason for it "
-                  "not to be trivially copyable");
+    static_assert(std::is_trivially_copyable_v<MatchStats>);
 
-    static_assert(sizeof(FillEvent) == 40,
-                  "FillEvent's reordered layout should total 36 bytes of fields "
-                  "plus 4 bytes of trailing alignment padding; if this fails, "
-                  "the member order/types above no longer match this comment "
-                  "and one of them needs to be fixed to agree with the other");
+    // 36 bytes of fields plus 4 bytes of trailing alignment padding.
+    static_assert(sizeof(FillEvent) == 40, "FillEvent layout changed");
     static_assert(std::is_trivially_copyable_v<FillEvent>,
-                  "FillEvent must be POD for by-value pooled/queued transport");
+                  "FillEvent must be POD for by-value transport");
 
 } // namespace hydra

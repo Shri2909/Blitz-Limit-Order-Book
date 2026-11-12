@@ -1,30 +1,8 @@
 #!/usr/bin/env bash
-#
-# scripts/run_ablations.sh
-#
-# Automates the four docs/DESIGN.md ablations (lock-free vs. mutex queue,
-# pinned vs. unpinned, pooled vs. malloc, hot/cold vs. flat layout) for
-# BOTH matching policies (price_time and pro_rata) -- 10 runs total, never
-# just 5. This never mutates the real source tree: each ablation lives in
-# its own directory under ablation/ and is built as a separate,
-# EXCLUDE_FROM_ALL CMake target that shadows exactly one real header via
-# include-path ordering (see ablation/mutex_queue/include/hydra/
-# spsc_queue.hpp's own WHY for the mechanism).
-#
-# Usage:
-#   ./scripts/run_ablations.sh [--trials N]
-#
-# Requires the same environment preflight --benchmark itself requires
-# (isolcpus, performance governor, SMT off) -- every run below goes through
-# the real, gated run_benchmark(), nothing here bypasses that.
-#
-# Reads each run's SUMMARY CSV (one row per trial, real named columns --
-# see write_summary_csv() in benchmark.cpp) directly, not human-readable
-# stdout text and not '#' comment lines (the old CSV shape's contract,
-# which no longer exists). Cross-checks dropped_events, arena_fallback,
-# and pool_exhaustion between baseline and every ablated variant BEFORE
-# accepting a delta -- refuses to call a delta clean if either side saw any
-# of these (closing the gap the prior version of this script left open).
+# Benchmark the baseline and four ablations under both matching policies (10 runs)
+# and summarize each ablation against the baseline.
+# Usage: [RESULTS_ROOT=dir] ./scripts/run_ablations.sh [--trials N] [--allow-dirty]
+# Output goes to $RESULTS_ROOT/<commit> (default: results/<commit>).
 
 set -uo pipefail
 
@@ -32,7 +10,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 BUILD_DIR="$REPO_ROOT/build"
 GIT_HASH="$(git -C "$REPO_ROOT" rev-parse --short HEAD 2>/dev/null || echo unknown)"
-OUT_DIR="$REPO_ROOT/results/$GIT_HASH"
+OUT_DIR="${RESULTS_ROOT:-$REPO_ROOT/results}/$GIT_HASH"
 DATASET="$REPO_ROOT/datasets/bench_110k.bin"
 FLAT_DATASET="$REPO_ROOT/datasets/ablation4_flat.bin"
 
@@ -63,10 +41,7 @@ fi
 RAW_JSONL="$OUT_DIR/ablation_raw.jsonl"
 : > "$RAW_JSONL"
 
-# Runs one (label, binary, dataset, mode) combination, then extracts every
-# per-trial row from its summary CSV into one JSON line appended to
-# $RAW_JSONL -- the embedded Python block at the bottom of this script is
-# the only place that then interprets those numbers into a verdict table.
+# A failed benchmark is recorded as an invalid run; the suite keeps going.
 run_one() {
     local label="$1" binary="$2" dataset="$3" mode="$4"
     local csv="$OUT_DIR/ablation_${label}_${mode}.csv"
@@ -125,16 +100,22 @@ PYEOF
 }
 
 echo "=== building baseline + ablation targets ==="
-cmake --build "$BUILD_DIR" --target blitz_lob \
+if ! cmake --build "$BUILD_DIR" --target blitz_lob \
     blitz_lob_ablation_mutex_queue blitz_lob_ablation_unpinned \
     blitz_lob_ablation_malloc_pool blitz_lob_ablation_flat_layout \
-    blitz_gen_dataset_ablation_flat_layout -j"$(nproc)"
+    blitz_gen_dataset_ablation_flat_layout -j"$(nproc)"; then
+    echo "error: ablation build failed; no benchmarks were run" >&2
+    exit 1
+fi
 
 echo "=== flat_layout: generating ablation-compatible dataset ==="
-"$BUILD_DIR/blitz_gen_dataset_ablation_flat_layout" --seed 42 --count 110000 \
+if ! "$BUILD_DIR/blitz_gen_dataset_ablation_flat_layout" --seed 42 --count 110000 \
     --mid-price 100000 --spread 500 --min-qty 1 --max-qty 1000 --cancel-ratio 0.15 \
     --ioc-ratio 0.05 --fok-ratio 0.02 --rate-hz 100000 \
-    --output "$FLAT_DATASET" > /dev/null
+    --output "$FLAT_DATASET" > /dev/null; then
+    echo "error: flat-layout dataset generation failed; no benchmarks were run" >&2
+    exit 1
+fi
 
 for MODE in price_time pro_rata; do
     run_one "baseline"    "$BUILD_DIR/blitz_lob"                      "$DATASET"      "$MODE"
@@ -167,10 +148,7 @@ pairs = [
     ("flat_layout", "Cache-line hot/cold split", "Flat, unseparated Order layout"),
 ]
 
-# Mirrors hydra::stats::classify_ablation() exactly (include/hydra/stats.hpp)
-# -- kept as an independent Python re-implementation here since this script
-# runs before/without needing to link the C++ binary; if the two ever
-# disagree, that's a bug worth finding, not a reason to only trust one.
+# Mirrors hydra::stats::classify_ablation().
 def classify(baseline, ablated):
     if baseline is None or ablated is None:
         return "INVALID"
@@ -251,7 +229,3 @@ echo "raw results (jsonl): $RAW_JSONL"
 echo "summary CSV:         $SUMMARY_CSV"
 echo "summary (md):        $SUMMARY_MD"
 echo "per-run CSVs:        $OUT_DIR/ablation_<label>_<mode>.csv (+ .raw.csv, .meta.json)"
-echo
-echo "Compare against a prior run's summary -- expect the same DIRECTION"
-echo "(every ablation slower than baseline on both policies), not necessarily"
-echo "the same multiplier (different machine/session/load)."

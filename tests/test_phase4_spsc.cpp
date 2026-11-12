@@ -1,22 +1,5 @@
-//===----------------------------------------------------------------------===
-// tests/test_phase4_spsc.cpp
-//
-// Phase 4 exit condition (see HYDRA-LOB-Roadmap.md):
-//   "SPSC stress test passes under TSan with zero races."
-//
-// WHY this binary is itself built with -fsanitize=thread,undefined (see
-// CMakeLists.txt's blitz_lob_test_phase4_spsc target): the exit condition
-// explicitly says "under TSan" -- a plain, uninstrumented build can only
-// prove the logic *looks* race-free, not that TSan's own happens-before
-// analysis found nothing across a real concurrent producer/consumer run.
-//
-// Cross-thread-safety note for this file itself: worker thread bodies never
-// call HYDRA_CHECK (throwing across a thread boundary with no matching
-// catch would call std::terminate) -- they only record results into plain
-// local state, which the main thread reads *after* joining both threads
-// (std::jthread's join establishes happens-before, so no race in the
-// reading itself) and asserts on there.
-//===----------------------------------------------------------------------===
+// SPSC queue ordering, full/empty and concurrency tests (built with TSan).
+// Worker threads only record results; assertions run after join.
 
 #include "hydra/spsc_queue.hpp"
 
@@ -24,6 +7,7 @@
 
 #include <atomic>
 #include <cstdint>
+#include <cstdio>
 #include <thread>
 
 namespace hydra::test
@@ -70,13 +54,13 @@ namespace hydra::test
             {
                 HYDRA_CHECK(q.push(i));
             }
-            HYDRA_CHECK(!q.push(999)); // full: must fail cleanly, not overwrite
+            HYDRA_CHECK(!q.push(999)); // full: fails without overwriting
 
             uint64_t out = 0;
             HYDRA_CHECK(q.pop(out));
             HYDRA_CHECK_EQ(out, uint64_t{0});
 
-            // One slot freed -- push must succeed again immediately.
+            // A freed slot makes push succeed again.
             HYDRA_CHECK(q.push(999));
         }
 
@@ -102,16 +86,12 @@ namespace hydra::test
             HYDRA_CHECK_EQ(q.approx_size(), std::size_t{3});
         }
 
-        // The core Phase 4 exit-condition test: a real producer std::jthread
-        // and consumer std::jthread, pushing/popping as fast as possible
-        // against a small (heavily-wrapped) ring buffer, verifying strict
-        // ordering with zero drops and zero duplicates end to end.
+        // A concurrent producer and consumer preserve every value, in order.
         void test_concurrent_producer_consumer_strict_ordering()
         {
             constexpr std::size_t kCapacity = 256;
             constexpr uint64_t kItemCount = 200'000;
-            // Generous safety bound so a genuine bug (queue stuck full/empty
-            // forever) fails the test instead of hanging the binary forever.
+            // Spin bound so a stuck queue fails the test instead of hanging it.
             constexpr uint64_t kMaxSpinAttemptsPerItem = 50'000'000;
 
             SpscQueue<StampedValue, kCapacity> q;
@@ -119,25 +99,27 @@ namespace hydra::test
             std::atomic<bool> producer_gave_up{false};
             std::atomic<bool> consumer_gave_up{false};
 
-            std::jthread producer([&](std::stop_token)
-                                  {
-                for (uint64_t seq = 0; seq < kItemCount; ++seq)
+            std::jthread producer(
+                [&](std::stop_token)
                 {
-                    const StampedValue item{seq, {0, 0, 0}};
-                    uint64_t attempts = 0;
-                    while (!q.push(item))
+                    for (uint64_t seq = 0; seq < kItemCount; ++seq)
                     {
-                        if (++attempts > kMaxSpinAttemptsPerItem)
+                        const StampedValue item{seq, {0, 0, 0}};
+                        uint64_t attempts = 0;
+                        while (!q.push(item))
                         {
-                            producer_gave_up.store(true, std::memory_order_relaxed);
-                            return;
-                        }
-                        if (attempts % 4096 == 0)
-                        {
-                            std::this_thread::yield();
+                            if (++attempts > kMaxSpinAttemptsPerItem)
+                            {
+                                producer_gave_up.store(true, std::memory_order_relaxed);
+                                return;
+                            }
+                            if (attempts % 4096 == 0)
+                            {
+                                std::this_thread::yield();
+                            }
                         }
                     }
-                } });
+                });
 
             uint64_t received_count = 0;
             uint64_t expected_next_seq = 0;
@@ -146,36 +128,38 @@ namespace hydra::test
             uint64_t violation_expected = 0;
             uint64_t violation_actual = 0;
 
-            std::jthread consumer([&](std::stop_token)
-                                  {
-                while (received_count < kItemCount)
+            std::jthread consumer(
+                [&](std::stop_token)
                 {
-                    StampedValue item{};
-                    uint64_t attempts = 0;
-                    while (!q.pop(item))
+                    while (received_count < kItemCount)
                     {
-                        if (++attempts > kMaxSpinAttemptsPerItem)
+                        StampedValue item{};
+                        uint64_t attempts = 0;
+                        while (!q.pop(item))
                         {
-                            consumer_gave_up.store(true, std::memory_order_relaxed);
-                            return;
+                            if (++attempts > kMaxSpinAttemptsPerItem)
+                            {
+                                consumer_gave_up.store(true, std::memory_order_relaxed);
+                                return;
+                            }
+                            if (attempts % 4096 == 0)
+                            {
+                                std::this_thread::yield();
+                            }
                         }
-                        if (attempts % 4096 == 0)
+
+                        if (!ordering_violated && item.seq != expected_next_seq)
                         {
-                            std::this_thread::yield();
+                            ordering_violated = true;
+                            violation_at_index = received_count;
+                            violation_expected = expected_next_seq;
+                            violation_actual = item.seq;
                         }
-                    }
 
-                    if (!ordering_violated && item.seq != expected_next_seq)
-                    {
-                        ordering_violated = true;
-                        violation_at_index = received_count;
-                        violation_expected = expected_next_seq;
-                        violation_actual = item.seq;
+                        ++received_count;
+                        expected_next_seq = item.seq + 1;
                     }
-
-                    ++received_count;
-                    expected_next_seq = item.seq + 1;
-                } });
+                });
 
             producer.join();
             consumer.join();
@@ -195,7 +179,7 @@ namespace hydra::test
             }
             HYDRA_CHECK(!ordering_violated);
 
-            // Queue must be fully drained -- no leftover/duplicated items.
+            // The queue is fully drained.
             HYDRA_CHECK_EQ(q.approx_size(), std::size_t{0});
         }
 

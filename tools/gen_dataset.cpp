@@ -1,9 +1,4 @@
-// tools/gen_dataset.cpp
-//
-// Standalone CLI tool wrapping DatasetGenerator -- the only way dataset
-// files get produced, so benchmark.cpp never generates-and-writes a file
-// as a side effect of a benchmark run. Generation and benchmarking stay
-// decoupled: generate once, replay many times.
+// Generate deterministic replay datasets independently of benchmark execution.
 
 #include "hydra/config.hpp"
 #include "hydra/dataset_generator.hpp"
@@ -18,10 +13,6 @@
 #include <string>
 #include <vector>
 
-// Same fallback convention as src/benchmark.cpp's HYDRA_LOB_VERSION -- set
-// by CMakeLists.txt from `git rev-parse --short HEAD` at build time, so a
-// dataset's manifest entry can record which generator binary (not just
-// which flags) produced it.
 #ifndef HYDRA_LOB_VERSION
 #define HYDRA_LOB_VERSION "dev-build"
 #endif
@@ -29,8 +20,7 @@
 namespace
 {
 
-    // UTC, second precision, human-readable -- good enough for "which day
-    // was this generated," not meant for sub-second provenance.
+    // Record generation time in UTC with second precision.
     [[nodiscard]] std::string utc_timestamp_now()
     {
         const std::time_t now = std::time(nullptr);
@@ -79,12 +69,13 @@ namespace
         return true;
     }
 
-    unsigned long long parse_u64(const std::string &s, const char *flag)
+    template <typename T, typename Convert>
+    T parse_number(const std::string &s, const char *flag, const char *expected, Convert convert)
     {
         try
         {
             std::size_t consumed = 0;
-            const unsigned long long v = std::stoull(s, &consumed);
+            const T v = convert(s, &consumed);
             if (consumed != s.size())
             {
                 throw std::invalid_argument("trailing characters");
@@ -93,48 +84,29 @@ namespace
         }
         catch (const std::exception &)
         {
-            std::fprintf(stderr, "error: %s expects a non-negative integer, got '%s'\n",
-                         flag, s.c_str());
+            std::fprintf(stderr, "error: %s expects %s, got '%s'\n", flag, expected, s.c_str());
             std::exit(1);
         }
+    }
+
+    unsigned long long parse_u64(const std::string &s, const char *flag)
+    {
+        return parse_number<unsigned long long>(s, flag, "a non-negative integer",
+                                                [](const std::string &t, std::size_t *n)
+                                                { return std::stoull(t, n); });
     }
 
     long long parse_i64(const std::string &s, const char *flag)
     {
-        try
-        {
-            std::size_t consumed = 0;
-            const long long v = std::stoll(s, &consumed);
-            if (consumed != s.size())
-            {
-                throw std::invalid_argument("trailing characters");
-            }
-            return v;
-        }
-        catch (const std::exception &)
-        {
-            std::fprintf(stderr, "error: %s expects an integer, got '%s'\n", flag, s.c_str());
-            std::exit(1);
-        }
+        return parse_number<long long>(s, flag, "an integer",
+                                       [](const std::string &t, std::size_t *n)
+                                       { return std::stoll(t, n); });
     }
 
     double parse_double(const std::string &s, const char *flag)
     {
-        try
-        {
-            std::size_t consumed = 0;
-            const double v = std::stod(s, &consumed);
-            if (consumed != s.size())
-            {
-                throw std::invalid_argument("trailing characters");
-            }
-            return v;
-        }
-        catch (const std::exception &)
-        {
-            std::fprintf(stderr, "error: %s expects a number, got '%s'\n", flag, s.c_str());
-            std::exit(1);
-        }
+        return parse_number<double>(s, flag, "a number", [](const std::string &t, std::size_t *n)
+                                    { return std::stod(t, n); });
     }
 
 } // namespace
@@ -276,7 +248,8 @@ int main(int argc, char **argv)
     std::printf("  ioc_ratio          = %.6f\n", cfg.ioc_ratio);
     std::printf("  fok_ratio          = %.6f\n", cfg.fok_ratio);
     std::printf("  replace_ratio      = %.6f\n", cfg.replace_ratio);
-    std::printf("  client_id_count    = %llu\n", static_cast<unsigned long long>(cfg.client_id_count));
+    std::printf("  client_id_count    = %llu\n",
+                static_cast<unsigned long long>(cfg.client_id_count));
     std::printf("  output             = %s\n", output_path.c_str());
     std::printf("  generated_utc      = %s\n", generated_at.c_str());
     std::printf("  generator_version  = %s\n", HYDRA_LOB_VERSION);
@@ -299,29 +272,20 @@ int main(int argc, char **argv)
     const std::string basename =
         (last_slash == std::string::npos) ? output_path : output_path.substr(last_slash + 1);
 
-    // Copy-pasteable datasets/manifest.txt entry -- the manifest is a
-    // manually-maintained reproducibility record (this tool never writes
-    // to it directly, matching the project's existing "flags in
-    // manifest.txt, not the binary, are the source of truth" policy), but
-    // previously recorded flags/seed only, with no generation timestamp or
-    // generator identity -- a silent generator-*logic* change (not caught
-    // by DatasetFileHeader's format_version check) would have been
-    // undetectable from the manifest alone. Printed, not auto-appended:
-    // whether/how to fold this into datasets/manifest.txt's prose entries
-    // is still a human call.
-    std::printf(
-        "\n"
-        "-- datasets/manifest.txt entry (copy/paste, add rationale by hand) --\n"
-        "%s: --seed %llu --count %zu --mid-price %lld --spread %lld\n"
-        "                --min-qty %u --max-qty %u --cancel-ratio %.6f\n"
-        "                --ioc-ratio %.6f --fok-ratio %.6f --replace-ratio %.6f\n"
-        "                --client-id-count %llu --rate-hz %.6f\n"
-        "                (generated_utc=%s generator_version=%s)\n",
-        basename.c_str(), static_cast<unsigned long long>(cfg.seed), cfg.order_count,
-        static_cast<long long>(cfg.mid_price), static_cast<long long>(cfg.price_spread_ticks),
-        cfg.min_qty, cfg.max_qty, cfg.cancel_ratio, cfg.ioc_ratio, cfg.fok_ratio,
-        cfg.replace_ratio, static_cast<unsigned long long>(cfg.client_id_count),
-        cfg.arrival_rate_hz, generated_at.c_str(), HYDRA_LOB_VERSION);
+    // Print a manifest entry for manual inclusion in datasets/manifest.txt.
+    std::printf("\n"
+                "-- datasets/manifest.txt entry (copy/paste, add rationale by hand) --\n"
+                "%s: --seed %llu --count %zu --mid-price %lld --spread %lld\n"
+                "                --min-qty %u --max-qty %u --cancel-ratio %.6f\n"
+                "                --ioc-ratio %.6f --fok-ratio %.6f --replace-ratio %.6f\n"
+                "                --client-id-count %llu --rate-hz %.6f\n"
+                "                (generated_utc=%s generator_version=%s)\n",
+                basename.c_str(), static_cast<unsigned long long>(cfg.seed), cfg.order_count,
+                static_cast<long long>(cfg.mid_price),
+                static_cast<long long>(cfg.price_spread_ticks), cfg.min_qty, cfg.max_qty,
+                cfg.cancel_ratio, cfg.ioc_ratio, cfg.fok_ratio, cfg.replace_ratio,
+                static_cast<unsigned long long>(cfg.client_id_count), cfg.arrival_rate_hz,
+                generated_at.c_str(), HYDRA_LOB_VERSION);
 
     return 0;
 }

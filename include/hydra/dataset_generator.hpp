@@ -1,17 +1,11 @@
 #pragma once
 
-// include/hydra/dataset_generator.hpp
-//
-// Deterministic, seeded synthetic order dataset generation. Decouples *what*
-// orders get sent from *how* they get sent, so the exact same order
-// sequence can be replayed across benchmark runs, across machines, or fed
-// into regression tests, instead of regenerating a fresh random sequence
-// inline every time benchmark.cpp runs.
+// Seeded synthetic order events for benchmark replay and regression tests.
 
 #include "hydra/types.hpp"
 
-#include <cstdint>
 #include <cstddef>
+#include <cstdint>
 #include <cstring>
 #include <fstream>
 #include <random>
@@ -34,41 +28,23 @@ namespace hydra
         double arrival_rate_hz;
         double ioc_ratio;
         double fok_ratio;
-        // Fraction of non-cancel events that become a REPLACE instead of a
-        // NEW_ORDER, once a resting order exists to replace. Drawn from
-        // the same uniform value as cancel_ratio (cancel_ratio + this must
-        // be <= 1.0) -- see DatasetGenerator::generate(). Defaulted to 0.0
-        // so every existing construction site (tests, blitz_gen_dataset)
-        // that doesn't set it keeps generating exactly the datasets it did
-        // before this field existed.
+        // Probability of a replace event when a target ID is available.
+        // Shares the dispatch draw with cancel_ratio; their sum must be <= 1.
         double replace_ratio = 0.0;
-        // Number of distinct synthetic client_ids new orders are drawn
-        // from (client_id = 1 + order_id % client_id_count). Smaller values
-        // deliberately raise the self-trade collision rate -- a
-        // "self-trade-heavy" dataset is just this knob turned down, not a
-        // separate generation mode. Defaulted to 8 to reproduce the
-        // previously-hardcoded kSyntheticClientCount exactly for any
-        // existing construction site that doesn't set it.
+        // Distinct synthetic clients: client_id = 1 + order_id % client_id_count.
+        // Smaller counts increase self-trade collisions.
         uint64_t client_id_count = 8;
     };
-    static_assert(sizeof(DatasetConfig) == 88, "DatasetConfig layout drifted from the computed byte budget");
+    static_assert(sizeof(DatasetConfig) == 88, "DatasetConfig layout changed");
     static_assert(std::is_trivially_copyable_v<DatasetConfig>,
-                  "DatasetConfig is written verbatim into the file header; it "
-                  "must be trivially copyable for that memcpy/fwrite to be safe");
+                  "DatasetConfig is written verbatim into the file header");
 
     enum class EventType : uint8_t
     {
         NEW_ORDER,
         CANCEL,
-        // Modifies the resting order named by cancel_order_id (reused as
-        // "target order_id" for this event type) to (order.price,
-        // order.qty) -- see Matcher::replace() for the priority-preserving
-        // vs. priority-losing semantics this drives. Added as a new enum
-        // value, not a new DatasetRecord field: old dataset files only
-        // ever wrote 0/1 here, so this is a backward-compatible extension
-        // of an existing byte, not a layout change (format_version did not
-        // need to change for this reason alone; see below for why it
-        // changed anyway, for DatasetConfig's own size).
+        // Replace the ID in cancel_order_id with (order.price, order.qty).
+        // See Matcher::replace() for time-priority semantics.
         REPLACE
     };
 
@@ -88,10 +64,9 @@ namespace hydra
         uint64_t event_count;
         DatasetConfig config;
     };
-    static_assert(sizeof(DatasetFileHeader) == 112, "DatasetFileHeader layout drifted from the computed byte budget");
+    static_assert(sizeof(DatasetFileHeader) == 112, "DatasetFileHeader layout changed");
     static_assert(std::is_trivially_copyable_v<DatasetFileHeader>,
-                  "DatasetFileHeader must be trivially copyable to read/write "
-                  "with a single memcpy/fread/fwrite of raw bytes");
+                  "DatasetFileHeader is read/written as raw bytes");
 
     struct DatasetRecord
     {
@@ -101,23 +76,20 @@ namespace hydra
         uint64_t cancel_order_id;
         uint64_t arrival_offset_ns;
     };
-    static_assert(sizeof(DatasetRecord) == 256, "DatasetRecord layout drifted from the computed byte budget");
+    static_assert(sizeof(DatasetRecord) == 256, "DatasetRecord layout changed");
     static_assert(std::is_trivially_copyable_v<DatasetRecord>,
-                  "DatasetRecord must be trivially copyable to read/write with "
-                  "a single memcpy/fread/fwrite of raw bytes");
+                  "DatasetRecord is read/written as raw bytes");
 
     class DatasetGenerator
     {
     public:
-        explicit DatasetGenerator(const DatasetConfig &cfg)
-            : cfg_(cfg), rng_(cfg.seed)
+        explicit DatasetGenerator(const DatasetConfig &cfg) : cfg_(cfg), rng_(cfg.seed)
         {
             if (cfg_.ioc_ratio + cfg_.fok_ratio > 1.0)
             {
                 throw std::invalid_argument(
                     "DatasetConfig: ioc_ratio + fok_ratio must be <= 1.0 (got " +
-                    std::to_string(cfg_.ioc_ratio) + " + " +
-                    std::to_string(cfg_.fok_ratio) + ")");
+                    std::to_string(cfg_.ioc_ratio) + " + " + std::to_string(cfg_.fok_ratio) + ")");
             }
             if (cfg_.ioc_ratio < 0.0 || cfg_.fok_ratio < 0.0 || cfg_.cancel_ratio < 0.0 ||
                 cfg_.cancel_ratio > 1.0 || cfg_.replace_ratio < 0.0)
@@ -130,13 +102,12 @@ namespace hydra
             {
                 throw std::invalid_argument(
                     "DatasetConfig: cancel_ratio + replace_ratio must be <= 1.0 (got " +
-                    std::to_string(cfg_.cancel_ratio) + " + " +
-                    std::to_string(cfg_.replace_ratio) + ")");
+                    std::to_string(cfg_.cancel_ratio) + " + " + std::to_string(cfg_.replace_ratio) +
+                    ")");
             }
             if (cfg_.min_qty == 0 || cfg_.min_qty > cfg_.max_qty)
             {
-                throw std::invalid_argument(
-                    "DatasetConfig: require 0 < min_qty <= max_qty");
+                throw std::invalid_argument("DatasetConfig: require 0 < min_qty <= max_qty");
             }
             if (cfg_.arrival_rate_hz <= 0.0)
             {
@@ -153,8 +124,8 @@ namespace hydra
             std::vector<DatasetEvent> events;
             events.reserve(cfg_.order_count);
 
-            std::uniform_int_distribution<int64_t> price_offset_dist(
-                -cfg_.price_spread_ticks, cfg_.price_spread_ticks);
+            std::uniform_int_distribution<int64_t> price_offset_dist(-cfg_.price_spread_ticks,
+                                                                     cfg_.price_spread_ticks);
             std::uniform_int_distribution<uint32_t> qty_dist(cfg_.min_qty, cfg_.max_qty);
             std::uniform_real_distribution<double> unit_dist(0.0, 1.0);
             std::exponential_distribution<double> inter_arrival_dist(cfg_.arrival_rate_hz);
@@ -173,8 +144,8 @@ namespace hydra
 
                 if (want_cancel)
                 {
-                    const std::size_t idx =
-                        std::uniform_int_distribution<std::size_t>(0, resting_ids_.size() - 1)(rng_);
+                    const std::size_t idx = std::uniform_int_distribution<std::size_t>(
+                        0, resting_ids_.size() - 1)(rng_);
                     const uint64_t cancel_id = resting_ids_[idx];
                     remove_resting(idx);
 
@@ -186,20 +157,11 @@ namespace hydra
                 }
                 else if (want_replace)
                 {
-                    // Target order stays resting (not removed from
-                    // resting_ids_) -- unlike a cancel, a replace leaves an
-                    // order id occupying the book, just possibly at a new
-                    // price/qty/queue-position. Picking the new price/qty
-                    // independently of the target's current values (rather
-                    // than tracking each resting order's live quantity
-                    // here, which this generator doesn't do) means most
-                    // generated replaces exercise Matcher::replace()'s
-                    // priority-losing (cancel + re-match) path; the
-                    // priority-preserving in-place path is covered
-                    // precisely by dedicated unit tests instead (see
-                    // tests/test_phase6_matcher.cpp).
-                    const std::size_t idx =
-                        std::uniform_int_distribution<std::size_t>(0, resting_ids_.size() - 1)(rng_);
+                    // Keep the target ID available for future events. This generator tracks
+                    // submitted GTC IDs rather than live book state; random replacements
+                    // usually exercise the priority-losing path.
+                    const std::size_t idx = std::uniform_int_distribution<std::size_t>(
+                        0, resting_ids_.size() - 1)(rng_);
                     const uint64_t target_id = resting_ids_[idx];
 
                     DatasetEvent ev{};
@@ -251,8 +213,8 @@ namespace hydra
             std::ofstream out(path, std::ios::binary | std::ios::trunc);
             if (!out)
             {
-                throw std::runtime_error(
-                    "DatasetGenerator::write_to_file: cannot open '" + path + "' for writing");
+                throw std::runtime_error("DatasetGenerator::write_to_file: cannot open '" + path +
+                                         "' for writing");
             }
 
             DatasetFileHeader header{};
@@ -276,8 +238,8 @@ namespace hydra
 
             if (!out)
             {
-                throw std::runtime_error(
-                    "DatasetGenerator::write_to_file: write failed for '" + path + "'");
+                throw std::runtime_error("DatasetGenerator::write_to_file: write failed for '" +
+                                         path + "'");
             }
         }
 
@@ -286,21 +248,21 @@ namespace hydra
             std::ifstream in(path, std::ios::binary);
             if (!in)
             {
-                throw std::runtime_error("DatasetGenerator::read_from_file: cannot open '" + path + "'");
+                throw std::runtime_error("DatasetGenerator::read_from_file: cannot open '" + path +
+                                         "'");
             }
 
             DatasetFileHeader header{};
             in.read(reinterpret_cast<char *>(&header), sizeof(header));
             if (!in || in.gcount() != static_cast<std::streamsize>(sizeof(header)))
             {
-                throw std::runtime_error(
-                    "DatasetGenerator::read_from_file: truncated header in '" + path + "'");
+                throw std::runtime_error("DatasetGenerator::read_from_file: truncated header in '" +
+                                         path + "'");
             }
             if (std::memcmp(header.magic, kMagic, sizeof(header.magic)) != 0)
             {
-                throw std::runtime_error(
-                    "DatasetGenerator::read_from_file: bad magic in '" + path +
-                    "' (not a HYDRA-LOB dataset file)");
+                throw std::runtime_error("DatasetGenerator::read_from_file: bad magic in '" + path +
+                                         "' (not a HYDRA-LOB dataset file)");
             }
             if (header.format_version != kFormatVersion)
             {
@@ -310,30 +272,25 @@ namespace hydra
                     ", reader=" + std::to_string(kFormatVersion) + ")");
             }
 
-            // DATA-01: bound event_count against the actual file size BEFORE
-            // reserve(). A crafted header declaring e.g. 7.2e9 events otherwise
-            // drives a ~1.8 TB reserve() (std::length_error / std::bad_alloc /
-            // OOM-kill) before a single record is read -- an untrusted-input
-            // denial of service on the one code path that consumes a dataset.
-            // The record stream starts right after the fixed-size header, so the
-            // file can hold at most (size - header) / record_size records.
+            // Bound the declared event count by file size before allocating storage.
             const std::streamoff header_end = in.tellg();
             in.seekg(0, std::ios::end);
             const std::streamoff file_end = in.tellg();
             in.seekg(header_end, std::ios::beg);
             if (!in || file_end < header_end)
             {
-                throw std::runtime_error(
-                    "DatasetGenerator::read_from_file: cannot size '" + path + "'");
+                throw std::runtime_error("DatasetGenerator::read_from_file: cannot size '" + path +
+                                         "'");
             }
             const uint64_t available_bytes = static_cast<uint64_t>(file_end - header_end);
             const uint64_t max_records = available_bytes / sizeof(DatasetRecord);
-            if (header.event_count > max_records)
+            const std::vector<DatasetEvent> empty_events;
+            if (header.event_count > max_records || header.event_count > empty_events.max_size())
             {
                 throw std::runtime_error(
                     "DatasetGenerator::read_from_file: header event_count (" +
                     std::to_string(header.event_count) + ") exceeds what the file holds (" +
-                    std::to_string(max_records) + " records) in '" + path + "'");
+                    std::to_string(max_records) + " records) or vector capacity in '" + path + "'");
             }
 
             std::vector<DatasetEvent> events;
@@ -344,13 +301,10 @@ namespace hydra
                 in.read(reinterpret_cast<char *>(&rec), sizeof(rec));
                 if (!in || in.gcount() != static_cast<std::streamsize>(sizeof(rec)))
                 {
-                    throw std::runtime_error(
-                        "DatasetGenerator::read_from_file: truncated record " +
-                        std::to_string(i) + " in '" + path + "'");
+                    throw std::runtime_error("DatasetGenerator::read_from_file: truncated record " +
+                                             std::to_string(i) + " in '" + path + "'");
                 }
-                // DATA-06: reject out-of-range enum bytes instead of casting raw
-                // untrusted bytes straight into an enum (which would reach the
-                // matcher as an order with a garbage side/tif/event meaning).
+                // Validate enum values before forwarding file data to the matcher.
                 if (rec.event_type > static_cast<uint8_t>(EventType::REPLACE))
                 {
                     throw std::runtime_error(
@@ -361,7 +315,8 @@ namespace hydra
                 if (rec.event_type == static_cast<uint8_t>(EventType::NEW_ORDER))
                 {
                     if (static_cast<uint8_t>(rec.order.side) > static_cast<uint8_t>(Side::SELL) ||
-                        static_cast<uint8_t>(rec.order.tif) > static_cast<uint8_t>(TimeInForce::FOK))
+                        static_cast<uint8_t>(rec.order.tif) >
+                            static_cast<uint8_t>(TimeInForce::FOK))
                     {
                         throw std::runtime_error(
                             "DatasetGenerator::read_from_file: invalid side/tif in record " +
@@ -380,13 +335,8 @@ namespace hydra
 
     private:
         static constexpr char kMagic[8] = {'H', 'Y', 'D', 'R', 'A', 'L', 'O', 'B'};
-        // Bumped from 2 -> 3: DatasetConfig grew by 16 bytes (replace_ratio,
-        // client_id_count), which changes DatasetFileHeader's total size --
-        // a version-2 file's bytes would otherwise be silently
-        // misinterpreted rather than cleanly rejected by the
-        // format_version check below. EventType::REPLACE itself did NOT
-        // require this bump (see its own comment) -- the bump is entirely
-        // attributable to DatasetConfig's size change.
+        // Version 3 includes replace_ratio and client_id_count in DatasetConfig.
+        // Only this exact header layout is accepted by the reader.
         static constexpr uint32_t kFormatVersion = 3;
 
         DatasetConfig cfg_;
@@ -395,14 +345,9 @@ namespace hydra
 
         std::vector<uint64_t> resting_ids_;
 
-        void add_resting(uint64_t id)
-        {
-            resting_ids_.push_back(id);
-        }
+        void add_resting(uint64_t id) { resting_ids_.push_back(id); }
 
-        // Swap-remove by index: the caller already knows idx (drawn via
-        // uniform_int_distribution against resting_ids_.size() at the one
-        // call site), so no id->index lookup structure is needed here.
+        // Remove an ID without preserving its position in the candidate list.
         void remove_resting(std::size_t idx)
         {
             const std::size_t last = resting_ids_.size() - 1;

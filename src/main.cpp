@@ -1,14 +1,5 @@
-// src/main.cpp
-//
-// The single production entry point. This is the one place every hot-path
-// dependency gets wired together by reference (ObjectPools, OrderBook,
-// Matcher, SpscQueue, PipelineContext) -- no hidden globals anywhere else
-// in the codebase. Parses a minimal hand-rolled CLI (no external
-// dependency, matching tools/gen_dataset.cpp's own style) and dispatches to
-// either the benchmark harness (--benchmark, Phase 8) or the live
-// RX->SPSC->matching pipeline.
+// CLI entry point for dataset benchmarks and the live order pipeline.
 
-#include "hydra/affinity.hpp"
 #include "hydra/benchmark.hpp"
 #include "hydra/clock.hpp"
 #include "hydra/config.hpp"
@@ -24,6 +15,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <stdexcept>
@@ -36,48 +28,27 @@ namespace
 
     void print_usage(const char *prog)
     {
-        std::fprintf(stderr,
-                     "Usage: %s [--benchmark | --test] [options]\n"
-                     "\n"
-                     "  --benchmark            run THE latency benchmark (Phase 8) and exit;\n"
-                     "                         requires --output and --dataset. This is the\n"
-                     "                         only code path in this project that produces a\n"
-                     "                         latency number -- there is no live-generation\n"
-                     "                         fallback and no other command to run instead.\n"
-                     "  --test                 print how to run the standalone test binaries\n"
-                     "                         and exit (tests are a separate target, never\n"
-                     "                         linked into this binary -- see Phase 9)\n"
-                     "  (neither flag)         run the live RX -> SPSC -> matching pipeline\n"
-                     "                         until interrupted (Ctrl+C). This is a manual\n"
-                     "                         smoke test -- it prints no latency numbers and\n"
-                     "                         is never a substitute for --benchmark.\n"
-                     "\n"
-                     "  --mode [price_time|pro_rata]  matching mode (default: price_time, the\n"
-                     "                         canonical claim; pro_rata is a secondary\n"
-                     "                         comparison run, not an interchangeable result)\n"
-                     "  --trials N             benchmark-only: trial count (default: %zu;\n"
-                     "                         below %zu is marked SMOKETEST in the output\n"
-                     "                         and should not be quoted as a result)\n"
-                     "  --output PATH          benchmark-only, required: CSV output path\n"
-                     "  --dataset PATH         benchmark-only, required: replay this dataset\n"
-                     "                         file (generate one with blitz_gen_dataset)\n"
-                     "  --verbose              benchmark-only: print the detailed diagnostics\n"
-                     "                         block (per-workload breakdown, pool telemetry)\n"
-                     "                         in addition to the concise default report\n"
-                     "  --allow-dirty          benchmark-only: don't fail closed on a dirty\n"
-                     "                         working tree -- the report still marks the run\n"
-                     "                         as measured against a dirty tree\n"
-                     "\n"
-                     "  --xdp-iface IFACE      live-pipeline-only: receive real packets over\n"
-                     "                         AF_XDP on this interface instead of the\n"
-                     "                         synthetic RNG generator (requires a build\n"
-                     "                         with -DENABLE_AFXDP=ON; see net/xdp_prog.bpf.c)\n"
-                     "  --xdp-queue N          AF_XDP RX queue index to bind (default: %u)\n"
-                     "  --xdp-prog PATH        compiled XDP program to load (default: %s)\n"
-                     "  --xdp-attach-mode [native|skb|hw]  XDP attach mode (default: %s --\n"
-                     "                         veth test interfaces only support skb/generic)\n",
-                     prog, hydra::DEFAULT_TRIAL_COUNT, hydra::DEFAULT_TRIAL_COUNT,
-                     hydra::config::AFXDP_DEFAULT_QUEUE_ID, "net/xdp_prog.o", "skb");
+        std::fprintf(
+            stderr,
+            "Usage: %s [--benchmark | --test] [options]\n"
+            "\n"
+            "  --benchmark            replay a dataset and report latency; requires\n"
+            "                         --output and --dataset\n"
+            "  --test                 print standalone test commands and exit\n"
+            "  (neither flag)         run the live pipeline until interrupted (Ctrl+C)\n"
+            "                         without reporting latency\n"
+            "\n"
+            "  --mode [price_time|pro_rata]  matching policy (default: price_time)\n"
+            "\n"
+            "Benchmark options:\n"
+            "  --trials N             trial count (default: %zu; fewer than %zu\n"
+            "                         trials are marked SMOKETEST)\n"
+            "  --output PATH          required CSV report path\n"
+            "  --dataset PATH         required dataset file; generate with blitz_gen_dataset\n"
+            "  --verbose              include workload and resource diagnostics\n"
+            "  --allow-dirty          allow a tree that was dirty at build time;\n"
+            "                         the report records this state\n",
+            prog, hydra::DEFAULT_TRIAL_COUNT, hydra::DEFAULT_TRIAL_COUNT);
     }
 
     bool match_flag(int argc, char **argv, int &i, const char *flag, std::string &out_value)
@@ -110,35 +81,19 @@ namespace
         std::exit(1);
     }
 
-#ifdef ENABLE_AFXDP
-    [[nodiscard]] xdp_attach_mode parse_attach_mode(const std::string &s)
-    {
-        if (s == "native")
-        {
-            return XDP_MODE_NATIVE;
-        }
-        if (s == "skb")
-        {
-            return XDP_MODE_SKB;
-        }
-        if (s == "hw")
-        {
-            return XDP_MODE_HW;
-        }
-        std::fprintf(stderr,
-                     "error: --xdp-attach-mode expects 'native', 'skb', or 'hw', got '%s'\n",
-                     s.c_str());
-        std::exit(1);
-    }
-#endif
-
     [[nodiscard]] std::size_t parse_size(const std::string &s, const char *flag)
     {
+        if (s.empty() || s.front() == '-')
+        {
+            std::fprintf(stderr, "error: %s expects a non-negative integer, got '%s'\n", flag,
+                         s.c_str());
+            std::exit(1);
+        }
         try
         {
             std::size_t consumed = 0;
             const unsigned long long v = std::stoull(s, &consumed);
-            if (consumed != s.size())
+            if (consumed != s.size() || v > std::numeric_limits<std::size_t>::max())
             {
                 throw std::invalid_argument("trailing characters");
             }
@@ -146,8 +101,8 @@ namespace
         }
         catch (const std::exception &)
         {
-            std::fprintf(stderr, "error: %s expects a non-negative integer, got '%s'\n",
-                         flag, s.c_str());
+            std::fprintf(stderr, "error: %s expects a non-negative integer, got '%s'\n", flag,
+                         s.c_str());
             std::exit(1);
         }
     }
@@ -162,17 +117,6 @@ namespace
         std::optional<std::string> dataset_path;
         bool verbose = false;
         bool allow_dirty = false;
-
-        // Live-pipeline-only: unset xdp_iface means "use the synthetic
-        // rx_thread_fn generator" regardless of build configuration. These
-        // stay plain std::string/uint32_t (not the ENABLE_AFXDP-only
-        // xdp_attach_mode enum) so CliOptions itself compiles identically
-        // in both build configurations -- only run_live_pipeline's use of
-        // them is #ifdef-guarded.
-        std::optional<std::string> xdp_iface;
-        uint32_t xdp_queue = hydra::config::AFXDP_DEFAULT_QUEUE_ID;
-        std::string xdp_prog_path = "net/xdp_prog.o";
-        std::string xdp_attach_mode = "skb";
     };
 
     [[nodiscard]] CliOptions parse_cli(int argc, char **argv)
@@ -209,10 +153,6 @@ namespace
             }
             if (match_flag(argc, argv, i, "--dataset", val))
             {
-                // Forwarded into BenchmarkConfig::dataset_path unchanged --
-                // file loading/validation happens inside run_benchmark()
-                // (Phase 8), not here. Required alongside --benchmark; there
-                // is no live-generation fallback.
                 opts.dataset_path = val;
                 continue;
             }
@@ -224,30 +164,6 @@ namespace
             if (std::strcmp(argv[i], "--allow-dirty") == 0)
             {
                 opts.allow_dirty = true;
-                continue;
-            }
-            if (match_flag(argc, argv, i, "--xdp-iface", val))
-            {
-                opts.xdp_iface = val;
-                continue;
-            }
-            if (match_flag(argc, argv, i, "--xdp-queue", val))
-            {
-                opts.xdp_queue = static_cast<uint32_t>(parse_size(val, "--xdp-queue"));
-                continue;
-            }
-            if (match_flag(argc, argv, i, "--xdp-prog", val))
-            {
-                opts.xdp_prog_path = val;
-                continue;
-            }
-            if (match_flag(argc, argv, i, "--xdp-attach-mode", val))
-            {
-                // Validated for real inside run_live_pipeline (only
-                // ENABLE_AFXDP builds have the xdp_attach_mode enum to
-                // validate against); stored as a plain string here so
-                // parse_cli() itself needs no #ifdef.
-                opts.xdp_attach_mode = val;
                 continue;
             }
             if (std::strcmp(argv[i], "--help") == 0 || std::strcmp(argv[i], "-h") == 0)
@@ -272,17 +188,13 @@ namespace
         }
         if (opts.want_benchmark && !opts.dataset_path.has_value())
         {
-            std::fprintf(stderr,
-                         "error: --benchmark requires --dataset PATH -- there is no "
-                         "live-generation fallback. Generate one first:\n"
-                         "  cmake --build build --target blitz_gen_dataset\n"
-                         "  ./build/blitz_gen_dataset --seed 42 --count 110000 "
-                         "--output datasets/bench_110k.bin\n");
+            std::fprintf(stderr, "error: --benchmark requires --dataset PATH -- there is no "
+                                 "live-generation fallback. Generate one first:\n"
+                                 "  cmake --build build --target blitz_gen_dataset\n"
+                                 "  ./build/blitz_gen_dataset --seed 42 --count 110000 "
+                                 "--output datasets/bench_110k.bin\n");
             std::exit(1);
         }
-        // MEAS-12: a zero-trial benchmark produces no measurement and crashes
-        // run_benchmark (empty trial_stats). Reject it at the CLI too, so the
-        // common case fails fast with a clear message rather than aborting.
         if (opts.want_benchmark && opts.trials == 0)
         {
             std::fprintf(stderr, "error: --trials must be at least 1\n");
@@ -292,137 +204,89 @@ namespace
         return opts;
     }
 
-    // WHY a raw pointer, not e.g. an atomic<stop_source*>: main() constructs
-    // exactly one stop_source on the stack, and its address is stable for
-    // the entire cooperative-shutdown window this handler can fire during;
-    // the handler only ever reads it, never owns or outlives it.
-    // WHY calling request_stop() directly from the handler (rather than the
-    // more conservative "set a volatile sig_atomic_t flag, let main()'s
-    // poll loop call request_stop()" pattern): this is the literal, widely-
-    // used simplification for this class of scaffold -- SIGINT arrives
-    // asynchronously to the main thread's quiescent poll loop below, not
-    // concurrently with the stop_source's own construction/registration, so
-    // the theoretical async-signal-safety gap here is a known, accepted
-    // tradeoff, not an oversight.
-    std::stop_source *g_stop_source = nullptr;
+    // The handler only sets this flag; the main thread requests the stop.
+    volatile std::sig_atomic_t g_interrupted = 0;
 
     extern "C" void handle_sigint(int)
     {
-        if (g_stop_source != nullptr)
-        {
-            g_stop_source->request_stop();
-        }
+        g_interrupted = 1;
     }
+
+    // Heap-allocated pools, book, matcher and queue shared by live and benchmark modes.
+    struct PipelineResources
+    {
+        std::unique_ptr<hydra::ObjectPool<hydra::Order, hydra::ORDER_POOL_SIZE>> order_pool =
+            std::make_unique<hydra::ObjectPool<hydra::Order, hydra::ORDER_POOL_SIZE>>();
+        std::unique_ptr<hydra::ObjectPool<hydra::Level, hydra::LEVEL_POOL_SIZE>> level_pool =
+            std::make_unique<hydra::ObjectPool<hydra::Level, hydra::LEVEL_POOL_SIZE>>();
+        std::unique_ptr<hydra::OrderBook> book =
+            std::make_unique<hydra::OrderBook>(*order_pool, *level_pool);
+        std::unique_ptr<hydra::Matcher> matcher;
+        std::unique_ptr<hydra::SpscQueue<hydra::Order, hydra::SPSC_CAPACITY>> queue =
+            std::make_unique<hydra::SpscQueue<hydra::Order, hydra::SPSC_CAPACITY>>();
+
+        explicit PipelineResources(hydra::MatchingMode mode)
+            : matcher(std::make_unique<hydra::Matcher>(*book, mode))
+        {
+        }
+
+        [[nodiscard]] hydra::PipelineContext context()
+        {
+            return hydra::PipelineContext{
+                .queue = *queue,
+                .book = *book,
+                .matcher = *matcher,
+                .order_pool = *order_pool,
+                .level_pool = *level_pool,
+            };
+        }
+    };
 
     void run_live_pipeline(const CliOptions &opts)
     {
-        const hydra::MatchingMode mode = opts.mode;
-
-#ifndef ENABLE_AFXDP
-        // Caught here, before any pool/thread setup, rather than letting an
-        // #ifdef'd-out afxdp_rx_thread_fn simply not exist -- a build
-        // without AF_XDP support must say so clearly, not silently fall
-        // back to the synthetic generator the caller didn't ask for.
-        if (opts.xdp_iface)
-        {
-            std::fprintf(stderr,
-                         "error: --xdp-iface requires a build with -DENABLE_AFXDP=ON\n");
-            std::exit(1);
-        }
-#endif
-
-        // Registered before any blocking startup work (below,
-        // calibrate_ns_per_cycle() alone blocks for ~2s) -- a SIGINT that
-        // arrives during that window must still be caught cooperatively,
-        // not fall through to the default terminate-the-process
-        // disposition just because the handler wasn't wired up yet.
+        // Install the handler before the blocking calibration step.
         std::stop_source stop_source;
-        g_stop_source = &stop_source;
+        g_interrupted = 0;
         std::signal(SIGINT, handle_sigint);
 
-        auto order_pool =
-            std::make_unique<hydra::ObjectPool<hydra::Order, hydra::ORDER_POOL_SIZE>>();
-        auto level_pool =
-            std::make_unique<hydra::ObjectPool<hydra::Level, hydra::LEVEL_POOL_SIZE>>();
-        auto book = std::make_unique<hydra::OrderBook>(*order_pool, *level_pool);
-        auto matcher = std::make_unique<hydra::Matcher>(*book, mode);
-        auto queue = std::make_unique<hydra::SpscQueue<hydra::Order, hydra::SPSC_CAPACITY>>();
+        PipelineResources resources(opts.mode);
+        hydra::PipelineContext ctx = resources.context();
+        ctx.ns_per_cycle = hydra::calibrate_ns_per_cycle();
 
-        hydra::PipelineContext ctx{
-            .queue = *queue,
-            .book = *book,
-            .matcher = *matcher,
-            .order_pool = *order_pool,
-            .level_pool = *level_pool,
-            .ns_per_cycle = hydra::calibrate_ns_per_cycle(),
-        };
-
-        if (stop_source.stop_requested())
+        if (g_interrupted != 0)
         {
-            // Interrupted during startup/calibration, before either thread
-            // was spawned -- nothing to join, just exit cleanly rather than
-            // starting a pipeline the caller already asked to stop.
+            // A startup interrupt must not launch worker threads.
             std::fprintf(stdout, "hydra_lob: interrupted during startup, exiting.\n");
-            g_stop_source = nullptr;
             std::signal(SIGINT, SIG_DFL);
             return;
         }
 
         std::fprintf(stdout,
                      "hydra_lob: running live pipeline (mode=%s, RX_CORE_ID=%d, "
-                     "MATCHING_CORE_ID=%d, rx_source=%s) -- press Ctrl+C to stop.\n"
+                     "MATCHING_CORE_ID=%d, rx_source=synthetic) -- press Ctrl+C to stop.\n"
                      "hydra_lob: this is a manual smoke test, not a benchmark -- it prints "
                      "no latency numbers. For a real latency figure, run "
                      "'blitz_lob --benchmark --dataset <path> --output <path>' instead.\n",
-                     mode == hydra::MatchingMode::PRICE_TIME ? "price_time" : "pro_rata",
-                     hydra::RX_CORE_ID, hydra::MATCHING_CORE_ID,
-                     opts.xdp_iface ? opts.xdp_iface->c_str() : "synthetic");
+                     opts.mode == hydra::MatchingMode::PRICE_TIME ? "price_time" : "pro_rata",
+                     hydra::RX_CORE_ID, hydra::MATCHING_CORE_ID);
 
-        // std::thread, not std::jthread: rx_thread_fn/matching_thread_fn
-        // must both observe the SAME external stop_source, so one
-        // request_stop() call (from the SIGINT handler above) stops both --
-        // but std::jthread's automatic stop_token injection always supplies
-        // its OWN internal stop_source, with no way for a caller to
-        // substitute an external one in its place. Passing
-        // stop_source.get_token() as a plain constructor argument (which
-        // std::thread does with no special-casing at all) is what actually
-        // shares one source across both threads.
-        std::thread rx_thread;
-#ifdef ENABLE_AFXDP
-        if (opts.xdp_iface)
-        {
-            hydra::AfxdpConfig xdp_cfg{
-                .ifname = *opts.xdp_iface,
-                .queue_id = opts.xdp_queue,
-                .bpf_prog_path = opts.xdp_prog_path,
-                .attach_mode = parse_attach_mode(opts.xdp_attach_mode),
-            };
-            rx_thread = std::thread(hydra::afxdp_rx_thread_fn, stop_source.get_token(),
-                                    std::ref(ctx), xdp_cfg);
-        }
-        else
-        {
-            rx_thread = std::thread(hydra::rx_thread_fn, stop_source.get_token(), std::ref(ctx));
-        }
-#else
-        rx_thread = std::thread(hydra::rx_thread_fn, stop_source.get_token(), std::ref(ctx));
-#endif
+        std::thread rx_thread(hydra::rx_thread_fn, stop_source.get_token(), std::ref(ctx));
         std::thread matching_thread(hydra::matching_thread_fn, stop_source.get_token(),
                                     std::ref(ctx));
 
-        // Deliberately no latency reporting here. This mode exists to prove
-        // the pipeline runs, not to produce a number. There is exactly one
-        // command in this project that produces a latency number:
-        // --benchmark.
         while (!stop_source.stop_requested())
         {
+            if (g_interrupted != 0)
+            {
+                stop_source.request_stop();
+                break;
+            }
             std::this_thread::sleep_for(std::chrono::milliseconds(200));
         }
 
         rx_thread.join();
         matching_thread.join();
 
-        g_stop_source = nullptr;
         std::signal(SIGINT, SIG_DFL);
 
         std::fprintf(stdout, "hydra_lob: shutdown complete.\n");
@@ -430,33 +294,14 @@ namespace
 
     void run_benchmark_mode(const CliOptions &opts)
     {
-        auto order_pool =
-            std::make_unique<hydra::ObjectPool<hydra::Order, hydra::ORDER_POOL_SIZE>>();
-        auto level_pool =
-            std::make_unique<hydra::ObjectPool<hydra::Level, hydra::LEVEL_POOL_SIZE>>();
-        auto book = std::make_unique<hydra::OrderBook>(*order_pool, *level_pool);
-        auto matcher = std::make_unique<hydra::Matcher>(*book, opts.mode);
-        auto queue = std::make_unique<hydra::SpscQueue<hydra::Order, hydra::SPSC_CAPACITY>>();
-
-        // ns_per_cycle is deliberately left at its default here, not
-        // calibrated -- run_benchmark() calibrates once internally and
-        // assigns ctx.ns_per_cycle itself before spawning matching_thread_fn
-        // (see benchmark.cpp); calibrating twice would just throw away ~2s
-        // on a redundant measurement.
-        hydra::PipelineContext ctx{
-            .queue = *queue,
-            .book = *book,
-            .matcher = *matcher,
-            .order_pool = *order_pool,
-            .level_pool = *level_pool,
-        };
+        PipelineResources resources(opts.mode);
+        // run_benchmark() calibrates the clock itself, so ns_per_cycle is left at its default.
+        hydra::PipelineContext ctx = resources.context();
 
         hydra::BenchmarkConfig cfg{
             .mode = opts.mode,
             .trials = opts.trials,
             .output_path = opts.output_path,
-            // opts.dataset_path is guaranteed set here -- parse_cli() exits
-            // with an error before reaching this point otherwise.
             .dataset_path = *opts.dataset_path,
             .verbose = opts.verbose,
             .allow_dirty = opts.allow_dirty,
@@ -473,16 +318,14 @@ int main(int argc, char **argv)
 
     if (opts.want_test)
     {
-        std::fprintf(stdout,
-                     "Tests are separate binaries (ten per-phase exit-condition targets, "
-                     "no GTest dependency) -- this binary never links test code. Run all 10:\n"
-                     "  cmake --build build -j$(nproc)\n"
-                     "  ctest --test-dir build --output-on-failure\n"
-                     "\n"
-                     "Or build/run one phase directly, e.g.:\n"
-                     "  cmake --build build --target blitz_lob_test_phase6_matcher\n"
-                     "  ./build/blitz_lob_test_phase6_matcher\n"
-                     "See CMakeLists.txt's per-phase target block for the full list.\n");
+        std::fprintf(stdout, "Build and run all standalone tests:\n"
+                             "  cmake --build build -j$(nproc)\n"
+                             "  ctest --test-dir build --output-on-failure\n"
+                             "\n"
+                             "Or build and run a single test target:\n"
+                             "  cmake --build build --target blitz_lob_test_phase6_matcher\n"
+                             "  ./build/blitz_lob_test_phase6_matcher\n"
+                             "See CMakeLists.txt for the complete target list.\n");
         return 0;
     }
 
