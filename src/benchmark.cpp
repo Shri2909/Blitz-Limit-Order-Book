@@ -544,6 +544,20 @@ namespace hydra
                 result.push_ns_max = std::max(result.push_ns_max, *push_ns);
                 ++result.push_count;
                 on_push();
+
+                // Warm the next record (256 B, read once, sequentially, ~10 us from now)
+                // while the producer is idle, so encode_as_queue_order() after t1 does not
+                // take a DRAM miss on the 28 MB event array. Runs outside every measured
+                // interval; it changes neither what t1..t_match_end spans nor the work
+                // inside it, only whether that work hits cache.
+                if (i + 1 < last)
+                {
+                    const char *next = reinterpret_cast<const char *>(&events[i + 1]);
+                    for (std::size_t off = 0; off < sizeof(DatasetEvent); off += 64)
+                    {
+                        __builtin_prefetch(next + off, 0, 3);
+                    }
+                }
             }
 
             if (result.dropped > 0) [[unlikely]]
@@ -846,6 +860,10 @@ namespace hydra
 
             TrialRecord record;
             record.timestamps_unix.reserve(MEASURED_ITERATIONS);
+            // Fault the reserved pages in now: the first push_back into each 4 KiB page
+            // otherwise takes a page fault on the producer thread inside the replay loop.
+            record.timestamps_unix.resize(MEASURED_ITERATIONS);
+            record.timestamps_unix.clear();
             std::vector<LatencySample> sink_storage(MEASURED_ITERATIONS);
             RawSampleSink sink;
             sink.samples = sink_storage.data();
