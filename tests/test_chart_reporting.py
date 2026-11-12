@@ -102,9 +102,10 @@ class ChartReportingTests(unittest.TestCase):
             charts.normalize_verdict("NOT_PROVEN")
 
     def test_x_worse_is_claimed_only_for_proven(self):
-        trials = [1219.0, 1317.0, 1452.0, 1615.0, 21293.0]
-        proven = charts.ablated_label("PROVEN", 6589, 5.63, trials)
-        self.assertIn("5.63x worse", proven[0])
+        trials = [1219.0, 1317.0, 1452.0, 1615.0, 2293.0]
+        proven = charts.ablated_label("PROVEN", 4165, 3.63, trials)
+        self.assertIn("3.63x worse", proven[0])
+        self.assertEqual(len(proven), 2)
         for verdict in ("INCONCLUSIVE", "NO_MEASURABLE_EFFECT", "ABLATED_FASTER"):
             lines = " ".join(charts.ablated_label(verdict, 1452, 1.24, trials))
             self.assertNotIn("worse", lines)
@@ -114,7 +115,32 @@ class ChartReportingTests(unittest.TestCase):
         self.assertIn("faster", charts.ablated_label("ABLATED_FASTER", 1, 0.8, trials)[0])
         inconclusive = charts.ablated_label("INCONCLUSIVE", 1452, 1.24, trials)
         self.assertIn("highly load dependent", inconclusive[1])
-        self.assertIn("1,219\u201321,293", inconclusive[1])
+        self.assertIn("1,219\u20132,293", inconclusive[1])
+
+    def test_fragile_proven_label_states_margin_and_load_dependence(self):
+        baseline = [1157.0, 1129.0, 1143.0, 1148.0, 1155.0]
+        trials = [52559.0, 69960.0, 2435.0, 1682.0, 1161.0]
+        lines = charts.ablated_label("PROVEN", 2435, 2.12, trials, baseline)
+        text = " ".join(lines)
+        self.assertIn("2.12x worse", lines[0])
+        self.assertIn("1,161\u201369,960", lines[1])
+        self.assertIn("highly load dependent", text)
+        self.assertIn("separation margin only 4 ns", text)
+        self.assertIn("flips between runs", text)
+
+    def test_committed_ablation_arms_render_with_expected_verdicts(self):
+        results = charts.DEFAULT_RESULTS_DIR
+        if not results.is_dir():
+            self.skipTest("run-of-record results are not present locally")
+        rows = [
+            r
+            for r in charts.read_csv_rows(results / "ablation_summary.csv")
+            if r["matching_mode"] == "price_time"
+        ]
+        verdicts = {r["design_decision"]: charts.normalize_verdict(r["verdict"]) for r in rows}
+        self.assertEqual(verdicts["Cache-line hot/cold split"], "NO_MEASURABLE_EFFECT")
+        self.assertEqual(verdicts["Lock-free SPSC queue"], "PROVEN")
+        self.assertIn("ABLATED_FASTER", charts.pro_rata_summary(results))
 
     def test_ablation_rows_cover_the_four_decisions(self):
         self.assertEqual(len(charts.DECISIONS), 4)
@@ -122,11 +148,11 @@ class ChartReportingTests(unittest.TestCase):
         self.assertIn("Core isolation + pinning vs unpinned (shared desktop)", titles)
 
     def test_clip_cap_only_clips_outliers(self):
-        self.assertEqual(charts.clip_cap([1170, 6589, 4427]), 6589)
+        self.assertEqual(charts.clip_cap([1148, 4165, 2435]), 4165)
         self.assertEqual(charts.clip_cap([1000, 1200, 30000]), 1500)
 
     def test_percentage_change_uses_signed_rounding(self):
-        self.assertEqual(charts.percentage_change(485, 321), "\u221234%")
+        self.assertEqual(charts.percentage_change(485, 320), "\u221234%")
         self.assertEqual(charts.percentage_change(100, 125), "+25%")
         self.assertEqual(charts.percentage_change(100, 100), "0%")
 

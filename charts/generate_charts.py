@@ -3,7 +3,7 @@
 
 Usage:
     python3 charts/generate_charts.py \
-        --results-dir results_new/7c2fd2c \
+        --results-dir results_new/77eb286 \
         --baseline-dir results/98a597b \
         --ctest-log build/Testing/Temporary/LastTest.log
 
@@ -30,7 +30,7 @@ import matplotlib.ticker as mticker
 from matplotlib.patches import Polygon
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-DEFAULT_RESULTS_DIR = REPO_ROOT / "results_new" / "7c2fd2c"
+DEFAULT_RESULTS_DIR = REPO_ROOT / "results_new" / "77eb286"
 DEFAULT_BASELINE_DIR = REPO_ROOT / "results" / "98a597b"
 DEFAULT_OUT_DIR = Path(__file__).resolve().parent
 
@@ -200,13 +200,28 @@ def trial_range_text(trials: list) -> str:
     return f"per-trial range {fmt(min(trials))}\u2013{fmt(max(trials))} ns"
 
 
-def ablated_label(verdict: str, ablated: float, delta_x: float, trials: list) -> tuple:
-    """Two bar-label lines for the ablated arm; 'x worse' is only claimed for PROVEN."""
+def ablated_label(
+    verdict: str, ablated: float, delta_x: float, trials: list, baseline_trials: list | None = None
+) -> tuple:
+    """Bar-label lines for the ablated arm; 'x worse' is only claimed for PROVEN.
+
+    A PROVEN arm whose per-trial values span more than 10x (a load-dependent tail) gets a
+    third line stating the separation margin (fastest ablated trial minus slowest baseline
+    trial) and that such a row can flip between runs.
+    """
     verdict = normalize_verdict(verdict)
     value = f"{fmt(ablated)} ns"
     spread = trial_range_text(trials)
     if verdict == "PROVEN":
-        return f"{value}  ({delta_x:.2f}x worse)", spread
+        lines = (f"{value}  ({delta_x:.2f}x worse)", spread)
+        if baseline_trials and max(trials) > 10 * min(trials):
+            margin = min(trials) - max(baseline_trials)
+            note = (
+                f"tail highly load dependent; separation margin only {fmt(margin)} ns; "
+                "this row flips between runs"
+            )
+            return lines + tuple(textwrap.wrap(note, 45))
+        return lines
     if verdict == "NO_MEASURABLE_EFFECT":
         return f"{value}  (no measurable effect)", spread
     if verdict == "ABLATED_FASTER":
@@ -382,7 +397,7 @@ def chart_ablation_impact(results_dir: Path, commit: str, out_path: Path):
         f"is a separate run of the same binary ({fmt(median_percentiles(results_dir, 'price_time')['P99.9'])} ns).",
         "Verdicts use per-trial P99.9, 5 trials per arm. PROVEN: median >= 110% of baseline and every ablated trial "
         "above every baseline trial.",
-        "NO_MEASURABLE_EFFECT: median within 10% of baseline (not detected, not proven equal).",
+        "NO_MEASURABLE_EFFECT: median within 10% of baseline (not detected, not proven equal). ABLATED_FASTER: the mirror of PROVEN.",
         "Pinning row: stock unpinned threads on a busy desktop vs isolated pinned cores. It measures core isolation plus "
         "placement luck, not pinning alone.",
         "Pro-rata, same suite: " + pro_rata_summary(results_dir),
@@ -420,14 +435,17 @@ def chart_ablation_impact(results_dir: Path, commit: str, out_path: Path):
             color=INK_SECONDARY,
             linespacing=1.5,
         )
-        line1, line2 = ablated_label(verdict, ablated, float(r["p99_9_delta_x"]), trials)
+        label_lines = list(
+            ablated_label(verdict, ablated, float(r["p99_9_delta_x"]), trials, baseline_trials)
+        )
         if ablated > cap:
-            line1 = f"{line1}  [bar cut, axis break]"
+            label_lines[0] = f"{label_lines[0]}  [bar cut, axis break]"
         ax.text(
             min(ablated, cap) + gap,
-            y_abl,
-            f"{line1}\n{line2}",
-            va="center",
+            y_abl if len(label_lines) <= 2 else y_abl - bar_h / 2,
+            "\n".join(label_lines),
+            # a long label hangs from the top of its bar so it cannot reach the baseline label
+            va="center" if len(label_lines) <= 2 else "top",
             ha="left",
             fontsize=9.5,
             color=INK_SECONDARY,
@@ -894,7 +912,7 @@ def main():
         "--results-dir",
         type=Path,
         default=DEFAULT_RESULTS_DIR,
-        help="results directory of the run of record (default: results_new/7c2fd2c)",
+        help="results directory of the run of record (default: results_new/77eb286)",
     )
     parser.add_argument(
         "--baseline-dir",
