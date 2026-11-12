@@ -378,19 +378,17 @@ PY
 ### Charts
 
 ```bash
-# Regenerate the README charts (overwrites the PNGs in charts/)
+# Regenerate the four README charts (overwrites the PNGs in charts/)
 python3 charts/generate_charts.py \
     --results-dir results_new/77eb286 \
-    --baseline-dir results/98a597b \
     --ctest-log build/Testing/Temporary/LastTest.log
-# both directories default to the run of record and the earlier run, so this is equivalent to:
+# --results-dir defaults to the run of record, so this is equivalent to:
 python3 charts/generate_charts.py --ctest-log build/Testing/Temporary/LastTest.log
 
 python3 charts/generate_charts.py --help
 ```
 
-Options: `--results-dir` (the run of record; default `results_new/77eb286`), `--baseline-dir` (the earlier run used
-by the before/after chart; default `results/98a597b`), `--out-dir` (where the PNGs go; default `charts/`) and
+Options: `--results-dir` (the run of record; default `results_new/77eb286`), `--out-dir` (where the PNGs go; default `charts/`) and
 `--ctest-log` (the CTest log for the tests tile; without it the tile shows N/A). `LastTest.log` is written by
 `ctest --test-dir build`, so run the full test suite first. To preview without touching the committed images, add
 `--out-dir /tmp/charts_preview`. The charts need `matplotlib` (`charts/requirements.txt`).

@@ -1,14 +1,12 @@
 #!/usr/bin/env python3
-"""Generate the five README charts from benchmark evidence on disk.
+"""Generate the four README charts from benchmark evidence on disk.
 
 Usage:
     python3 charts/generate_charts.py \
         --results-dir results_new/77eb286 \
-        --baseline-dir results/98a597b \
         --ctest-log build/Testing/Temporary/LastTest.log
 
-Every benchmark number comes from the result CSVs in --results-dir (the run of record);
-chart 03 also reads --baseline-dir (an earlier run, for the before/after comparison).
+Every benchmark number comes from the result CSVs in --results-dir (the run of record).
 Test status comes from the CTest log given with --ctest-log and shows N/A without one.
 The layout chart is transcribed from include/hydra/types.hpp and must be updated when
 that struct changes (tests/test_chart_reporting.py checks the transcription is gap-free).
@@ -16,7 +14,6 @@ that struct changes (tests/test_chart_reporting.py checks the transcription is g
 
 import argparse
 import csv
-import json
 import re
 import statistics
 import sys
@@ -32,7 +29,6 @@ from matplotlib.patches import Polygon
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_RESULTS_DIR = REPO_ROOT / "results_new" / "77eb286"
-DEFAULT_BASELINE_DIR = REPO_ROOT / "results" / "98a597b"
 DEFAULT_OUT_DIR = Path(__file__).resolve().parent
 
 SERIES_1 = "#2a78d6"  # price-time / baseline
@@ -44,7 +40,6 @@ INK_SECONDARY = "#52514e"
 INK_MUTED = "#6e6c66"
 GRID = "#e1e0d9"
 SURFACE = "#fcfcfb"
-COLOR_EARLIER = "#a3a199"  # the earlier run in the before/after chart
 
 PERCENTILE_COLUMNS = {
     "P50": "p50_ns_per_order",
@@ -71,29 +66,6 @@ plt.rcParams.update(
 
 
 # -- Evidence loading ---------------------------------------------------------
-
-
-def isolated_cores(results_dir: Path) -> str | None:
-    """Return the isolated-core list recorded in a run's metadata (for example '4-7')."""
-    try:
-        meta = json.loads((results_dir / "price_time.meta.json").read_text())
-        found = re.search(r"isolated=(\S+)", meta["env_snapshot"])
-    except (OSError, KeyError, ValueError):
-        return None
-    return found.group(1) if found else None
-
-
-def tuning_note(baseline_dir: Path, results_dir: Path) -> str:
-    """Say honestly whether the two runs had the same host tuning, from their metadata."""
-    earlier, final = isolated_cores(baseline_dir), isolated_cores(results_dir)
-    if earlier is None or final is None:
-        return "Same machine and dataset; host tuning not recorded for both runs."
-    if earlier == final:
-        return f"Same machine, dataset and isolated cores ({final})."
-    return (
-        f"Same machine and dataset, but host tuning differed: isolated cores {earlier} earlier, "
-        f"{final} in the final run (which also tuned the whole cluster)."
-    )
 
 
 def display_path(path: Path) -> str:
@@ -656,90 +628,6 @@ def chart_tail_latency(results_dir: Path, commit: str, out_path: Path):
     finish(fig, out_path)
 
 
-def percentage_change(before: float, after: float) -> str:
-    change = round((after - before) / before * 100)
-    return f"{'+' if change > 0 else '−' if change < 0 else ''}{abs(change)}%"
-
-
-def chart_before_after(
-    results_dir: Path, baseline_dir: Path, commit: str, baseline_commit: str, out_path: Path
-):
-    labels = list(PERCENTILE_COLUMNS)
-    fig, axes = plt.subplots(1, 2, figsize=(11.6, 6.0), dpi=200, sharey=True)
-    top = 0.0
-    panels = []
-    for name, mode, color in MODES:
-        before = median_percentiles(baseline_dir, mode)
-        after = median_percentiles(results_dir, mode)
-        panels.append((name, mode, color, before, after))
-        top = max(top, max(before.values()), max(after.values()))
-
-    width = 0.38
-    for ax, (name, mode, color, before, after) in zip(axes, panels):
-        for k, label in enumerate(labels):
-            ax.bar(k - width / 2 - 0.01, before[label], width, color=COLOR_EARLIER, zorder=3)
-            ax.bar(k + width / 2 + 0.01, after[label], width, color=color, zorder=3)
-            ax.text(
-                k - width / 2 - 0.01,
-                before[label] + top * 0.015,
-                fmt(before[label]),
-                ha="center",
-                va="bottom",
-                fontsize=8.5,
-                color=INK_SECONDARY,
-            )
-            ax.text(
-                k + width / 2 + 0.01,
-                after[label] + top * 0.015,
-                f"{fmt(after[label])}\n{percentage_change(before[label], after[label])}",
-                ha="center",
-                va="bottom",
-                fontsize=8.5,
-                fontweight="bold",
-                color=INK,
-                linespacing=1.4,
-            )
-        ax.set_xticks(range(len(labels)))
-        ax.set_xticklabels(labels, fontsize=11)
-        ax.set_title(name, loc="left", fontsize=12, fontweight="bold", color=INK, pad=10)
-        style_axes(ax, "y", hidden_spines=("top", "right", "left"))
-        ax.tick_params(axis="y", length=0)
-        ax.legend(
-            handles=[
-                plt.Rectangle(
-                    (0, 0), 1, 1, color=COLOR_EARLIER, label=f"Earlier ({baseline_commit})"
-                ),
-                plt.Rectangle((0, 0), 1, 1, color=color, label=f"Final ({commit})"),
-            ],
-            loc="upper left",
-            frameon=False,
-            fontsize=9.5,
-        )
-    axes[0].set_ylim(0, top * 1.22)
-    axes[0].set_ylabel("Median per-trial latency (ns)")
-    comma_format(axes[0].yaxis)
-
-    add_headline(
-        fig,
-        "Before / after: earlier run vs final run",
-        "Earlier engine, earlier session vs current engine: not a controlled A/B.",
-        y=0.975,
-    )
-    bottom = add_footnotes(
-        fig,
-        [
-            f"Earlier: {display_path(baseline_dir)} (commit {baseline_commit}). Final: {display_path(results_dir)} "
-            f"(commit {commit}). 5 trials per mode.",
-            tuning_note(baseline_dir, results_dir),
-            "Values: median over trials of the per-trial percentile, new orders only. The engines differ (correctness fixes, "
-            "allocator, queue slot, harness);",
-            "sessions differ too, and tail percentiles of one binary move 10-20% between sessions. Percentages are not attributable to any one change.",
-        ],
-    )
-    fig.tight_layout(rect=(0, bottom, 1, 0.85))
-    finish(fig, out_path)
-
-
 # Transcribed from include/hydra/types.hpp (static_assert(sizeof(Order) == 128));
 # update these lists together with that struct.
 # Rect tuples are (field, byte offset, size, kind); label tuples are (text, byte, row).
@@ -940,12 +828,6 @@ def main():
         help="results directory of the run of record (default: results_new/77eb286)",
     )
     parser.add_argument(
-        "--baseline-dir",
-        type=Path,
-        default=DEFAULT_BASELINE_DIR,
-        help="earlier results directory for the before/after chart (default: results/98a597b)",
-    )
-    parser.add_argument(
         "--out-dir", type=Path, default=DEFAULT_OUT_DIR, help="where the PNGs go (default: charts/)"
     )
     parser.add_argument(
@@ -956,15 +838,13 @@ def main():
     )
     args = parser.parse_args()
 
-    for label, directory in (("results", args.results_dir), ("baseline", args.baseline_dir)):
-        if not directory.is_dir():
-            sys.exit(f"error: {label} directory {directory} does not exist (see --help)")
+    if not args.results_dir.is_dir():
+        sys.exit(f"error: results directory {args.results_dir} does not exist (see --help)")
 
     commit = run_commit(args.results_dir)
-    baseline_commit = run_commit(args.baseline_dir)
     args.out_dir.mkdir(parents=True, exist_ok=True)
 
-    print(f"Reading evidence from {args.results_dir} (and {args.baseline_dir} for chart 03)")
+    print(f"Reading evidence from {args.results_dir}")
     charts = [
         (
             "00_headline_stats.png",
@@ -978,13 +858,7 @@ def main():
             "02_latency_percentiles.png",
             lambda path: chart_tail_latency(args.results_dir, commit, path),
         ),
-        (
-            "03_before_after.png",
-            lambda path: chart_before_after(
-                args.results_dir, args.baseline_dir, commit, baseline_commit, path
-            ),
-        ),
-        ("04_order_layout.png", lambda path: chart_cache_line_layout(commit, path)),
+        ("03_order_layout.png", lambda path: chart_cache_line_layout(commit, path)),
     ]
     for name, render in charts:
         render(args.out_dir / name)

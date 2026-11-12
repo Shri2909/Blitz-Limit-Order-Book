@@ -1,7 +1,6 @@
 """Regression coverage for chart reporting: test status, verdict vocabulary, labels, determinism."""
 
 import importlib.util
-import json
 import sys
 from pathlib import Path
 import tempfile
@@ -152,11 +151,6 @@ class ChartReportingTests(unittest.TestCase):
         self.assertEqual(charts.clip_cap([1148, 4165, 2435]), 4165)
         self.assertEqual(charts.clip_cap([1000, 1200, 30000]), 1500)
 
-    def test_percentage_change_uses_signed_rounding(self):
-        self.assertEqual(charts.percentage_change(485, 320), "\u221234%")
-        self.assertEqual(charts.percentage_change(100, 125), "+25%")
-        self.assertEqual(charts.percentage_change(100, 100), "0%")
-
     def test_layout_transcription_tiles_each_cache_line(self):
         for rects, start in ((charts.HOT_LINE_RECTS, 0), (charts.COLD_LINE_RECTS, 64)):
             cursor = start
@@ -167,8 +161,7 @@ class ChartReportingTests(unittest.TestCase):
 
     def test_cli_options_and_full_run_are_deterministic(self):
         results = charts.DEFAULT_RESULTS_DIR
-        baseline = charts.DEFAULT_BASELINE_DIR
-        if not (results.is_dir() and baseline.is_dir()):
+        if not results.is_dir():
             self.skipTest("run-of-record results are not present locally")
         outputs = []
         for name in ("one", "two"):
@@ -178,27 +171,9 @@ class ChartReportingTests(unittest.TestCase):
                 charts.main()
             outputs.append(out)
         names = sorted(p.name for p in outputs[0].iterdir())
-        self.assertEqual(len(names), 5)
+        self.assertEqual(len(names), 4)
         for name in names:
             self.assertEqual((outputs[0] / name).read_bytes(), (outputs[1] / name).read_bytes())
-
-    def _run_dir(self, name, isolated):
-        run = self.root / name
-        run.mkdir()
-        if isolated is not None:
-            snapshot = f"isolated={isolated} rx_core=4 matching_core=5"
-            (run / "price_time.meta.json").write_text(json.dumps({"env_snapshot": snapshot}))
-        return run
-
-    def test_tuning_note_states_whether_the_hosts_were_tuned_alike(self):
-        earlier = self._run_dir("earlier", "4-5")
-        final = self._run_dir("final", "4-7")
-        same = self._run_dir("same", "4-5")
-        unknown = self._run_dir("unknown", None)
-        self.assertIn("host tuning differed", charts.tuning_note(earlier, final))
-        self.assertIn("4-5 earlier, 4-7 in the final run", charts.tuning_note(earlier, final))
-        self.assertIn("isolated cores (4-5)", charts.tuning_note(earlier, same))
-        self.assertIn("not recorded", charts.tuning_note(earlier, unknown))
 
 
 if __name__ == "__main__":
