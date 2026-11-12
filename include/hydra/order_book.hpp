@@ -48,13 +48,23 @@ namespace hydra
             {
                 return nullptr;
             }
+            return add_order_known_absent(incoming, incoming.qty);
+        }
 
-            Order *resting = order_pool_.acquire();
+        // Rests `incoming` with quantity `qty`. Precondition: incoming.order_id is not
+        // currently indexed (the matcher has just checked this and the sweep in between
+        // only removes other resting orders), so the duplicate lookup is skipped.
+        // Writing straight into the pool slot also avoids a temporary Order copy.
+        [[nodiscard]] Order *add_order_known_absent(const Order &incoming, uint32_t qty) noexcept
+        {
+            // Copy-construct in place: acquire() would value-initialise (zero) all 128
+            // bytes first, and the compiler cannot prove those stores dead.
+            Order *resting = order_pool_.acquire(incoming);
             if (resting == nullptr) [[unlikely]]
             {
                 return nullptr;
             }
-            *resting = incoming;
+            resting->qty = qty;
 
             Level *level = find_or_create_level(resting->side, resting->price);
             if (level == nullptr) [[unlikely]]

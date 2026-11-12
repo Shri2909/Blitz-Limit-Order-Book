@@ -87,10 +87,10 @@ namespace hydra
                 const bool would_rest_crossed = (opp != nullptr) && crosses(opp, incoming);
                 if (!would_rest_crossed) [[likely]]
                 {
-                    // Copy the order only when a remainder must rest.
-                    Order resting_copy = incoming;
-                    resting_copy.qty = remaining;
-                    [[maybe_unused]] Order *rested = book_.add_order(resting_copy);
+                    // The duplicate-ID check at the top of match() still holds: the sweep
+                    // only removed other resting orders. Rest the remainder directly.
+                    [[maybe_unused]] Order *rested =
+                        book_.add_order_known_absent(incoming, remaining);
                 }
             }
 
