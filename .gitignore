@@ -1,26 +1,24 @@
 # Build outputs
-build/
-build-xdp/
+build*/
 *.o
 *.obj
 
-# Generated benchmark/dataset artifacts
-# WHY: dataset files are deterministic and regenerable via blitz_gen_dataset
-#      given the same seed + config. Store seed/flags in datasets/manifest.txt
-#      instead of committing the binary files themselves.
-# WHY datasets/* + a negated exception (not a blanket datasets/ rule): a
-#      bare "datasets/" ignores the whole directory, manifest.txt included
-#      -- silently defeating the "store flags in manifest.txt instead"
-#      policy this comment describes. This form ignores everything in the
-#      directory except the one file meant to be tracked.
+# Regenerable benchmark and dataset artifacts
 *.csv
 results/
+results_new/
 datasets/*
 !datasets/manifest.txt
 
-# CMake cache
+# Tooling caches and local Python environments
 compile_commands.json
 .cache/
+.venv/
+__pycache__/
+*.py[cod]
 
-# Local forensic-audit workspace (reports/tests/logs) -- kept out of the public repo
+# Local audit notes
 audit/
+
+# Local notes
+PROJECT_PROFILE.md
