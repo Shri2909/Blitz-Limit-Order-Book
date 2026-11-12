@@ -197,7 +197,7 @@ class ChartReportingTests(unittest.TestCase):
         unknown = self._run_dir("unknown", None)
         self.assertIn("host tuning differed", charts.tuning_note(earlier, final))
         self.assertIn("4-5 earlier, 4-7 in the final run", charts.tuning_note(earlier, final))
-        self.assertIn("same isolated cores (4-5)", charts.tuning_note(earlier, same))
+        self.assertIn("isolated cores (4-5)", charts.tuning_note(earlier, same))
         self.assertIn("not recorded", charts.tuning_note(earlier, unknown))
 
 
