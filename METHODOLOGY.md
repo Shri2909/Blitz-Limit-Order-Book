@@ -30,6 +30,9 @@ Timeline: `t0` (producer stamp), `t_pop_start`, `t_pop_end`, `t_match_start`, `t
   coordinated-omission failure mode). `t0` is read after the spin, i.e. the actual release time: if the producer
   itself runs late, that lateness is not added to latency. The worst lag is printed as max schedule drift (not gated).
 - **Back-pressure**: a full ring is retried 1,000 times, then the event is dropped, counted and the run invalidated.
+- **Phase completion**: an in-band control marker follows each warmup and measured replay. The matcher acknowledges
+  it only after all earlier queue events finish, so warmup samples cannot leak into measurement and the book is
+  drained before a trial reset. The marker is excluded from event counts and latency samples.
 - **Population**: new orders only (cancels are in the raw file, excluded; the dataset has no replaces). 84,992
   orders/s is the paced new-order rate (100 kHz, about 85% new), not capacity.
 

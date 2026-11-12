@@ -27,7 +27,7 @@ failure modes. Results are in [`README.md`](README.md), timing and validity in
 | `tail_` / `head_` of the ring | Producer / matcher | Each side writes only its own index, publishes with release, reads the other with acquire. | No CAS loop, and the element copy is ordered before its index. |
 | Producer | Core 4 (`RX_CORE_ID`): the harness thread in benchmark mode, `rx_thread_fn` in live mode | Stamps `Order.timestamp_ns` just before `push()`. | The ring is the only path by which order data crosses threads. |
 | `buffer_`, `tail_`, `head_` | Each `alignas(64)` | Separate cache lines. | The two threads do not false-share. |
-| Pipeline state shared across threads | `std::stop_token`, `ns_per_cycle` (written once before threads start), `raw_samples` (atomic pointer) | Everything else is thread-local. | `ns_per_cycle` is calibrated once so cross-thread timestamp subtraction is consistent. |
+| Pipeline state shared across threads | `std::stop_token`, `ns_per_cycle` (written once before threads start), worker startup states, `raw_samples`, and benchmark phase-barrier acknowledgement | Everything else is thread-local. | Startup failures are reported to the caller; benchmark barriers drain each phase without a per-event counter. |
 
 Both threads busy-poll (the matcher retries `pop()` up to 1,000 times per outer iteration and never sleeps), so
 each holds a core at full utilisation. `pin_to_core` plus `verify_affinity` require the mask to be exactly one
@@ -56,8 +56,9 @@ struct changes.
 
 ## Handling one event
 
-`matching_thread_fn` pops an `Order` and dispatches on `event_tag` and `qty`. A cancel goes straight to the book.
-A replace calls `Matcher::replace`. Everything else calls `Matcher::match`.
+`matching_thread_fn` pops an `Order` and dispatches on `event_tag` and `qty`. Benchmark phase barriers are
+acknowledged in queue order and do not reach the matcher. A cancel goes straight to the book. A replace calls
+`Matcher::replace` with the replacement event timestamp. Everything else calls `Matcher::match`.
 
 ```mermaid
 flowchart TD
