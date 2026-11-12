@@ -86,7 +86,6 @@ namespace hydra::test
             HYDRA_CHECK_EQ(q.approx_size(), std::size_t{3});
         }
 
-
         Order make_order(uint64_t i)
         {
             Order o{};
