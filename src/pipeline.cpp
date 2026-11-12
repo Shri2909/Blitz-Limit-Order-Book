@@ -28,12 +28,15 @@ namespace hydra
         }
         catch (const std::runtime_error &e)
         {
+            ctx.rx_thread_startup.store(WorkerStartupState::FAILED, std::memory_order_release);
             std::fprintf(stderr,
                          "rx_thread_fn: affinity setup failed, exiting without "
                          "entering its loop: %s\n",
                          e.what());
             return;
         }
+
+        ctx.rx_thread_startup.store(WorkerStartupState::READY, std::memory_order_release);
 
         const double ns_per_cycle = ctx.ns_per_cycle;
 
@@ -90,12 +93,16 @@ namespace hydra
         }
         catch (const std::runtime_error &e)
         {
+            ctx.matching_thread_startup.store(WorkerStartupState::FAILED,
+                                              std::memory_order_release);
             std::fprintf(stderr,
                          "matching_thread_fn: affinity setup failed, exiting "
                          "without entering its loop: %s\n",
                          e.what());
             return;
         }
+
+        ctx.matching_thread_startup.store(WorkerStartupState::READY, std::memory_order_release);
 
         const double ns_per_cycle = ctx.ns_per_cycle;
         const auto now_ns = [ns_per_cycle]() -> uint64_t
@@ -122,6 +129,12 @@ namespace hydra
             }
             if (!popped)
             {
+                continue;
+            }
+
+            if (order.event_tag == OrderEventTag::PHASE_BARRIER)
+            {
+                ctx.completed_phase_barrier.store(order.order_id, std::memory_order_release);
                 continue;
             }
 
@@ -176,9 +189,10 @@ namespace hydra
             const bool is_replace = (order.event_tag == OrderEventTag::REPLACE);
 
             const uint64_t t_match_start_ns = now_ns();
-            const MatchStats stats = is_replace ? ctx.matcher.replace(order.order_id, order.price,
-                                                                      order.qty, timed_on_fill)
-                                                : ctx.matcher.match(order, timed_on_fill);
+            const MatchStats stats =
+                is_replace ? ctx.matcher.replace(order.order_id, order.price, order.qty,
+                                                 order.timestamp_ns, timed_on_fill)
+                           : ctx.matcher.match(order, timed_on_fill);
             const uint64_t t_match_end_ns = now_ns();
 
             const uint64_t match_time_ns =

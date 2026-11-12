@@ -11,6 +11,7 @@ namespace hydra
 
     template <typename T, std::size_t N> class SpscQueue
     {
+        static_assert(N > 0, "N must be positive");
         static_assert((N & (N - 1)) == 0, "N must be power of 2");
 
         static constexpr std::uint64_t kMask = static_cast<std::uint64_t>(N) - 1;

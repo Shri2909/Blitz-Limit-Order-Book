@@ -301,7 +301,7 @@ namespace hydra::test
             (void)f.book->add_order(make_order(1, 100, 10, Side::SELL));
             (void)f.book->add_order(make_order(2, 100, 10, Side::SELL));
 
-            const MatchStats stats = f.matcher->replace(1, 100, 4, [](const FillEvent &) {});
+            const MatchStats stats = f.matcher->replace(1, 100, 4, 0, [](const FillEvent &) {});
             HYDRA_CHECK_EQ(stats.fills_generated, uint32_t{0});
 
             Level *lvl = f.book->best_ask_level();
@@ -320,7 +320,7 @@ namespace hydra::test
             (void)f.book->add_order(make_order(1, 100, 10, Side::SELL));
             (void)f.book->add_order(make_order(2, 101, 10, Side::SELL));
 
-            const MatchStats stats = f.matcher->replace(1, 101, 10, [](const FillEvent &) {});
+            const MatchStats stats = f.matcher->replace(1, 101, 10, 0, [](const FillEvent &) {});
             HYDRA_CHECK_EQ(stats.fills_generated, uint32_t{0});
 
             // The old level is gone.
@@ -341,7 +341,7 @@ namespace hydra::test
             (void)f.book->add_order(make_order(1, 100, 10, Side::SELL));
             (void)f.book->add_order(make_order(2, 100, 10, Side::SELL));
 
-            const MatchStats stats = f.matcher->replace(1, 100, 20, [](const FillEvent &) {});
+            const MatchStats stats = f.matcher->replace(1, 100, 20, 0, [](const FillEvent &) {});
             HYDRA_CHECK_EQ(stats.fills_generated, uint32_t{0});
 
             Level *lvl = f.book->best_ask_level();
@@ -357,17 +357,27 @@ namespace hydra::test
         void test_replace_that_crosses_book()
         {
             Fixture f;
-            (void)f.book->add_order(make_order(1, 105, 10, Side::SELL)); // to be replaced
-            (void)f.book->add_order(make_order(2, 100, 10, Side::BUY));  // resting bid
+            Order replaced = make_order(1, 105, 10, Side::SELL); // to be replaced
+            replaced.timestamp_ns = 123;
+            (void)f.book->add_order(replaced);
+            (void)f.book->add_order(make_order(2, 100, 10, Side::BUY)); // resting bid
 
             std::vector<FillRecord> fills;
+            uint64_t fill_timestamp_ns = 0;
             // Repricing to 100 crosses the resting bid.
-            const MatchStats stats = f.matcher->replace(1, 100, 10, record_fills(fills));
+            const MatchStats stats =
+                f.matcher->replace(1, 100, 10, 456,
+                                   [&](const FillEvent &fill)
+                                   {
+                                       fills.push_back({fill.maker_order_id, fill.price, fill.qty});
+                                       fill_timestamp_ns = fill.timestamp_ns;
+                                   });
 
             HYDRA_CHECK_EQ(stats.fills_generated, uint32_t{1});
             HYDRA_CHECK_EQ(fills.size(), std::size_t{1});
             HYDRA_CHECK_EQ(fills[0].maker_order_id, uint64_t{2});
             HYDRA_CHECK_EQ(fills[0].qty, uint32_t{10});
+            HYDRA_CHECK_EQ(fill_timestamp_ns, uint64_t{456});
             HYDRA_CHECK(!f.book->best_bid().has_value());
             HYDRA_CHECK(!f.book->best_ask().has_value());
         }
@@ -377,7 +387,7 @@ namespace hydra::test
             Fixture f;
             (void)f.book->add_order(make_order(1, 100, 10, Side::SELL));
 
-            const MatchStats stats = f.matcher->replace(999, 100, 5, [](const FillEvent &) {});
+            const MatchStats stats = f.matcher->replace(999, 100, 5, 0, [](const FillEvent &) {});
             HYDRA_CHECK_EQ(stats.fills_generated, uint32_t{0});
 
             Level *lvl = f.book->best_ask_level();

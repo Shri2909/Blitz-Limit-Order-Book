@@ -102,8 +102,12 @@ namespace hydra
         // changes or quantity increases cancel and rematch as a fresh order.
         // Zero quantity cancels; an unknown ID is a no-op. Only the rematch path
         // can return fills.
+        // The replacement event timestamp is used if the replacement loses priority
+        // and rematches as an incoming order. A same-price quantity reduction keeps
+        // its existing timestamp and FIFO position.
         template <typename FillHandler>
         [[nodiscard]] MatchStats replace(uint64_t order_id, int64_t new_price, uint32_t new_qty,
+                                         uint64_t replacement_timestamp_ns,
                                          FillHandler &&on_fill) noexcept
         {
             const Order *const existing = book_.find_order(order_id);
@@ -134,7 +138,7 @@ namespace hydra
             incoming.tif = existing->tif;
             incoming.event_tag = OrderEventTag::NEW_OR_CANCEL;
             incoming.client_id = existing->client_id;
-            incoming.timestamp_ns = existing->timestamp_ns;
+            incoming.timestamp_ns = replacement_timestamp_ns;
             std::memcpy(incoming.client_tag, existing->client_tag, sizeof(incoming.client_tag));
 
             // The ID is known to be live, so cancellation must succeed.

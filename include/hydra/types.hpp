@@ -21,10 +21,12 @@ namespace hydra
 
     // Queue event semantics: NEW_OR_CANCEL with qty == 0 cancels order_id;
     // positive quantity submits an order. REPLACE modifies that live ID.
+    // PHASE_BARRIER is a benchmark control marker, not a trading event.
     enum class OrderEventTag : uint8_t
     {
         NEW_OR_CANCEL = 0,
         REPLACE = 1,
+        PHASE_BARRIER = 2,
     };
 
     // Two cache lines separate core order fields and FIFO links from metadata.

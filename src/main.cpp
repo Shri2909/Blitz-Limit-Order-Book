@@ -270,14 +270,31 @@ namespace
                      opts.mode == hydra::MatchingMode::PRICE_TIME ? "price_time" : "pro_rata",
                      hydra::RX_CORE_ID, hydra::MATCHING_CORE_ID);
 
+        ctx.rx_thread_startup.store(hydra::WorkerStartupState::STARTING, std::memory_order_release);
+        ctx.matching_thread_startup.store(hydra::WorkerStartupState::STARTING,
+                                          std::memory_order_release);
         std::thread rx_thread(hydra::rx_thread_fn, stop_source.get_token(), std::ref(ctx));
         std::thread matching_thread(hydra::matching_thread_fn, stop_source.get_token(),
                                     std::ref(ctx));
 
+        bool worker_startup_failed = false;
         while (!stop_source.stop_requested())
         {
             if (g_interrupted != 0)
             {
+                stop_source.request_stop();
+                break;
+            }
+            const bool rx_failed = ctx.rx_thread_startup.load(std::memory_order_acquire) ==
+                                   hydra::WorkerStartupState::FAILED;
+            const bool matching_failed =
+                ctx.matching_thread_startup.load(std::memory_order_acquire) ==
+                hydra::WorkerStartupState::FAILED;
+            if (rx_failed || matching_failed)
+            {
+                std::fprintf(stderr,
+                             "hydra_lob: worker affinity startup failed; stopping the pipeline.\n");
+                worker_startup_failed = true;
                 stop_source.request_stop();
                 break;
             }
@@ -289,7 +306,8 @@ namespace
 
         std::signal(SIGINT, SIG_DFL);
 
-        std::fprintf(stdout, "hydra_lob: shutdown complete.\n");
+        std::fprintf(stdout, "hydra_lob: shutdown complete%s.\n",
+                     worker_startup_failed ? " after worker startup failure" : "");
     }
 
     void run_benchmark_mode(const CliOptions &opts)

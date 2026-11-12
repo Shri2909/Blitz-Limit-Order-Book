@@ -25,6 +25,7 @@ namespace hydra
     {
         NEW_OR_CANCEL = 0,
         REPLACE = 1,
+        PHASE_BARRIER = 2,
     };
 
     // Flat field layout without cache-line separation or alignment.

@@ -783,10 +783,48 @@ namespace hydra
             }
         }
 
+        void wait_for_matching_thread_startup(PipelineContext &ctx)
+        {
+            WorkerStartupState state = ctx.matching_thread_startup.load(std::memory_order_acquire);
+            while (state == WorkerStartupState::STARTING)
+            {
+                std::this_thread::yield();
+                state = ctx.matching_thread_startup.load(std::memory_order_acquire);
+            }
+            if (state != WorkerStartupState::READY)
+            {
+                throw std::runtime_error(
+                    "benchmark: matching thread failed affinity startup; see the worker error "
+                    "above");
+            }
+        }
+
+        void wait_for_phase_completion(PipelineContext &ctx, uint64_t &barrier_sequence)
+        {
+            ++barrier_sequence;
+            if (barrier_sequence == 0)
+            {
+                ++barrier_sequence;
+            }
+
+            Order barrier{};
+            barrier.order_id = barrier_sequence;
+            barrier.event_tag = OrderEventTag::PHASE_BARRIER;
+            while (!ctx.queue.push(barrier))
+            {
+                std::this_thread::yield();
+            }
+            while (ctx.completed_phase_barrier.load(std::memory_order_acquire) != barrier_sequence)
+            {
+                std::this_thread::yield();
+            }
+        }
+
         // Warm-up replay, then a measured replay that the matching thread records into a
         // sink; trials after the first start from a freshly reset book and pools.
         void run_trial(PipelineContext &ctx, const std::vector<DatasetEvent> &events,
-                       double ns_per_cycle, std::size_t trial, RunData &run)
+                       double ns_per_cycle, std::size_t trial, uint64_t &barrier_sequence,
+                       RunData &run)
         {
             if (trial > 0)
             {
@@ -799,8 +837,12 @@ namespace hydra
             const uint64_t order_pool_before = ctx.order_pool.exhaustion_count();
             const uint64_t level_pool_before = ctx.level_pool.exhaustion_count();
 
-            absorb_replay_stats(
-                run, replay_phase(ctx, events, 0, WARMUP_ITERATIONS, ns_per_cycle, [] {}));
+            const ReplayPhaseResult warmup =
+                replay_phase(ctx, events, 0, WARMUP_ITERATIONS, ns_per_cycle, [] {});
+            absorb_replay_stats(run, warmup);
+            // An in-band barrier completes after all warmup events, including any
+            // in-flight match, before the measured sink is attached.
+            wait_for_phase_completion(ctx, barrier_sequence);
 
             TrialRecord record;
             record.timestamps_unix.reserve(MEASURED_ITERATIONS);
@@ -820,11 +862,16 @@ namespace hydra
             run.push_ns_max = std::max(run.push_ns_max, measured.push_ns_max);
             run.push_count += measured.push_count;
 
-            while (sink.count() < record.timestamps_unix.size())
-            {
-                std::this_thread::yield();
-            }
+            // The barrier follows every successful enqueue in this phase, so its ack
+            // means all measured samples are complete and the queue is drained.
+            wait_for_phase_completion(ctx, barrier_sequence);
+            const std::size_t completed_samples = sink.count();
             ctx.raw_samples.store(nullptr, std::memory_order_release);
+            if (completed_samples != record.timestamps_unix.size())
+            {
+                throw std::runtime_error(
+                    "benchmark: processed-event and latency-sample counts diverged");
+            }
             const double batch_seconds =
                 std::chrono::duration<double>(std::chrono::steady_clock::now() - batch_start)
                     .count();
@@ -1340,13 +1387,16 @@ namespace hydra
         ctx.ns_per_cycle = ns_per_cycle;
         run.clock_overhead_ns = measure_clock_overhead_ns(ns_per_cycle);
 
+        ctx.matching_thread_startup.store(WorkerStartupState::STARTING, std::memory_order_release);
         std::jthread matching_thread(matching_thread_fn, std::ref(ctx));
+        wait_for_matching_thread_startup(ctx);
 
         run.records.reserve(cfg.trials);
         run.trials.reserve(cfg.trials);
+        uint64_t barrier_sequence = ctx.completed_phase_barrier.load(std::memory_order_acquire);
         for (std::size_t trial = 0; trial < cfg.trials; ++trial)
         {
-            run_trial(ctx, events, ns_per_cycle, trial, run);
+            run_trial(ctx, events, ns_per_cycle, trial, barrier_sequence, run);
         }
 
         run.final_bid_levels = ctx.book.bid_level_count();

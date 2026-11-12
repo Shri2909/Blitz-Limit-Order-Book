@@ -2,6 +2,7 @@
 
 #include <atomic>
 #include <cstddef>
+#include <cstdint>
 #include <stop_token>
 
 #include "hydra/config.hpp"
@@ -13,6 +14,14 @@
 
 namespace hydra
 {
+
+    enum class WorkerStartupState : uint8_t
+    {
+        NOT_STARTED,
+        STARTING,
+        READY,
+        FAILED,
+    };
 
     // Per-event timing boundaries and matching counters.
     // See METHODOLOGY.md for measurement definitions.
@@ -81,6 +90,12 @@ namespace hydra
         double ns_per_cycle = 0.0;
 
         std::atomic<RawSampleSink *> raw_samples{nullptr};
+        // Startup status lets callers fail promptly when affinity setup fails.
+        std::atomic<WorkerStartupState> rx_thread_startup{WorkerStartupState::NOT_STARTED};
+        std::atomic<WorkerStartupState> matching_thread_startup{WorkerStartupState::NOT_STARTED};
+        // Benchmark-only in-band barriers acknowledge that all preceding queue events
+        // have completed without adding an atomic RMW to every matching operation.
+        std::atomic<uint64_t> completed_phase_barrier{0};
     };
 
     void rx_thread_fn(std::stop_token stop, PipelineContext &ctx);
