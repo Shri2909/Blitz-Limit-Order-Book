@@ -24,7 +24,7 @@ Source: `results_new/77eb286/{price_time,pro_rata}.csv`, also in [CONSOLIDATED_B
 
 Versus the earlier engine (`98a597b`), price-time P50 falls 485 to 320 (-34%) and P99.9 1,850 to 1,158 (-37%); pro-rata P99.9 falls 3,132 to 2,433 (-22%). That run was a different session and an older engine, so it is informative, not a controlled A/B. Same-session paired runs of the last three performance commits (not stored in the repo) showed price-time P50 420 to 320 ns. The same engine code was measured three times on the tuned host (including an earlier run in `results_new/`) and agrees within about 2% (3% at pro-rata P99.9), P50 to P99.9.
 
-<p align="center"><img src="charts/02_tail_latency_profile.png" alt="Tail latency profile P50 to P99.99, price-time vs pro-rata, log scale" width="49%"> <img src="charts/03_scheduler_noise.png" alt="Before and after percentiles, old engine 98a597b versus 77eb286, different sessions" width="49%"></p>
+<p align="center"><img src="charts/02_latency_percentiles.png" alt="Tail latency profile P50 to P99.99, price-time vs pro-rata, log scale" width="49%"> <img src="charts/03_before_after.png" alt="Before and after percentiles, old engine 98a597b versus 77eb286, different sessions" width="49%"></p>
 
 ## How it works
 
@@ -55,7 +55,7 @@ Median P99.9 in ns, same dataset and host; each arm changes one thing (the mutex
 
 Queue and pool effects are clear; the mutex queue is also 2.7x worse at P50 (861 vs 320 ns). The isolation row is not a pinning result: across four sessions it has read INCONCLUSIVE, ABLATED_FASTER and PROVEN. Here price-time is PROVEN worse only because the fastest unpinned trial (1,161) beat the slowest baseline trial (1,157) by 4 ns, with unpinned trials spanning 1,161 to 69,960 ns, while pro-rata is faster unpinned. It measures isolation plus placement luck on a busy desktop (earlier one-off runs: roughly 4x to 40x worse tails off the isolated cores, depending on desktop load; pinning alone showed no measurable effect once the core set was fixed; not reproducible from repo scripts). The hot/cold split shows no measurable effect at any percentile (P50 320 vs 320 ns), so it is a footprint argument that this workload cannot exercise (analysis in [DESIGN.md](DESIGN.md)).
 
-<p align="center"><img src="charts/01_ablation_impact.png" alt="Ablation verdicts per design choice, price-time and pro-rata" width="80%"></p>
+<p align="center"><img src="charts/01_ablation_verdicts.png" alt="Ablation verdicts per design choice, price-time and pro-rata" width="80%"></p>
 
 ## What is verified, and what is not
 

@@ -49,7 +49,7 @@ Fills go to a synchronous callback as stack-local `FillEvent` values, valid unti
 - Ablation builds (`ablation/<variant>/include/hydra/`) shadow single headers so that each arm changes one thing: the flat-layout arm keeps the same ring (same eight transported fields, different offsets), and the mutex arm queues the same eight-field payload through `std::mutex` plus `std::queue`, so it differs from the ring only in synchronisation, not in bytes copied.
 - Why two lines: sweep fields and FIFO links share line 0, identity and timing sit on line 1. Honest result: sweeps also read `client_id` (line 1) for the self-trade check, so line 1 is not cold, and the measured benefit of the split is none (flat 88 B layout through the same ring: NO_MEASURABLE_EFFECT at every percentile, see the README ablation table and [DESIGN.md](DESIGN.md)). It is a memory-footprint argument that this workload cannot exercise.
 
-<p align="center"><img src="charts/04_cache_line_layout.png" alt="Order struct layout: two 64-byte cache lines with byte offsets" width="85%"></p>
+<p align="center"><img src="charts/04_order_layout.png" alt="Order struct layout: two 64-byte cache lines with byte offsets" width="85%"></p>
 
 The image was checked against `types.hpp` offsets for this revision. Re-check it if the struct changes.
 

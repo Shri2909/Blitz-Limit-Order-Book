@@ -942,24 +942,24 @@ def main():
     print(f"Reading evidence from {args.results_dir} (and {args.baseline_dir} for chart 03)")
     charts = [
         (
-            "00_hero_stats.png",
+            "00_headline_stats.png",
             lambda path: chart_hero_stats(args.results_dir, commit, path, args.ctest_log),
         ),
         (
-            "01_ablation_impact.png",
+            "01_ablation_verdicts.png",
             lambda path: chart_ablation_impact(args.results_dir, commit, path),
         ),
         (
-            "02_tail_latency_profile.png",
+            "02_latency_percentiles.png",
             lambda path: chart_tail_latency(args.results_dir, commit, path),
         ),
         (
-            "03_scheduler_noise.png",
+            "03_before_after.png",
             lambda path: chart_before_after(
                 args.results_dir, args.baseline_dir, commit, baseline_commit, path
             ),
         ),
-        ("04_cache_line_layout.png", lambda path: chart_cache_line_layout(commit, path)),
+        ("04_order_layout.png", lambda path: chart_cache_line_layout(commit, path)),
     ]
     for name, render in charts:
         render(args.out_dir / name)
