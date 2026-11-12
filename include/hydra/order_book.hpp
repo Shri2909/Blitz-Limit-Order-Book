@@ -88,11 +88,11 @@ namespace hydra
                 const int64_t price = level->price;
                 if (side == Side::BUY)
                 {
-                    bids_.erase(price);
+                    bids_.erase(bids_.find(price));
                 }
                 else
                 {
-                    asks_.erase(price);
+                    asks_.erase(asks_.find(price));
                 }
                 level_pool_.release(level);
             }
@@ -185,6 +185,21 @@ namespace hydra
             return (it == asks_.end()) ? nullptr : it->second;
         }
 
+        // Best level strictly worse than `price`, found by key. Unlike next_*_level(),
+        // this stays valid after the level at `price` has been emptied and released,
+        // so a sweep can look up its next level only once it knows it needs one.
+        [[nodiscard]] Level *bid_level_below(int64_t price) noexcept
+        {
+            const auto it = bids_.upper_bound(price);
+            return (it == bids_.end()) ? nullptr : it->second;
+        }
+
+        [[nodiscard]] Level *ask_level_above(int64_t price) noexcept
+        {
+            const auto it = asks_.upper_bound(price);
+            return (it == asks_.end()) ? nullptr : it->second;
+        }
+
         [[nodiscard]] std::size_t bid_level_count() const noexcept { return bids_.size(); }
         [[nodiscard]] std::size_t ask_level_count() const noexcept { return asks_.size(); }
 
@@ -260,8 +275,8 @@ namespace hydra
         template <typename PriceMap>
         [[nodiscard]] Level *get_or_create_level(PriceMap &price_map, int64_t price) noexcept
         {
-            auto it = price_map.find(price);
-            if (it != price_map.end()) [[likely]]
+            auto it = price_map.lower_bound(price);
+            if (it != price_map.end() && !price_map.key_comp()(price, it->first)) [[likely]]
             {
                 return it->second;
             }
@@ -275,7 +290,7 @@ namespace hydra
             level->order_count = 0;
             level->head_ = nullptr;
             level->tail_ = nullptr;
-            price_map.emplace(price, level);
+            price_map.emplace_hint(it, price, level);
             return level;
         }
 

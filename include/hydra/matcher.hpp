@@ -186,9 +186,8 @@ namespace hydra
 
             while (level != nullptr && remaining > 0 && crosses(level, incoming))
             {
-                Level *const next_level = (incoming.side == Side::BUY)
-                                              ? book_.next_ask_level(level->price)
-                                              : book_.next_bid_level(level->price);
+                // Filling may empty and release `level`, so keep its key for the lookup below.
+                const int64_t level_price = level->price;
                 if constexpr (!DryRun)
                 {
                     ++stats.levels_consumed;
@@ -230,7 +229,13 @@ namespace hydra
                     }
                 }
 
-                level = next_level;
+                if (remaining == 0)
+                {
+                    break;
+                }
+                // Same level the eager lookup returned: processing never adds levels.
+                level = (incoming.side == Side::BUY) ? book_.ask_level_above(level_price)
+                                                     : book_.bid_level_below(level_price);
             }
         }
 
@@ -358,9 +363,8 @@ namespace hydra
 
             while (level != nullptr && remaining > 0 && crosses(level, incoming))
             {
-                Level *const next_level = (incoming.side == Side::BUY)
-                                              ? book_.next_ask_level(level->price)
-                                              : book_.next_bid_level(level->price);
+                // Filling may empty and release `level`, so keep its key for the lookup below.
+                const int64_t level_price = level->price;
                 if constexpr (!DryRun)
                 {
                     ++stats.levels_consumed;
@@ -368,7 +372,13 @@ namespace hydra
 
                 pro_rata_at_level<DryRun>(level, incoming, remaining, stats, on_fill);
 
-                level = next_level;
+                if (remaining == 0)
+                {
+                    break;
+                }
+                // Same level the eager lookup returned: processing never adds levels.
+                level = (incoming.side == Side::BUY) ? book_.ask_level_above(level_price)
+                                                     : book_.bid_level_below(level_price);
             }
         }
 
