@@ -1,8 +1,12 @@
 # Blitz LOB — Consolidated Benchmark Results
 
-Every benchmark this project's harness ran in this session, consolidated from the actual saved CSV/JSON artifacts in `results/98a597b/` -- nothing re-run, nothing estimated, nothing carried over from a prior session. All 16 runs below (4 canonical + 10 ablation + 2 verbose) are independently `VALID`, deterministic, and saw zero dropped events / pool exhaustion / arena fallback. This supersedes and replaces every prior results directory (`results/684f9ff/` and an earlier, mislabeled `results/98a597b/` run whose binary had not been rebuilt after the commit) -- both were deleted. See `docs/BENCHMARK_METHODOLOGY.md` for what every field means.
+Per-trial results for every benchmark run saved in `results/98a597b/`, copied from the run CSV and `.meta.json` files without re-running or estimating anything. This is the source for the figures quoted in the [README](README.md), [DESIGN.md](DESIGN.md), and [METHODOLOGY.md](METHODOLOGY.md). Field definitions are in [METHODOLOGY.md](METHODOLOGY.md).
 
-**Environment for every run below**: 12th Gen Intel Core i5-1235U, cores 4 (producer) / 5 (consumer) isolated (`isolcpus`), governor `performance` on both, no SMT sibling on either core, single NUMA node, Chrome closed. Commit `98a597b` ('Clean Benchmarks'), **working tree genuinely clean** -- every artifact below self-reports `dirty: false`, confirmed, not merely assumed.
+> **Measurement vintage.** All runs below were measured at commit `98a597b`, before later correctness fixes changed matching outcomes (for example self-trade handling), so `state_hash` values, fill counts, and latencies describe the earlier engine. The current engine has not been re-measured on a tuned host. The datasets are unchanged: regenerating `bench_110k.bin` and `ablation4_flat.bin` with the current generator reproduces hashes `51ce6285b274413e` and `f330eff74ca2a47e`.
+
+All 14 runs (2 canonical, 2 canonical with `--verbose`, 10 ablation) are `VALID` and deterministic, with zero dropped events, pool exhaustion, and arena fallback, for 70 measured trials in total. Dataset paths below are shown relative to the repository; the saved metadata records absolute paths on the benchmark host.
+
+**Environment for every run**: 12th Gen Intel Core i5-1235U, cores 4 (producer) and 5 (consumer) isolated (`isolcpus`), `performance` governor on both, no SMT sibling on either core, single NUMA node, browser closed, GCC 15.2.0. Commit `98a597b`, clean working tree (every artifact self-reports `dirty: false`). Ablation runs carry the commit string `98a597b-ablation-<variant>`.
 
 ## At a Glance
 
@@ -85,7 +89,7 @@ Every benchmark this project's harness ran in this session, consolidated from th
 
 ---
 
-## 3–4. Canonical Benchmarks, --verbose (same runs, diagnostics-enabled reports)
+## 3–4. Canonical Benchmarks, --verbose (separate runs with diagnostics enabled)
 
 ### Price-Time (--verbose)
 
@@ -151,7 +155,7 @@ Every benchmark this project's harness ran in this session, consolidated from th
 
 - **Run ID**: `98a597b-price_time-1784608667`
 - **Commit**: `98a597b`  |  **Working tree**: Clean
-- **Matching mode**: `price_time`  |  **Dataset**: `/home/abc/projects/Blitz-Limit-Order-Book/datasets/bench_110k.bin` (hash `51ce6285b274413e`)
+- **Matching mode**: `price_time`  |  **Dataset**: `datasets/bench_110k.bin` (hash `51ce6285b274413e`)
 - **CPU**: 12th Gen Intel(R) Core(TM) i5-1235U  |  **Compiler**: GCC 15.2.0
 - **Env**: `isolated=4-5 rx_core=4 rx_governor=performance rx_smt_siblings=4 matching_core=5 matching_governor=performance matching_smt_siblings=5 git=98a597b dirty=no`
 - **Result validity**: **VALID**
@@ -180,7 +184,7 @@ Every benchmark this project's harness ran in this session, consolidated from th
 
 - **Run ID**: `98a597b-pro_rata-1784608707`
 - **Commit**: `98a597b`  |  **Working tree**: Clean
-- **Matching mode**: `pro_rata`  |  **Dataset**: `/home/abc/projects/Blitz-Limit-Order-Book/datasets/bench_110k.bin` (hash `51ce6285b274413e`)
+- **Matching mode**: `pro_rata`  |  **Dataset**: `datasets/bench_110k.bin` (hash `51ce6285b274413e`)
 - **CPU**: 12th Gen Intel(R) Core(TM) i5-1235U  |  **Compiler**: GCC 15.2.0
 - **Env**: `isolated=4-5 rx_core=4 rx_governor=performance rx_smt_siblings=4 matching_core=5 matching_governor=performance matching_smt_siblings=5 git=98a597b dirty=no`
 - **Result validity**: **VALID**
@@ -209,7 +213,7 @@ Every benchmark this project's harness ran in this session, consolidated from th
 
 - **Run ID**: `98a597b-ablation-mutex_queue-price_time-1784608675`
 - **Commit**: `98a597b-ablation-mutex_queue`  |  **Working tree**: Clean
-- **Matching mode**: `price_time`  |  **Dataset**: `/home/abc/projects/Blitz-Limit-Order-Book/datasets/bench_110k.bin` (hash `51ce6285b274413e`)
+- **Matching mode**: `price_time`  |  **Dataset**: `datasets/bench_110k.bin` (hash `51ce6285b274413e`)
 - **CPU**: 12th Gen Intel(R) Core(TM) i5-1235U  |  **Compiler**: GCC 15.2.0
 - **Env**: `isolated=4-5 rx_core=4 rx_governor=performance rx_smt_siblings=4 matching_core=5 matching_governor=performance matching_smt_siblings=5 git=98a597b-ablation-mutex_queue dirty=no`
 - **Result validity**: **VALID**
@@ -238,7 +242,7 @@ Every benchmark this project's harness ran in this session, consolidated from th
 
 - **Run ID**: `98a597b-ablation-mutex_queue-pro_rata-1784608715`
 - **Commit**: `98a597b-ablation-mutex_queue`  |  **Working tree**: Clean
-- **Matching mode**: `pro_rata`  |  **Dataset**: `/home/abc/projects/Blitz-Limit-Order-Book/datasets/bench_110k.bin` (hash `51ce6285b274413e`)
+- **Matching mode**: `pro_rata`  |  **Dataset**: `datasets/bench_110k.bin` (hash `51ce6285b274413e`)
 - **CPU**: 12th Gen Intel(R) Core(TM) i5-1235U  |  **Compiler**: GCC 15.2.0
 - **Env**: `isolated=4-5 rx_core=4 rx_governor=performance rx_smt_siblings=4 matching_core=5 matching_governor=performance matching_smt_siblings=5 git=98a597b-ablation-mutex_queue dirty=no`
 - **Result validity**: **VALID**
@@ -267,7 +271,7 @@ Every benchmark this project's harness ran in this session, consolidated from th
 
 - **Run ID**: `98a597b-ablation-unpinned-price_time-1784608683`
 - **Commit**: `98a597b-ablation-unpinned`  |  **Working tree**: Clean
-- **Matching mode**: `price_time`  |  **Dataset**: `/home/abc/projects/Blitz-Limit-Order-Book/datasets/bench_110k.bin` (hash `51ce6285b274413e`)
+- **Matching mode**: `price_time`  |  **Dataset**: `datasets/bench_110k.bin` (hash `51ce6285b274413e`)
 - **CPU**: 12th Gen Intel(R) Core(TM) i5-1235U  |  **Compiler**: GCC 15.2.0
 - **Env**: `isolated=4-5 rx_core=4 rx_governor=performance rx_smt_siblings=4 matching_core=5 matching_governor=performance matching_smt_siblings=5 git=98a597b-ablation-unpinned dirty=no`
 - **Result validity**: **VALID**
@@ -296,7 +300,7 @@ Every benchmark this project's harness ran in this session, consolidated from th
 
 - **Run ID**: `98a597b-ablation-unpinned-pro_rata-1784608723`
 - **Commit**: `98a597b-ablation-unpinned`  |  **Working tree**: Clean
-- **Matching mode**: `pro_rata`  |  **Dataset**: `/home/abc/projects/Blitz-Limit-Order-Book/datasets/bench_110k.bin` (hash `51ce6285b274413e`)
+- **Matching mode**: `pro_rata`  |  **Dataset**: `datasets/bench_110k.bin` (hash `51ce6285b274413e`)
 - **CPU**: 12th Gen Intel(R) Core(TM) i5-1235U  |  **Compiler**: GCC 15.2.0
 - **Env**: `isolated=4-5 rx_core=4 rx_governor=performance rx_smt_siblings=4 matching_core=5 matching_governor=performance matching_smt_siblings=5 git=98a597b-ablation-unpinned dirty=no`
 - **Result validity**: **VALID**
@@ -325,7 +329,7 @@ Every benchmark this project's harness ran in this session, consolidated from th
 
 - **Run ID**: `98a597b-ablation-malloc_pool-price_time-1784608691`
 - **Commit**: `98a597b-ablation-malloc_pool`  |  **Working tree**: Clean
-- **Matching mode**: `price_time`  |  **Dataset**: `/home/abc/projects/Blitz-Limit-Order-Book/datasets/bench_110k.bin` (hash `51ce6285b274413e`)
+- **Matching mode**: `price_time`  |  **Dataset**: `datasets/bench_110k.bin` (hash `51ce6285b274413e`)
 - **CPU**: 12th Gen Intel(R) Core(TM) i5-1235U  |  **Compiler**: GCC 15.2.0
 - **Env**: `isolated=4-5 rx_core=4 rx_governor=performance rx_smt_siblings=4 matching_core=5 matching_governor=performance matching_smt_siblings=5 git=98a597b-ablation-malloc_pool dirty=no`
 - **Result validity**: **VALID**
@@ -354,7 +358,7 @@ Every benchmark this project's harness ran in this session, consolidated from th
 
 - **Run ID**: `98a597b-ablation-malloc_pool-pro_rata-1784608731`
 - **Commit**: `98a597b-ablation-malloc_pool`  |  **Working tree**: Clean
-- **Matching mode**: `pro_rata`  |  **Dataset**: `/home/abc/projects/Blitz-Limit-Order-Book/datasets/bench_110k.bin` (hash `51ce6285b274413e`)
+- **Matching mode**: `pro_rata`  |  **Dataset**: `datasets/bench_110k.bin` (hash `51ce6285b274413e`)
 - **CPU**: 12th Gen Intel(R) Core(TM) i5-1235U  |  **Compiler**: GCC 15.2.0
 - **Env**: `isolated=4-5 rx_core=4 rx_governor=performance rx_smt_siblings=4 matching_core=5 matching_governor=performance matching_smt_siblings=5 git=98a597b-ablation-malloc_pool dirty=no`
 - **Result validity**: **VALID**
@@ -383,7 +387,7 @@ Every benchmark this project's harness ran in this session, consolidated from th
 
 - **Run ID**: `98a597b-ablation-flat_layout-price_time-1784608699`
 - **Commit**: `98a597b-ablation-flat_layout`  |  **Working tree**: Clean
-- **Matching mode**: `price_time`  |  **Dataset**: `/home/abc/projects/Blitz-Limit-Order-Book/datasets/ablation4_flat.bin` (hash `f330eff74ca2a47e`)
+- **Matching mode**: `price_time`  |  **Dataset**: `datasets/ablation4_flat.bin` (hash `f330eff74ca2a47e`)
 - **CPU**: 12th Gen Intel(R) Core(TM) i5-1235U  |  **Compiler**: GCC 15.2.0
 - **Env**: `isolated=4-5 rx_core=4 rx_governor=performance rx_smt_siblings=4 matching_core=5 matching_governor=performance matching_smt_siblings=5 git=98a597b-ablation-flat_layout dirty=no`
 - **Result validity**: **VALID**
@@ -412,7 +416,7 @@ Every benchmark this project's harness ran in this session, consolidated from th
 
 - **Run ID**: `98a597b-ablation-flat_layout-pro_rata-1784608739`
 - **Commit**: `98a597b-ablation-flat_layout`  |  **Working tree**: Clean
-- **Matching mode**: `pro_rata`  |  **Dataset**: `/home/abc/projects/Blitz-Limit-Order-Book/datasets/ablation4_flat.bin` (hash `f330eff74ca2a47e`)
+- **Matching mode**: `pro_rata`  |  **Dataset**: `datasets/ablation4_flat.bin` (hash `f330eff74ca2a47e`)
 - **CPU**: 12th Gen Intel(R) Core(TM) i5-1235U  |  **Compiler**: GCC 15.2.0
 - **Env**: `isolated=4-5 rx_core=4 rx_governor=performance rx_smt_siblings=4 matching_core=5 matching_governor=performance matching_smt_siblings=5 git=98a597b-ablation-flat_layout dirty=no`
 - **Result validity**: **VALID**
@@ -437,9 +441,9 @@ Every benchmark this project's harness ran in this session, consolidated from th
 
 ---
 
-## Ablation Verdicts (PROVEN / INCONCLUSIVE / NOT PROVEN / REGRESSION / INVALID)
+## Ablation Verdicts
 
-# Optimization Ablation Study
+From `results/98a597b/ablation_summary.md`. Verdict rules are in [METHODOLOGY.md](METHODOLOGY.md#ablation-verdicts).
 
 ### Matching policy: price_time
 
@@ -464,8 +468,9 @@ Every benchmark this project's harness ran in this session, consolidated from th
 
 ## Reading this file
 
-- Every number above is read directly from `results/98a597b/*.csv` / `*.meta.json` -- the actual files this project's `--benchmark` and `scripts/run_ablations.sh` wrote in this session, after a clean rebuild at the current committed HEAD.
-- "Valid"/"Deterministic" being YES/PASS on every single row is itself a result: zero dropped events, zero pool exhaustion, zero arena fallback, identical logical outcome fingerprint (`state_hash`) across all 5 trials of every run.
-- The `unpinned` ablation's own trial-to-trial numbers are themselves the clearest evidence for why its verdict is noise-sensitive: Price-Time P99.9 ranges from 4,729.0 ns to 144,646.0 ns *across the 5 trials of this one binary* -- OS-scheduled unpinned threads are simply that unpredictable, which is exactly the property core pinning exists to remove.
-- "Max" latency (worst single sample per trial) is included for every run precisely because it's the number most sensitive to real interference -- compare it across the baseline vs. ablated rows above to see backpressure/scheduling effects the median alone would hide.
-- Compare this run's ablation deltas against a future re-run: the *direction* (every ablation slower than baseline) should hold; the *magnitude* is expected to shift with environment/load, which is exactly why this file exists instead of a hand-copied number.
+- Every number above is read from `results/98a597b/*.csv` and `*.meta.json`, written by `--benchmark` and `scripts/run_ablations.sh`.
+- `VALID` and `PASS` on every row is itself a result: zero dropped events, zero pool exhaustion, zero arena fallback, and an identical `state_hash` across all 5 trials of each run. `state_hash` is a repeatability fingerprint, not a correctness check.
+- The same binary produces different medians in different runs: the canonical price-time run (P99.9 1,850.0 ns) and the ablation suite's baseline (1,762.0 ns) are separate runs, so ablation ratios are computed against the ablation baseline.
+- The unpinned ablation's trial-to-trial range is the clearest picture of why its price-time verdict is noise-sensitive: P99.9 spans 4,729.0 to 144,646.0 ns across the 5 trials of one binary.
+- Max latency (worst single sample per trial) is included because it is the figure most sensitive to interference.
+- Treat a future re-run as a check on direction (every ablation slower than baseline), not magnitude, which shifts with environment and load.

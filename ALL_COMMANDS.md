@@ -1,375 +1,311 @@
-# Blitz LOB — Complete Command Sequence: Zero-Interference Benchmarking
+# Command Reference
 
-Run these phases **in order, top to bottom, on one machine, in one session**.
-Each phase assumes the previous one succeeded. Commands marked **[ROOT]**
-need `sudo`/root and are not run by the agent automatically in a sandboxed
-session with no passwordless sudo — run them yourself, then continue.
+The full command sequence for building, testing, tuning a host, and running
+every benchmark. Run from the repository root on a dedicated benchmark host.
+**[ROOT]** marks commands that need administrator rights. Inspect the host
+before tuning: service names, IRQ routing, boot configuration, core IDs, and
+NUMA nodes vary by machine.
 
-This project hardcodes `RX_CORE_ID=4` / `MATCHING_CORE_ID=5`
-(`include/hydra/config.hpp`) for **this specific host's** CPU topology
-(12th-gen Intel hybrid: P-cores 0–3 have SMT siblings, E-cores 4+ do not —
-see that file's own comment). **Re-verify core numbers with Phase 1 below
-before reusing any command here on different hardware.**
+The examples use `RX_CORE_ID=4` and `MATCHING_CORE_ID=5` from
+`include/hydra/config.hpp` (the development host's E-cores) and NUMA node 0.
+Change the constants and rebuild for other hardware. Running these commands
+measures the checked-out revision; it does not reproduce the historical
+`98a597b` figures in the [README](README.md).
+
+Contents: [1 Build, test, format](#1-build-test-format) ·
+[2 Inspect the host](#2-inspect-the-host) ·
+[3 Reduce interference](#3-reduce-interference-root) ·
+[4 Tune the CPU](#4-tune-the-cpu-root) ·
+[5 Verify tuning](#5-verify-tuning) ·
+[6 Datasets](#6-datasets) ·
+[7 Benchmarks](#7-benchmarks) ·
+[8 Results and charts](#8-results-and-charts)
 
 ---
 
-## Phase 1 — Inspect current state (read-only, no root needed)
+## 1. Build, test, format
 
-Run these first, every time — they tell you whether Phase 2/3 tuning is
-even necessary, and give you the exact core numbers to use everywhere else.
+Build targets use the `blitz_` prefix (the C++ namespace is `hydra::`).
 
 ```bash
-# CPU model, core/thread counts, per-core topology
+# Release build and the default targets (engine, generator, sanitizer builds, tests)
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build -j"$(nproc)"
+
+# Nine test executables; one command runs them all
+ctest --test-dir build --output-on-failure
+ctest --test-dir build -R phase6_matcher --output-on-failure   # a single suite
+
+# CLI help
+./build/blitz_lob --help
+./build/blitz_gen_dataset --help
+./build/blitz_lob --test            # prints the standalone test commands
+```
+
+Tests phases 3, 6, and 9 are built with ASan+UBSan and phase 4 with TSan.
+`blitz_lob_asan` (ASan+UBSan) and `blitz_lob_tsan` (TSan) are full-binary
+sanitizer builds of the engine; they are separate because the two runtimes are
+not combined.
+
+```bash
+# Bounded live-pipeline smoke runs under each sanitizer (Ctrl+C equivalent after 10 s)
+timeout -s INT 10 ./build/blitz_lob_asan
+timeout -s INT 10 ./build/blitz_lob_tsan
+```
+
+Running `./build/blitz_lob` with no flags starts the live synthetic pipeline
+until Ctrl+C. It is a smoke test and prints no latency numbers.
+
+Formatting and Python checks (versions are pinned in `requirements-dev.txt`):
+
+```bash
+python3 -m pip install -r requirements-dev.txt -r charts/requirements.txt
+./scripts/format.sh --check          # clang-format 21.1.8 over tracked C/C++ files
+./scripts/format.sh --write          # apply it
+python3 -m black --check charts/generate_charts.py tests/test_chart_reporting.py
+python3 -m unittest discover -s tests -p 'test_chart_reporting.py'
+```
+
+The Formatting GitHub workflow runs the two `--check` commands. CI does not
+build or run the C++ tests.
+
+---
+
+## 2. Inspect the host
+
+Read-only. Run these first to learn the real core numbers and whether tuning is
+needed.
+
+```bash
 lscpu
 nproc
 
-# Which cores are hyperthread siblings of which (E-cores should show as
-# their own singleton sibling list; P-cores show pairs)
+# SMT sibling lists: a usable core is its own sole sibling
 for c in /sys/devices/system/cpu/cpu*/topology/thread_siblings_list; do
     echo "$c: $(cat "$c")"
 done
 
-# Currently isolated cores (should include 4,5 for this project once tuned)
-cat /sys/devices/system/cpu/isolated
-
-# Current governor per core (must be "performance" on cores 4,5)
-cat /sys/devices/system/cpu/cpu4/cpufreq/scaling_governor
+cat /sys/devices/system/cpu/isolated                         # should include 4-5 once tuned
+cat /sys/devices/system/cpu/cpu4/cpufreq/scaling_governor    # must be "performance"
 cat /sys/devices/system/cpu/cpu5/cpufreq/scaling_governor
-
-# NUMA topology (confirm which node cores 4,5 belong to -- used by
-# --cpunodebind/--membind later)
-numactl --hardware
-
-# Turbo boost state (Intel P-state driver)
+numactl --hardware                                           # which node owns cores 4/5
 cat /sys/devices/system/cpu/intel_pstate/no_turbo 2>/dev/null || echo "not intel_pstate"
-
-# NMI watchdog (a real, if small, source of periodic interrupt jitter)
 cat /proc/sys/kernel/nmi_watchdog
 
-# What's actually running on cores 4/5 right now
 ps -eLo pid,psr,pcpu,comm | awk '$2==4 || $2==5' | sort -k3 -nr | head -20
-
-# Top CPU consumers system-wide (identify anything noisy before killing it)
 ps aux --sort=-%cpu | head -20
 ```
 
 ---
 
-## Phase 2 — Kill background interference **[ROOT for some]**
+## 3. Reduce interference [ROOT]
 
 ```bash
-# Close any GUI browser/apps -- this project's own README documents a real,
-# measured case where a background browser alone moved P99.9 from 1205ns to
-# 7382ns. Close them by hand, or:
-pkill -f firefox 2>/dev/null
-pkill -f chrome 2>/dev/null
-pkill -f chromium 2>/dev/null
+# Close browsers and other CPU-heavy applications. Load on non-isolated cores
+# can still inflate latency through the shared turbo and thermal budget.
 
-# Stop irqbalance -- it will otherwise migrate IRQs onto your isolated
-# cores over time. [ROOT]
-sudo systemctl stop irqbalance
-sudo systemctl disable irqbalance   # optional: keep it off across reboots
-
-# Move existing IRQ affinity OFF cores 4 and 5 onto some other core (core 0
-# here -- adjust if 0 is busy). Run once after the above. [ROOT]
-for irq in /proc/irq/*/smp_affinity_list; do
-    echo 0 | sudo tee "$irq" > /dev/null 2>&1
+sudo systemctl stop irqbalance          # otherwise it migrates IRQs onto isolated cores
+sudo systemctl mask --runtime --now power-profiles-daemon   # D-Bus activated: stop alone is not enough; resets the governor
+cat /proc/interrupts                    # inspect IRQ placement and adjust per host
+# Move device IRQs off the pinned cores (a few hundred IRQs per run on core 5 inflate the tail).
+# Some managed IRQs (NVMe) refuse the write; that is fine.
+for f in /proc/irq/[0-9]*/smp_affinity_list; do
+    echo 0-3,6-11 | sudo tee "$f" >/dev/null 2>&1
 done
+grep -H . /proc/irq/*/effective_affinity_list | grep -E ':(4|5)$'   # expect little or nothing
+sudo systemctl stop cron atd unattended-upgrades 2>/dev/null   # adjust to what is running
 
-# Stop routine timers/services that can wake up and steal a cycle mid-run.
-# Adjust this list to what's actually running on your box (see Phase 1's
-# `ps aux` output) -- these are common, safe-to-stop-temporarily examples:
-sudo systemctl stop cron atd unattended-upgrades 2>/dev/null
-
-# Confirm nothing user-visible is left running on cores 4/5:
-ps -eLo pid,psr,pcpu,comm | awk '$2==4 || $2==5'
+ps -eLo pid,psr,pcpu,comm | awk '$2==4 || $2==5'   # should be empty or idle
 ```
 
 ---
 
-## Phase 3 — CPU tuning **[ROOT]**
+## 4. Tune the CPU [ROOT]
 
 ```bash
-# 1. Performance governor on the two cores this project pins to (required
-#    by run_benchmark()'s own preflight gate -- it will refuse to run
-#    without this):
-sudo cpupower frequency-set -c 4,5 --governor performance
-# or, if cpupower isn't installed:
+# 1. Performance governor on both pinned cores (required by the preflight gate)
+sudo cpupower -c 4,5 frequency-set --governor performance
+# without cpupower:
 echo performance | sudo tee /sys/devices/system/cpu/cpu4/cpufreq/scaling_governor
 echo performance | sudo tee /sys/devices/system/cpu/cpu5/cpufreq/scaling_governor
 
-# 2. SMT off (required by preflight; already structurally true for cores
-#    4/5 on this host's hybrid topology -- confirmed in Phase 1 above -- but
-#    if you're on different hardware where 4/5 DO have siblings, disable
-#    SMT machine-wide):
+# 2. No SMT sibling on either pinned core is required. Disabling SMT globally
+#    is optional when the chosen cores already have no sibling:
 echo off | sudo tee /sys/devices/system/cpu/smt/control
 
-# 3. isolcpus / nohz_full / rcu_nocbs (required by preflight; needs a GRUB
-#    edit + REBOOT -- do this once, it persists across reboots):
-sudo sed -i 's/^GRUB_CMDLINE_LINUX="/GRUB_CMDLINE_LINUX="isolcpus=4,5 nohz_full=4,5 rcu_nocbs=4,5 /' /etc/default/grub
+# 3. Boot parameters. Add isolcpus=4,5 nohz_full=4,5 rcu_nocbs=4,5 to the kernel
+#    command line without duplicating existing entries, then reboot.
+sudoedit /etc/default/grub
 sudo update-grub
 sudo reboot
-# --- after reboot, re-run Phase 1's `cat /sys/devices/system/cpu/isolated`
-#     to confirm it now reads "4-5" before continuing ---
 
-# 4. Turbo boost OFF (optional, not required by this project's preflight,
-#    but reduces P-state-transition jitter at the cost of raw clock speed --
-#    HFT-style low-jitter tuning trades peak speed for consistency):
+# 4. Optional: turbo off and NMI watchdog off (less jitter, lower peak clock)
 echo 1 | sudo tee /sys/devices/system/cpu/intel_pstate/no_turbo
-
-# 5. NMI watchdog OFF (optional -- removes a small periodic interrupt
-#    source from every core, including your isolated ones):
 echo 0 | sudo tee /proc/sys/kernel/nmi_watchdog
-
-# 6. NUMA binding is applied per-run, not persistently -- see Phase 6/7's
-#    `numactl --cpunodebind=0 --membind=0` prefix on every benchmark
-#    invocation. Confirm node 0 is correct for cores 4/5 from Phase 1's
-#    `numactl --hardware` output before assuming it.
 ```
+
+One-shot runtime version of the steps above (governor, IRQ affinity, stopping services):
+`sudo scripts/tune_host.sh`. It resets on reboot.
+
+Shared L2: on the 12th-gen hybrid CPU used here, cores 4-7 form one E-core cluster with a
+shared L2 (`cat /sys/devices/system/cpu/cpu4/cache/index2/shared_cpu_list` prints `4-7`).
+Work on cores 6 and 7 raised P99.9 by about 1.5x in a test, so for quiet measurements
+isolate the whole cluster (`isolcpus=4-7 nohz_full=4-7 rcu_nocbs=4-7`) and keep it idle.
+The preflight does not check this.
+
+What each setting does: `isolcpus` removes the cores from the scheduler pool,
+`nohz_full` suppresses the periodic tick on them, `rcu_nocbs` moves RCU
+callbacks off them. NUMA binding is applied per run with
+`numactl --cpunodebind=0 --membind=0`; confirm node 0 is right from
+`numactl --hardware`.
+
+The core numbers are host-specific. On the 12th-gen Intel hybrid CPU used for
+development, cores 2/3 are the two SMT threads of one P-core (disabling SMT
+takes core 3 offline, which fails the SMT check), while cores 4+ are E-cores
+with no sibling. Check `thread_siblings_list` and pick two cores that are each
+their own sole sibling.
 
 ---
 
-## Phase 4 — Verify tuning actually took effect (read-only)
-
-Re-run Phase 1's inspection commands and confirm, explicitly, before
-proceeding:
+## 5. Verify tuning
 
 ```bash
 cat /sys/devices/system/cpu/isolated                              # expect: 4-5
-cat /sys/devices/system/cpu/cpu4/cpufreq/scaling_governor          # expect: performance
-cat /sys/devices/system/cpu/cpu5/cpufreq/scaling_governor          # expect: performance
-cat /sys/devices/system/cpu/cpu4/topology/thread_siblings_list     # expect: just "4"
-cat /sys/devices/system/cpu/cpu5/topology/thread_siblings_list     # expect: just "5"
-ps -eLo pid,psr,pcpu,comm | awk '$2==4 || $2==5'                   # expect: empty/idle
+cat /sys/devices/system/cpu/cpu4/cpufreq/scaling_governor         # expect: performance
+cat /sys/devices/system/cpu/cpu5/cpufreq/scaling_governor         # expect: performance
+cat /sys/devices/system/cpu/cpu4/topology/thread_siblings_list    # expect: 4
+cat /sys/devices/system/cpu/cpu5/topology/thread_siblings_list    # expect: 5
+ps -eLo pid,psr,pcpu,comm | awk '$2==4 || $2==5'                  # expect: empty or idle
 ```
 
-If any of these don't match, **stop and fix it now** — `run_benchmark()`'s
-own preflight gate will refuse to run otherwise (by design), but a
-partially-tuned host that happens to still pass preflight (e.g. governor
-right but a stray process still on core 4) will silently produce worse
-numbers without telling you why.
+The benchmark's preflight (`run_preflight_checks()` in `src/benchmark.cpp`)
+enforces, for each pinned core, isolation membership, the `performance`
+governor, and no SMT sibling, and refuses to measure otherwise. It does not
+check `nohz_full`, `rcu_nocbs`, IRQ placement, NUMA binding, or other
+processes, so confirm those yourself.
 
 ---
 
-## Phase 5 — Clean build
+## 6. Datasets
+
+`blitz_gen_dataset` flags other than `--output` default to the canonical values
+from `config.hpp`, so the short form below equals the explicit one. Output is
+deterministic for a given flag set. Flags are recorded in
+`datasets/manifest.txt`.
 
 ```bash
-cd /home/abc/projects/Blitz-Limit-Order-Book
+# Canonical mixed workload: 110,000 events (10,000 warmup + 100,000 measured)
+./build/blitz_gen_dataset --seed 42 --count 110000 --output datasets/bench_110k.bin
 
-# Fully clean (removes any stale object files from a different tuning state)
-rm -rf build
-cmake -S . -B build -DENABLE_AFXDP=OFF
-cmake --build build -j"$(nproc)"
-```
-
----
-
-## Phase 6 — Correctness gate (must be green before any number counts)
-
-```bash
-# Full per-phase test suite
-ctest --test-dir build --output-on-failure
-
-# Dynamic sanitizer verification -- bounded live-pipeline smoke run
-timeout -s INT 10 ./build/blitz_lob_asan
-timeout -s INT 10 ./build/blitz_lob_tsan
-
-# Sanitizer verification of the benchmark path specifically, BOTH matching
-# policies (--trials 1 is a smoketest by this project's own convention --
-# proves "clean," is never itself a citable latency number)
-./build/blitz_lob_asan --benchmark --mode price_time --trials 1 \
-    --dataset datasets/bench_110k.bin --output /tmp/asan_pt.csv
-./build/blitz_lob_asan --benchmark --mode pro_rata --trials 1 \
-    --dataset datasets/bench_110k.bin --output /tmp/asan_pr.csv
-./build/blitz_lob_tsan --benchmark --mode price_time --trials 1 \
-    --dataset datasets/bench_110k.bin --output /tmp/tsan_pt.csv
-./build/blitz_lob_tsan --benchmark --mode pro_rata --trials 1 \
-    --dataset datasets/bench_110k.bin --output /tmp/tsan_pr.csv
-```
-
-All of the above must be 100% pass / zero sanitizer reports before Phase 7.
-
----
-
-## Phase 7 — Regenerate datasets (only if missing, or after any dataset-format change)
-
-```bash
-# Canonical mixed workload (110,000 events: 10k warmup + 100k measured)
+# Explicit equivalent
 ./build/blitz_gen_dataset --seed 42 --count 110000 --mid-price 100000 \
     --spread 500 --min-qty 1 --max-qty 1000 --cancel-ratio 0.15 \
     --ioc-ratio 0.05 --fok-ratio 0.02 --rate-hz 100000 \
     --output datasets/bench_110k.bin
 
-# Same logical dataset, re-serialized for the flat_layout ablation (its
-# Order/DatasetRecord on-disk size differs -- see that target's own build)
+# Flat-layout ablation dataset (its Order is 88 bytes, so the file layout differs;
+# run_ablations.sh also does this automatically)
 cmake --build build --target blitz_gen_dataset_ablation_flat_layout -j"$(nproc)"
 ./build/blitz_gen_dataset_ablation_flat_layout --seed 42 --count 110000 \
-    --mid-price 100000 --spread 500 --min-qty 1 --max-qty 1000 \
-    --cancel-ratio 0.15 --ioc-ratio 0.05 --fok-ratio 0.02 --rate-hz 100000 \
     --output datasets/ablation4_flat.bin
 ```
 
+Other flags: `--replace-ratio F` (default 0) and `--client-id-count N` (default
+8; a smaller value raises the self-trade rate).
+
 ---
 
-## Phase 8 — The actual benchmarks (every type this system supports)
+## 7. Benchmarks
 
-Every command below is prefixed with `numactl --cpunodebind=0 --membind=0`
-(confirm node 0 is correct for your machine from Phase 1's
-`numactl --hardware`). Commit the tree first if you want the `Commit`
-field in every report to be trustworthy (drop `--allow-dirty` once you do):
-
-```bash
-git add -A && git commit -m "your message"
-```
-
-If you're iterating without committing yet, keep `--allow-dirty` on every
-command below (it makes the run **allowed**, not silently treated as
-clean — every report still marks it dirty).
-
-### 8.1 — Canonical Price-Time (the "how fast is Price-Time" number)
+The benchmark pins itself to the configured cores, so prefix every run with
+`numactl`. Use a clean tree for citable results; for deliberate experiments
+with uncommitted changes, rebuild and add `--allow-dirty` (the output still
+records the dirty state, and such runs must not be cited as measurements of a
+clean commit). Runs below 5 trials are marked as smoketests.
 
 ```bash
-mkdir -p results/$(git rev-parse --short HEAD)
-numactl --cpunodebind=0 --membind=0 -- \
-    ./build/blitz_lob --benchmark --mode price_time --trials 5 \
-    --dataset datasets/bench_110k.bin \
-    --output results/$(git rev-parse --short HEAD)/price_time.csv \
-    --allow-dirty
+commit="$(git rev-parse --short HEAD)"
+mkdir -p "results/$commit"
 ```
 
-### 8.2 — Canonical Pro-Rata (the "how fast is Pro-Rata" number)
-
-```bash
-numactl --cpunodebind=0 --membind=0 -- \
-    ./build/blitz_lob --benchmark --mode pro_rata --trials 5 \
-    --dataset datasets/bench_110k.bin \
-    --output results/$(git rev-parse --short HEAD)/pro_rata.csv \
-    --allow-dirty
-```
-
-### 8.3 — Verbose variants (adds per-workload/pool/queue diagnostics to the console report; same CSVs)
+### Canonical runs
 
 ```bash
 numactl --cpunodebind=0 --membind=0 -- \
     ./build/blitz_lob --benchmark --mode price_time --trials 5 \
-    --dataset datasets/bench_110k.bin \
-    --output results/$(git rev-parse --short HEAD)/price_time_verbose.csv \
-    --allow-dirty --verbose
+    --dataset datasets/bench_110k.bin --output "results/$commit/price_time.csv"
 
 numactl --cpunodebind=0 --membind=0 -- \
     ./build/blitz_lob --benchmark --mode pro_rata --trials 5 \
-    --dataset datasets/bench_110k.bin \
-    --output results/$(git rev-parse --short HEAD)/pro_rata_verbose.csv \
-    --allow-dirty --verbose
+    --dataset datasets/bench_110k.bin --output "results/$commit/pro_rata.csv"
 ```
 
-### 8.4 — Full optimization ablation suite (both policies, 5 variants each = 10 runs)
+Add `--verbose` for workload, pool, and queue diagnostics in the console
+report. Each run writes `<name>.csv`, `<name>.raw.csv`, and `<name>.meta.json`
+(see [`METHODOLOGY.md`](METHODOLOGY.md#output-files)).
+
+### Ablation suite (both policies, baseline plus four variants, 10 runs)
 
 ```bash
-./scripts/run_ablations.sh --trials 5 --allow-dirty
+./scripts/run_ablations.sh --trials 5            # add --allow-dirty for a dirty tree
+# RESULTS_ROOT=results_new ./scripts/run_ablations.sh --trials 5   # write elsewhere than results/
 ```
 
-Produces, per matching policy: `optimized`, `mutex_queue`, `unpinned`,
-`malloc_pool`, `flat_layout` -- each a real, independently gated run, plus
-`ablation_summary.{csv,md}` with PROVEN/INCONCLUSIVE/NOT PROVEN/REGRESSION/
-INVALID verdicts (see `METHODOLOGY.md` for exactly how each
-verdict is computed).
+The script builds the targets, regenerates the flat-layout dataset, runs
+everything under `numactl --cpunodebind=0 --membind=0`, and writes
+`results/<hash>/ablation_<variant>_<mode>.csv` plus
+`ablation_summary.{csv,md}` with PROVEN, INCONCLUSIVE, NOT PROVEN, REGRESSION,
+or INVALID verdicts. It requires `datasets/bench_110k.bin` to exist.
 
-### 8.5 — Individual ablation variants by hand (if you want to re-run just one, not the whole suite)
+One variant by hand (build it first with
+`cmake --build build --target blitz_lob_ablation_mutex_queue`):
 
 ```bash
 numactl --cpunodebind=0 --membind=0 -- \
     ./build/blitz_lob_ablation_mutex_queue --benchmark --mode price_time --trials 5 \
-    --dataset datasets/bench_110k.bin --output /tmp/mutex_queue_pt.csv --allow-dirty
-
-numactl --cpunodebind=0 --membind=0 -- \
-    ./build/blitz_lob_ablation_unpinned --benchmark --mode price_time --trials 5 \
-    --dataset datasets/bench_110k.bin --output /tmp/unpinned_pt.csv --allow-dirty
-
-numactl --cpunodebind=0 --membind=0 -- \
-    ./build/blitz_lob_ablation_malloc_pool --benchmark --mode price_time --trials 5 \
-    --dataset datasets/bench_110k.bin --output /tmp/malloc_pool_pt.csv --allow-dirty
-
-numactl --cpunodebind=0 --membind=0 -- \
-    ./build/blitz_lob_ablation_flat_layout --benchmark --mode price_time --trials 5 \
-    --dataset datasets/ablation4_flat.bin --output /tmp/flat_layout_pt.csv --allow-dirty
+    --dataset datasets/bench_110k.bin --output /tmp/mutex_queue_pt.csv
 ```
 
-(Swap `--mode price_time` for `--mode pro_rata` on any of the above to get
-that variant's Pro-Rata number instead.)
+Variants are `blitz_lob_ablation_{mutex_queue,unpinned,malloc_pool,flat_layout}`;
+the flat-layout one takes `--dataset datasets/ablation4_flat.bin`.
 
-### 8.6 — Smoketest (fast iteration only -- NEVER a citable result)
+### Smoketest and sanitizer benchmark runs (never citable)
 
 ```bash
 numactl --cpunodebind=0 --membind=0 -- \
     ./build/blitz_lob --benchmark --mode price_time --trials 1 \
-    --dataset datasets/bench_110k.bin --output /tmp/smoketest.csv --allow-dirty
-```
+    --dataset datasets/bench_110k.bin --output /tmp/smoketest.csv
 
-The console report and CSV both mark any `--trials` below 5 as
-`[SMOKETEST]` -- use this only to sanity-check a change quickly, never to
-report a number.
-
----
-
-## Phase 9 — Read the results
-
-```bash
-# Console output from each run above already prints the full report.
-# The three artifacts per run:
-ls results/$(git rev-parse --short HEAD)/
-
-# price_time.csv / pro_rata.csv       -- summary, one row per trial
-# price_time.raw.csv / pro_rata.raw.csv -- one row per sample
-# price_time.meta.json / pro_rata.meta.json -- environment + provenance
-
-# Confirm both canonical runs are VALID and deterministic before citing
-# anything from them:
-grep -m1 . results/$(git rev-parse --short HEAD)/price_time.csv | true
-python3 -c "
-import csv
-for f in ['price_time.csv', 'pro_rata.csv']:
-    path = 'results/$(git rev-parse --short HEAD)/' + f
-    rows = list(csv.DictReader(open(path)))
-    valid = all(r['valid'] == '1' for r in rows)
-    determ = all(r['determinism_status'] == 'PASS' for r in rows)
-    dropped = sum(int(r['dropped_events']) for r in rows)
-    print(f, 'valid=' + str(valid), 'deterministic=' + str(determ), 'dropped=' + str(dropped))
-"
+# Benchmark path under each sanitizer, both policies
+for mode in price_time pro_rata; do
+    ./build/blitz_lob_asan --benchmark --mode "$mode" --trials 1 \
+        --dataset datasets/bench_110k.bin --output "/tmp/asan_$mode.csv"
+    ./build/blitz_lob_tsan --benchmark --mode "$mode" --trials 1 \
+        --dataset datasets/bench_110k.bin --output "/tmp/tsan_$mode.csv"
+done
 ```
 
 ---
 
-## Quick reference: full sequence, no explanations
+## 8. Results and charts
 
 ```bash
-# --- one-time tuning (ROOT) ---
-sudo systemctl stop irqbalance cron atd unattended-upgrades
-sudo cpupower frequency-set -c 4,5 --governor performance
-echo off | sudo tee /sys/devices/system/cpu/smt/control
-sudo sed -i 's/^GRUB_CMDLINE_LINUX="/GRUB_CMDLINE_LINUX="isolcpus=4,5 nohz_full=4,5 rcu_nocbs=4,5 /' /etc/default/grub
-sudo update-grub && sudo reboot
-# (after reboot)
-echo 1 | sudo tee /sys/devices/system/cpu/intel_pstate/no_turbo
-echo 0 | sudo tee /proc/sys/kernel/nmi_watchdog
+ls "results/$commit/"
 
-# --- verify ---
-cat /sys/devices/system/cpu/isolated
-cat /sys/devices/system/cpu/cpu{4,5}/cpufreq/scaling_governor
+# Check that both canonical runs are valid and deterministic before citing them
+python3 - "results/$commit" <<'PY'
+import csv, sys
+for name in ("price_time.csv", "pro_rata.csv"):
+    rows = list(csv.DictReader(open(f"{sys.argv[1]}/{name}")))
+    print(name,
+          "valid=" + str(all(r["valid"] == "1" for r in rows)),
+          "deterministic=" + str(all(r["determinism_status"] == "PASS" for r in rows)),
+          "dropped=" + str(sum(int(r["dropped_events"]) for r in rows)))
+PY
 
-# --- build + test ---
-cd /home/abc/projects/Blitz-Limit-Order-Book
-rm -rf build && cmake -S . -B build -DENABLE_AFXDP=OFF && cmake --build build -j"$(nproc)"
-ctest --test-dir build --output-on-failure
-
-# --- datasets ---
-./build/blitz_gen_dataset --seed 42 --count 110000 --output datasets/bench_110k.bin
-cmake --build build --target blitz_gen_dataset_ablation_flat_layout -j"$(nproc)"
-./build/blitz_gen_dataset_ablation_flat_layout --seed 42 --count 110000 --output datasets/ablation4_flat.bin
-
-# --- benchmarks ---
-GIT=$(git rev-parse --short HEAD); mkdir -p "results/$GIT"
-numactl --cpunodebind=0 --membind=0 -- ./build/blitz_lob --benchmark --mode price_time --trials 5 --dataset datasets/bench_110k.bin --output "results/$GIT/price_time.csv" --allow-dirty
-numactl --cpunodebind=0 --membind=0 -- ./build/blitz_lob --benchmark --mode pro_rata  --trials 5 --dataset datasets/bench_110k.bin --output "results/$GIT/pro_rata.csv"  --allow-dirty
-./scripts/run_ablations.sh --trials 5 --allow-dirty
+# Regenerate the README charts from a results directory (overwrites charts/*.png)
+python3 charts/generate_charts.py --commit "$commit"
 ```
+
+Chart generation overwrites the committed PNGs, which currently show the
+`98a597b` evidence set; regenerate them only when publishing a new one.
