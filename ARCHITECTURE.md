@@ -9,8 +9,8 @@ Results: [README.md](README.md). Timing, validity and statistics: [METHODOLOGY.m
 
 | Component | File | Responsibility | Why it is fast |
 |---|---|---|---|
-| `SpscQueue<Order,N>` (specialization) | `spsc_queue.hpp` | Producer-to-matcher ring, `N = 65,536`, one 64-byte slot per event with its own sequence word | The consumer polls the same cache line that carries the data: one cross-core transfer per event, and a 4 MiB ring instead of 8 MiB |
-| `SpscQueue<T,N>` (generic) | `spsc_queue.hpp` | Index-based ring for other layouts (flat-layout ablation, tests) | One writer per index, release/acquire only, no CAS |
+| `SpscQueue<Order,N>` (specialization) | `spsc_queue.hpp` | Producer-to-matcher ring, `N = 65,536`, one 64-byte slot per event with its own sequence word; serves both `Order` layouts (production 128 B, flat-layout ablation 88 B) | The consumer polls the same cache line that carries the data: one cross-core transfer per event, and a 4 MiB ring instead of 8 MiB |
+| `SpscQueue<T,N>` (generic) | `spsc_queue.hpp` | Index-based ring for any other trivially copyable payload (used by the unit tests) | One writer per index, release/acquire only, no CAS |
 | `ObjectPool<T,N>` | `object_pool.hpp` | Fixed slab with intrusive free list: `Order` (65,536) and `Level` (4,096) | `acquire`/`release` are pointer swaps on a non-atomic list |
 | `OrderBook` | `order_book.hpp` | `std::pmr::map` of price to `Level` per side, FIFO of `Order*` per level, `order_id` hash index | Cancel is an index lookup plus a doubly-linked unlink, independent of book depth |
 | Size-class free-list resource | `order_book.hpp` | Memory resource behind the book's map and hash nodes | A pop or push on a LIFO list (about 10 instructions) replaced `std::pmr::unsynchronized_pool_resource` (about 150 or more) |
@@ -44,9 +44,10 @@ Fills go to a synchronous callback as stack-local `FillEvent` values, valid unti
 | `FillEvent` | 40 B | `maker_order_id`, `taker_order_id`, `price`, `timestamp_ns`, `qty` | `types.hpp` |
 
 - Sizes, alignment and trivial copyability are `static_assert`ed, so `Order` can cross the ring by value. Prices are `int64_t` ticks, quantities `uint32_t`.
-- The ring slot carries only what the matcher reads. `prev_`, `next_`, `client_tag` and padding are not transported and come back zeroed (`client_tag` is read only by `Matcher::replace`, from the resting order). `static_assert`s on field offsets fail the build if `Order` gains a field the slot does not carry.
+- The ring slot carries only what the matcher reads. `prev_`, `next_`, `client_tag` and padding are not transported and come back zeroed (`client_tag` is read only by `Matcher::replace`, from the resting order). `static_assert`s on field offsets fail the build if `Order` gains a field the slot does not carry, and any layout other than the 128 B and 88 B ones is rejected at compile time.
 - `Level::total_qty` is 64-bit because many `uint32_t` quantities can sum past 2^32.
-- Why two lines: sweep fields and FIFO links share line 0, identity and timing sit on line 1. Honest result: sweeps also read `client_id` (line 1) for the self-trade check, so line 1 is not cold, and the measured benefit of the split is none (flat 88 B layout: NO_MEASURABLE_EFFECT, see the README ablation table and [DESIGN.md](DESIGN.md)). It is a memory-footprint argument that this workload cannot exercise.
+- Ablation builds (`ablation/<variant>/include/hydra/`) shadow single headers so that each arm changes one thing: the flat-layout arm keeps the same ring (same eight transported fields, different offsets), and the mutex arm queues the same eight-field payload through `std::mutex` plus `std::queue`, so it differs from the ring only in synchronisation, not in bytes copied.
+- Why two lines: sweep fields and FIFO links share line 0, identity and timing sit on line 1. Honest result: sweeps also read `client_id` (line 1) for the self-trade check, so line 1 is not cold, and the measured benefit of the split is none (flat 88 B layout through the same ring: NO_MEASURABLE_EFFECT at every percentile, see the README ablation table and [DESIGN.md](DESIGN.md)). It is a memory-footprint argument that this workload cannot exercise.
 
 <p align="center"><img src="charts/04_cache_line_layout.png" alt="Order struct layout: two 64-byte cache lines with byte offsets" width="85%"></p>
 

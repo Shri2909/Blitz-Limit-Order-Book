@@ -9,7 +9,8 @@ The examples use `RX_CORE_ID=4` (producer) and `MATCHING_CORE_ID=5` (matching th
 `include/hydra/config.hpp`, which are the development host's E-cores, and NUMA node 0. They are compile-time
 constants: for other hardware change them and rebuild. Running these commands measures the checked-out revision.
 It will not reproduce the figures in [CONSOLIDATED_BENCHMARK_RESULTS.md](CONSOLIDATED_BENCHMARK_RESULTS.md) exactly:
-the same binary's tail percentiles can move 10 to 20% between sessions.
+the same binary's tail percentiles can move 10 to 20% between sessions (three runs of the same code on one day agreed
+within about 1 to 3%, see the repeat-runs section of that file).
 
 Contents: [1 Build, test, format](#1-build-test-format) ·
 [2 Inspect the host](#2-inspect-the-host) ·
@@ -36,8 +37,8 @@ cmake --build build -j"$(nproc)"
 
 **Reconfigure CMake after every commit, before benchmarking.** The git hash and the dirty flag are stamped into
 the binaries when CMake configures, not when it compiles. If you commit and only rebuild, the results report the
-old commit (the repeat run in [CONSOLIDATED_BENCHMARK_RESULTS.md](CONSOLIDATED_BENCHMARK_RESULTS.md) was stamped
-`a27e77f` for exactly this reason). Re-running the `cmake -S . -B build ...` line above is enough.
+old commit (the first repeat run in [CONSOLIDATED_BENCHMARK_RESULTS.md](CONSOLIDATED_BENCHMARK_RESULTS.md#repeat-runs-of-the-same-code)
+was stamped `a27e77f` for exactly this reason). Re-running the `cmake -S . -B build ...` line above is enough.
 
 ```bash
 # Ten test targets: phase1_types, phase2_timing, phase3_pool, phase4_spsc, phase5_orderbook,
@@ -93,15 +94,16 @@ done
 
 cat /sys/devices/system/cpu/isolated                         # should include 4-5 (4-7 on the development host)
 cat /sys/devices/system/cpu/cpu4/cache/index2/shared_cpu_list   # cores sharing cpu4's L2 (4-7 on the E-core cluster)
-cat /sys/devices/system/cpu/cpu4/cpufreq/scaling_governor    # must be "performance"
-cat /sys/devices/system/cpu/cpu5/cpufreq/scaling_governor
+for c in 4 5 6 7; do                                         # governors must be "performance"
+    echo "cpu$c: $(cat /sys/devices/system/cpu/cpu$c/cpufreq/scaling_governor)"
+done
 numactl --hardware                                           # which node owns cores 4/5
 cat /sys/devices/system/cpu/intel_pstate/no_turbo 2>/dev/null || echo "not intel_pstate"
 cat /proc/sys/kernel/nmi_watchdog
 systemctl is-enabled power-profiles-daemon                   # want: masked or masked-runtime
 systemctl is-active irqbalance                               # want: inactive
 
-ps -eLo pid,psr,pcpu,comm | awk '$2==4 || $2==5' | sort -k3 -nr | head -20
+ps -eLo pid,psr,pcpu,comm | awk '$2>=4 && $2<=7' | sort -k3 -nr | head -20
 ps aux --sort=-%cpu | head -20
 ```
 
@@ -130,9 +132,13 @@ cat /proc/cmdline                   # after the reboot: the three parameters mus
 ### 3.2 Runtime tuning (after every reboot)
 
 ```bash
-sudo scripts/tune_host.sh                # pinned cores default to "4,5"
-sudo scripts/tune_host.sh 4,5,6,7        # same, for a custom list (see below)
+sudo scripts/tune_host.sh 4,5,6,7        # the whole isolated cluster; this is what the run of record used
+sudo scripts/tune_host.sh                # no argument: only the two pinned cores, "4,5"
 ```
+
+The optional argument is the comma-separated list of cores to keep quiet. Pass the whole isolated cluster
+(`4,5,6,7`) so that cores 6 and 7, which share the 2 MB L2 with the pinned cores, are also set to `performance` and
+get no device IRQs. With the default `4,5` the script tunes only the two pinned cores.
 
 What the script does, in order (all of it resets on reboot, so repeat it after each one):
 
@@ -140,30 +146,33 @@ What the script does, in order (all of it resets on reboot, so repeat it after e
    resets governors, so stopping it is not enough; it must be masked.
 2. Stops `irqbalance`, `cron`, `atd` and `unattended-upgrades`.
 3. Sets the `performance` governor on the listed cores, with the `cpupower` syntax
-   `cpupower -c 4,5 frequency-set --governor performance`, and `performance` energy preference where the CPU has one.
-4. Writes `0` to `/proc/sys/kernel/nmi_watchdog`.
-5. Moves every movable device IRQ to the cores that are not in the list. Some managed IRQs (NVMe) refuse the write;
-   that is expected, and the script prints what is left on the pinned cores.
+   `cpupower -c 4,5,6,7 frequency-set --governor performance`, and writes `performance` to each listed core's
+   `energy_performance_preference` where the CPU has one.
+4. Writes `0` to `/proc/sys/kernel/nmi_watchdog` (NMI watchdog off).
+5. Moves every movable device IRQ to the CPUs that are not in the list. Some managed IRQs (the NVMe queue IRQs) refuse
+   the write and may remain on the isolated cores; they fire only on disk I/O, so they are quiet during a benchmark.
+   The script ends by printing what is left on the listed cores.
 6. Prints the isolated set, each listed core's governor, SMT siblings and shared-L2 list.
 
-The argument is the list of cores to keep quiet. The default `4,5` keeps device IRQs off the two pinned cores
-only; passing `4,5,6,7` also keeps them off cores 6 and 7 and sets their governor. Close browsers and other
-CPU-heavy applications first: load on the other cores still affects the shared turbo and thermal budget.
+Close browsers and other CPU-heavy applications first: load on the other cores still affects the shared turbo and
+thermal budget.
 
 Equivalent manual steps, if you prefer not to run the script:
 
 ```bash
 sudo systemctl mask --runtime --now power-profiles-daemon    # stop alone is not enough
 sudo systemctl stop irqbalance
-sudo cpupower -c 4,5 frequency-set --governor performance
+sudo cpupower -c 4,5,6,7 frequency-set --governor performance
 # without cpupower:
-echo performance | sudo tee /sys/devices/system/cpu/cpu4/cpufreq/scaling_governor
-echo performance | sudo tee /sys/devices/system/cpu/cpu5/cpufreq/scaling_governor
+for c in 4 5 6 7; do
+    echo performance | sudo tee /sys/devices/system/cpu/cpu$c/cpufreq/scaling_governor
+done
+echo 0 | sudo tee /proc/sys/kernel/nmi_watchdog
 
-# Move device IRQs off the pinned cores: use every other CPU number on your host
-# (0-3,6-11 on the 12-thread development host)
+# Move device IRQs off the isolated cores: use every other CPU number on your host
+# (0-3,8-11 on the 12-thread development host)
 for f in /proc/irq/[0-9]*/smp_affinity_list; do
-    echo 0-3,6-11 | sudo tee "$f" >/dev/null 2>&1
+    echo 0-3,8-11 | sudo tee "$f" >/dev/null 2>&1
 done
 ```
 
@@ -177,22 +186,24 @@ turbo (less jitter, lower peak clock).
 ```bash
 cat /proc/cmdline | tr ' ' '\n' | grep -E 'isolcpus|nohz_full|rcu_nocbs'   # expect the three 4-7 parameters
 cat /sys/devices/system/cpu/isolated                              # expect: 4-7 (at least 4-5)
-cat /sys/devices/system/cpu/cpu4/cpufreq/scaling_governor         # expect: performance
-cat /sys/devices/system/cpu/cpu5/cpufreq/scaling_governor         # expect: performance
-cat /sys/devices/system/cpu/cpu4/topology/thread_siblings_list    # expect: 4
-cat /sys/devices/system/cpu/cpu5/topology/thread_siblings_list    # expect: 5
+for c in 4 5 6 7; do                                              # expect: all four governors "performance"
+    echo "cpu$c: governor=$(cat /sys/devices/system/cpu/cpu$c/cpufreq/scaling_governor)" \
+         "epp=$(cat /sys/devices/system/cpu/cpu$c/cpufreq/energy_performance_preference 2>/dev/null)" \
+         "siblings=$(cat /sys/devices/system/cpu/cpu$c/topology/thread_siblings_list)"
+done                                                              # expect: epp=performance, siblings equal to the core id
 cat /sys/devices/system/cpu/cpu4/cache/index2/shared_cpu_list     # expect: 4-7
 systemctl is-enabled power-profiles-daemon                        # expect: masked-runtime (or masked)
 systemctl is-active irqbalance                                    # expect: inactive
 cat /proc/sys/kernel/nmi_watchdog                                 # expect: 0
-grep -H . /proc/irq/*/effective_affinity_list | grep -E ':(4|5)$' # expect little or nothing (managed IRQs may stay)
-ps -eLo pid,psr,pcpu,comm | awk '$2==4 || $2==5'                  # expect: empty or idle
+grep -H . /proc/irq/*/effective_affinity_list | grep -E ':(4|5|6|7)$'   # expect little or nothing (NVMe queue IRQs may stay)
+ps -eLo pid,psr,pcpu,comm | awk '$2>=4 && $2<=7'                  # expect: empty or idle
 ```
 
 The benchmark's preflight (`run_preflight_checks()` in `src/benchmark.cpp`) enforces, for each pinned core,
 isolation membership (the core is listed in `/sys/devices/system/cpu/isolated`), the `performance` governor, and no
-SMT sibling, and refuses to run otherwise. It does not check `nohz_full`, `rcu_nocbs`, IRQ placement, NUMA binding,
-the shared-L2 cluster or other processes, so confirm those yourself with the commands above.
+SMT sibling, and refuses to run otherwise. It checks only cores 4 and 5, so the governors of cores 6 and 7 and the
+rest of the list above (`nohz_full`, `rcu_nocbs`, IRQ placement, NUMA binding, the shared-L2 cluster, the NMI
+watchdog, other processes) are for you to confirm with the commands above.
 
 ---
 
@@ -252,7 +263,8 @@ cmake --build build -j"$(nproc)"
 ```
 
 Write new results to `results_new/<commit>/` (or any other directory). `results/` holds the frozen earlier run
-and is read-only by convention.
+(`results/98a597b/`) and is read-only by convention; the run of record is `results_new/77eb286/`, written by the
+commands in [section 9](#9-a-typical-session).
 
 ### Canonical runs
 
@@ -293,6 +305,10 @@ line each, including the per-trial P99.9 values) and `ablation_summary.{csv,md}`
 NO_MEASURABLE_EFFECT, ABLATED_FASTER, INCONCLUSIVE or INVALID ([rule](METHODOLOGY.md#ablation-verdicts)). A failed
 run is recorded as INVALID and the suite continues. The ablation baseline is a separate run from the canonical
 runs above, even though it is the same binary; compare variants only with the baseline of the same suite.
+
+Every arm pushes the same eight fields through its queue, so each ablation changes one thing: the production ring
+(one 64-byte slot per event) serves both `Order` layouts (128-byte production and 88-byte flat), and the mutex arm
+queues the same payload through `std::mutex` + `std::queue`.
 
 One variant by hand (build it first):
 
@@ -364,14 +380,16 @@ PY
 ```bash
 # Regenerate the README charts (overwrites the PNGs in charts/)
 python3 charts/generate_charts.py \
-    --results-dir results_new/<commit> \
+    --results-dir results_new/77eb286 \
     --baseline-dir results/98a597b \
     --ctest-log build/Testing/Temporary/LastTest.log
+# both directories default to the run of record and the earlier run, so this is equivalent to:
+python3 charts/generate_charts.py --ctest-log build/Testing/Temporary/LastTest.log
 
 python3 charts/generate_charts.py --help
 ```
 
-Options: `--results-dir` (the run of record; default `results_new/7c2fd2c`), `--baseline-dir` (the earlier run used
+Options: `--results-dir` (the run of record; default `results_new/77eb286`), `--baseline-dir` (the earlier run used
 by the before/after chart; default `results/98a597b`), `--out-dir` (where the PNGs go; default `charts/`) and
 `--ctest-log` (the CTest log for the tests tile; without it the tile shows N/A). `LastTest.log` is written by
 `ctest --test-dir build`, so run the full test suite first. To preview without touching the committed images, add
@@ -406,11 +424,14 @@ done
 
 ## 9. A typical session
 
-Everything above in order, for a fresh benchmark of the current commit (after a reboot):
+Everything above in order, for a fresh benchmark of the current commit (after a reboot). These are the commands
+behind the run of record in `results_new/77eb286/`, which was taken at commit `77eb286` with the whole isolated
+cluster tuned:
 
 ```bash
-sudo scripts/tune_host.sh                                   # section 3.2
+sudo scripts/tune_host.sh 4,5,6,7                            # section 3.2
 cat /sys/devices/system/cpu/isolated                         # section 4: confirm before measuring
+for c in 4 5 6 7; do cat /sys/devices/system/cpu/cpu$c/cpufreq/scaling_governor; done   # four times "performance"
 
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release               # reconfigure: re-stamps the commit
 cmake --build build -j"$(nproc)"
@@ -429,5 +450,5 @@ done
 RESULTS_ROOT=results_new ./scripts/run_ablations.sh --trials 5 | tee "results_new/ablation_run_$commit.log"
 
 python3 charts/generate_charts.py --results-dir "results_new/$commit" \
-    --ctest-log build/Testing/Temporary/LastTest.log
+    --ctest-log build/Testing/Temporary/LastTest.log     # charts default to results_new/77eb286 when --results-dir is omitted
 ```
